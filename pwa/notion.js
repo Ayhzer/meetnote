@@ -1,12 +1,9 @@
 /**
- * notion.js — Push vers Notion API depuis le navigateur
- * Note : nécessite un proxy CORS (Cloudflare Worker) pointant vers api.notion.com
- * En développement, configurer NOTION_PROXY_URL ci-dessous.
+ * notion.js — Push vers Notion API depuis le navigateur via proxy CORS Cloudflare Worker
  */
 
-// Si vous avez un Cloudflare Worker proxy, remplacez par son URL :
-// ex: 'https://meetnote-proxy.your-name.workers.dev'
-const NOTION_API = 'https://notion-cors-proxy.pottier-alexandre-01.workers.dev/v1';
+const NOTION_API     = 'https://notion-cors-proxy.pottier-alexandre-01.workers.dev/v1';
+const NOTION_VERSION = '2026-03-11';
 
 export async function pushToNotion({
   token,
@@ -18,8 +15,10 @@ export async function pushToNotion({
   durationMin = 0,
   whisperModel = '',
   detectedLang = null,
+  audioBlob = null,
+  recordingDate = null,
 }) {
-  const now   = new Date();
+  const now   = recordingDate || new Date();
   const title = `Réunion ${now.toLocaleDateString('fr-FR')} ${now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`;
 
   const blocks = _transcriptToBlocks(transcript);
@@ -31,17 +30,29 @@ export async function pushToNotion({
     Statut: { select: { name: 'À traiter' } },
   };
 
-  if (participants) {
-    props['Participants'] = { select: { name: participants.slice(0, 100) } };
-  }
-  if (meetingType) {
-    props['Type'] = { select: { name: meetingType } };
-  }
-  if (durationMin > 0) {
-    props['Durée (min)'] = { number: Math.round(durationMin * 10) / 10 };
-  }
-  if (whisperModel) {
-    props['Modèle Whisper'] = { select: { name: whisperModel } };
+  if (participants) props['Participants'] = { select: { name: participants.slice(0, 100) } };
+  if (meetingType)  props['Type']         = { select: { name: meetingType } };
+  if (durationMin > 0) props['Durée (min)'] = { number: Math.round(durationMin * 10) / 10 };
+  if (whisperModel) props['Modèle Whisper'] = { select: { name: whisperModel } };
+
+  // ── Upload audio si fourni ─────────────────────────────────────────────────
+  if (audioBlob) {
+    try {
+      const fileUploadId = await _uploadAudio(token, audioBlob, now);
+      if (fileUploadId) {
+        const fname = `meetnote_${now.toISOString().slice(0,19).replace(/[:T]/g,'-')}.webm`;
+        props['Enregistrement'] = {
+          files: [{
+            type: 'file_upload',
+            file_upload: { id: fileUploadId },
+            name: fname,
+          }]
+        };
+      }
+    } catch (e) {
+      // Non-bloquant : on continue sans le fichier audio
+      console.warn('Audio upload failed:', e.message);
+    }
   }
 
   const payload = {
@@ -54,20 +65,13 @@ export async function pushToNotion({
   try {
     resp = await fetch(`${NOTION_API}/pages`, {
       method: 'POST',
-      headers: {
-        Authorization:    `Bearer ${token}`,
-        'Content-Type':   'application/json',
-        'Notion-Version': '2022-06-28',
-      },
+      headers: _jsonHeaders(token),
       body: JSON.stringify(payload),
     });
   } catch (networkErr) {
-    // CORS block: the browser blocks direct Notion API requests.
-    // Solution: set up a Cloudflare Worker proxy pointing to https://api.notion.com
-    // and update NOTION_API above to your worker URL.
     throw new Error(
       'Impossible de contacter Notion (CORS). ' +
-      'Configurez un proxy Cloudflare Worker et mettez à jour NOTION_API dans notion.js. ' +
+      'Vérifiez votre proxy Cloudflare Worker. ' +
       'Détail : ' + networkErr.message
     );
   }
@@ -78,6 +82,53 @@ export async function pushToNotion({
   }
 
   return resp.json();
+}
+
+// ── Upload audio en 2 étapes ────────────────────────────────────────────────
+async function _uploadAudio(token, blob, date) {
+  const fname = `meetnote_${date.toISOString().slice(0,19).replace(/[:T]/g,'-')}.webm`;
+  const mime  = blob.type || 'audio/webm';
+
+  // Étape 1 — créer l'objet file_upload
+  const r1 = await fetch(`${NOTION_API}/file_uploads`, {
+    method: 'POST',
+    headers: _jsonHeaders(token),
+    body: JSON.stringify({ filename: fname, content_type: mime }),
+  });
+  if (!r1.ok) {
+    const e = await r1.json().catch(() => ({}));
+    throw new Error(e.message || `file_upload init error ${r1.status}`);
+  }
+  const { id: fileUploadId } = await r1.json();
+
+  // Étape 2 — envoyer le binaire (multipart/form-data)
+  const form = new FormData();
+  form.append('file', blob, fname);
+
+  const r2 = await fetch(`${NOTION_API}/file_uploads/${fileUploadId}/send`, {
+    method: 'POST',
+    headers: {
+      Authorization:    `Bearer ${token}`,
+      'Notion-Version': NOTION_VERSION,
+      // NE PAS mettre Content-Type ici — le navigateur le met avec le bon boundary
+    },
+    body: form,
+  });
+  if (!r2.ok) {
+    const e = await r2.json().catch(() => ({}));
+    throw new Error(e.message || `file_upload send error ${r2.status}`);
+  }
+
+  return fileUploadId;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function _jsonHeaders(token) {
+  return {
+    Authorization:    `Bearer ${token}`,
+    'Content-Type':   'application/json',
+    'Notion-Version': NOTION_VERSION,
+  };
 }
 
 function _transcriptToBlocks(text) {

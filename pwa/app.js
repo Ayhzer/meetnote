@@ -59,6 +59,7 @@ let _recStartTime    = null;
 let _vuInterval      = null;
 let _detectedLang    = null;
 let _detectedModel   = null;
+let _lastAudioBlob   = null;
 
 // ─── Hints ───────────────────────────────────────────────────────────────────
 const SOURCE_HINTS = {
@@ -226,6 +227,7 @@ async function stopAndTranscribe() {
   let blob;
   try {
     blob = await recorder.stop();
+    _lastAudioBlob = blob;
   } catch (err) {
     journal('Erreur arrêt : ' + err.message);
     setStatus('Erreur arrêt : ' + err.message);
@@ -308,6 +310,8 @@ btnPush.addEventListener('click', async () => {
       durationMin:   Math.round(durationMin * 10) / 10,
       whisperModel:  selModel.value.replace('Xenova/whisper-', ''),
       detectedLang:  _detectedLang,
+      audioBlob:     _lastAudioBlob,
+      recordingDate: _recStartTime,
     });
     setStatus('✓ Page créée dans Notion !');
     clearTranscript();
@@ -344,6 +348,7 @@ function clearTranscript() {
   transcriptArea.value  = '';
   participantsEl.value  = '';
   barProg.style.width   = '0%';
+  _lastAudioBlob        = null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

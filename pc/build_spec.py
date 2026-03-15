@@ -123,6 +123,7 @@ hidden_imports = [
     "cffi",
     "notion_push",
     "config",
+    "user_config",
 ]
 hidden_imports_str = ",\n    ".join(f"'{h}'" for h in hidden_imports)
 

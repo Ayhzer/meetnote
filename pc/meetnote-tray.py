@@ -19,7 +19,15 @@ import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config
+import user_config
 from notion_push import push_to_notion
+
+# Surcharge les credentials avec les valeurs utilisateur persistées
+_uc = user_config.load()
+if _uc.get("notion_token"):
+    config.NOTION_TOKEN = _uc["notion_token"]
+if _uc.get("notion_database_id"):
+    config.NOTION_DATABASE_ID = _uc["notion_database_id"]
 
 # ─── Win32 sleep prevention ──────────────────────────────────────────────────
 ES_CONTINUOUS        = 0x80000000
@@ -371,6 +379,7 @@ def _do_stop_transcribe():
                     whisper_model=_model_var.get() if _model_var else config.WHISPER_MODEL,
                     meeting_type=_type_var.get() if _type_var and _type_var.get() != "—" else "",
                     start_time=start_time,
+                    audio_path=path,
                 )
             except Exception as e:
                 _log_error(f"Erreur Notion : {e}")
@@ -834,17 +843,11 @@ def _build_window():
             if not new_token or not new_db:
                 status_lbl.config(text="Token et Database ID requis.", fg="#ff6666")
                 return
-            cfg_path = os.path.join(os.path.dirname(__file__), "config.py")
             try:
-                import re
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                content = re.sub(r'NOTION_TOKEN\s*=\s*"[^"]*"',
-                                 f'NOTION_TOKEN = "{new_token}"', content)
-                content = re.sub(r'NOTION_DATABASE_ID\s*=\s*"[^"]*"',
-                                 f'NOTION_DATABASE_ID = "{new_db}"', content)
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    f.write(content)
+                user_config.save({
+                    "notion_token":       new_token,
+                    "notion_database_id": new_db,
+                })
                 config.NOTION_TOKEN       = new_token
                 config.NOTION_DATABASE_ID = new_db
                 import notion_push as np_mod

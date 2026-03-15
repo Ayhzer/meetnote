@@ -16,7 +16,8 @@ export class AudioRecorder {
     this._chunks = [];
     this._stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     this._mediaRecorder = new MediaRecorder(this._stream, {
-      mimeType: this._getSupportedMimeType(),
+      mimeType:    this._getSupportedMimeType(),
+      audioBitsPerSecond: 24000,   // 24 kbps → ~10.8 Mo/h → 2h ≈ 21.6 Mo
     });
     this._mediaRecorder.ondataavailable = (e) => {
       if (e.data.size > 0) this._chunks.push(e.data);
