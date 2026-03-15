@@ -173,6 +173,7 @@ def _mic_callback(indata, frames, time, status):
 # ─── soundcard loopback thread ───────────────────────────────────────────────
 def _loopback_thread_fn(mic_also: bool):
     """Capture le loopback (+ micro si mixte) via soundcard."""
+    ctypes.windll.ole32.CoInitialize(None)
     # Utilise le speaker sélectionné dans l'UI, sinon celui par défaut
     spk_name = _speaker_var.get() if _speaker_var else None
     if spk_name:
