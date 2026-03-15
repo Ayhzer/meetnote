@@ -2,212 +2,443 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <title>MeetNote</title>
   <link rel="manifest" href="manifest.json" />
-  <meta name="theme-color" content="#dc3232" />
+  <meta name="theme-color" content="#1a1a2e" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+    :root {
+      --bg:   #1a1a2e;
+      --bg2:  #16213e;
+      --bg3:  #0f3460;
+      --fg:   #e0e0e0;
+      --fg2:  #888888;
+      --hint: #6699cc;
+      --red:  #dc3232;
+      --grn:  #2e7d32;
+      --dim:  #333355;
+      --p:    16px;
+    }
+
     body {
-      font-family: system-ui, sans-serif;
-      background: #1a1a2e;
-      color: #e0e0e0;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
       min-height: 100dvh;
+      padding-bottom: 2rem;
+    }
+
+    /* ── Header */
+    header {
+      text-align: center;
+      padding: 1.4rem 1rem 0.6rem;
+    }
+    header h1 { font-size: 1.5rem; color: #fff; letter-spacing: .04em; }
+    header p  { font-size: .8rem; color: var(--fg2); margin-top: .2rem; }
+
+    /* ── Record button */
+    .record-area {
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: 2rem 1rem;
+      padding: 1.4rem 0 1rem;
     }
-
-    h1 {
-      font-size: 1.6rem;
-      letter-spacing: 0.08em;
-      margin-bottom: 0.25rem;
-      color: #fff;
-    }
-
-    .subtitle {
-      font-size: 0.85rem;
-      color: #888;
-      margin-bottom: 2.5rem;
-    }
-
-    /* Big record button */
     #btn-record {
-      width: 120px;
-      height: 120px;
-      border-radius: 50%;
-      border: none;
-      cursor: pointer;
-      background: #dc3232;
-      box-shadow: 0 0 0 0 rgba(220, 50, 50, 0.5);
-      transition: background 0.2s, transform 0.1s;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      margin-bottom: 1.5rem;
+      width: 100px; height: 100px;
+      border-radius: 50%; border: none; cursor: pointer;
+      background: var(--red);
+      box-shadow: 0 0 0 0 rgba(220,50,50,.5);
+      display: flex; align-items: center; justify-content: center;
+      transition: background .2s;
     }
-
     #btn-record.recording {
-      background: #555;
-      animation: pulse 1.5s infinite;
+      background: #444;
+      animation: pulse 1.4s infinite;
     }
-
     @keyframes pulse {
-      0%   { box-shadow: 0 0 0 0 rgba(220, 50, 50, 0.5); }
-      70%  { box-shadow: 0 0 0 20px rgba(220, 50, 50, 0); }
-      100% { box-shadow: 0 0 0 0 rgba(220, 50, 50, 0); }
+      0%   { box-shadow: 0 0 0 0   rgba(220,50,50,.5); }
+      70%  { box-shadow: 0 0 0 18px rgba(220,50,50,0); }
+      100% { box-shadow: 0 0 0 0   rgba(220,50,50,0); }
     }
-
     #btn-record svg { pointer-events: none; }
 
     #status {
-      font-size: 1rem;
-      min-height: 1.5rem;
-      margin-bottom: 2rem;
-      color: #aaa;
-      text-align: center;
+      margin-top: .9rem;
+      font-size: .9rem; color: var(--fg2);
+      text-align: center; min-height: 1.3rem;
+      padding: 0 1rem;
     }
 
-    /* Settings panel */
-    details {
-      width: 100%;
-      max-width: 420px;
-      background: #16213e;
+    /* ── Sections */
+    .section {
+      margin: .5rem var(--p) 0;
+    }
+    .section-title {
+      font-size: .7rem; font-weight: 700;
+      color: var(--fg2); letter-spacing: .08em;
+      margin-bottom: .3rem;
+    }
+    .section-body {
+      background: var(--bg2);
       border-radius: 10px;
-      padding: 1rem;
+      padding: .8rem .9rem;
+    }
+
+    /* ── Fields */
+    .field { margin-bottom: .7rem; }
+    .field:last-child { margin-bottom: 0; }
+    .field label {
+      display: block;
+      font-size: .75rem; color: var(--fg2);
+      margin-bottom: .25rem;
+    }
+    .field-hint {
+      font-size: .7rem; color: var(--hint);
+      margin-top: .2rem; line-height: 1.3;
+    }
+    select, input[type="text"], input[type="password"] {
+      width: 100%;
+      background: var(--bg3);
+      border: 1px solid #334;
+      color: var(--fg);
+      border-radius: 6px;
+      padding: .45rem .6rem;
+      font-size: .88rem;
+      appearance: none;
+    }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+
+    /* ── VU-mètre */
+    .progress-row {
+      display: flex; align-items: center; gap: .5rem;
+      margin-bottom: .4rem;
+    }
+    .progress-row:last-child { margin-bottom: 0; }
+    .progress-row span {
+      font-size: .72rem; color: var(--fg2);
+      min-width: 80px;
+    }
+    .bar-track {
+      flex: 1; height: 8px;
+      background: var(--bg3); border-radius: 4px; overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%; width: 0%;
+      border-radius: 4px;
+      transition: width .05s linear;
+    }
+    #bar-level { background: #00cc66; }
+    #bar-prog  { background: var(--red); }
+
+    /* ── Buttons */
+    .btn-group { display: flex; flex-direction: column; gap: .5rem; margin: .5rem var(--p) 0; }
+    .btn {
+      width: 100%; padding: .75rem;
+      border: none; border-radius: 8px;
+      font-size: .95rem; font-weight: 700;
+      cursor: pointer; transition: opacity .15s;
+    }
+    .btn:disabled { opacity: .4; cursor: default; }
+    .btn-stop  { background: var(--grn); color: #fff; }
+    .btn-cancel { background: var(--dim); color: #ccc; font-weight: 400; font-size: .85rem; }
+
+    /* ── Transcript */
+    #transcript-section { display: none; }
+    #transcript-section.visible { display: block; }
+    textarea#transcript {
+      width: 100%; min-height: 120px;
+      background: var(--bg3); border: 1px solid #334;
+      color: var(--fg); border-radius: 8px;
+      padding: .7rem; font-size: .85rem; resize: vertical;
+    }
+    .push-row { display: flex; gap: .5rem; margin-top: .5rem; }
+    .btn-push    { flex: 2; background: var(--red); color: #fff; font-weight: 700; }
+    .btn-discard { flex: 1; background: var(--dim); color: #ccc; font-weight: 400; font-size: .85rem; }
+
+    /* ── Journal */
+    #journal-text {
+      background: #0a0a1a; color: #ff6666;
+      font-family: monospace; font-size: .72rem;
+      border-radius: 6px; padding: .5rem;
+      min-height: 2.5rem; max-height: 100px;
+      overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+    }
+
+    /* ── Bottom bar */
+    .bottom-bar {
+      display: flex; gap: .5rem;
+      margin: .8rem var(--p) 0;
+    }
+    .btn-sm {
+      flex: 1; padding: .5rem;
+      border: none; border-radius: 7px;
+      font-size: .8rem; cursor: pointer;
+    }
+    .btn-settings { background: var(--dim); color: #aaa; }
+    .btn-quit     { background: #2a1010; color: #cc4444; }
+
+    /* ── Modal */
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.7);
+      z-index: 100; align-items: flex-end;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: 100%; max-height: 90dvh;
+      background: var(--bg);
+      border-radius: 16px 16px 0 0;
+      overflow-y: auto;
+      padding: 1.2rem 1rem 2rem;
+    }
+    .modal h2 {
+      font-size: 1rem; color: #fff;
       margin-bottom: 1rem;
     }
-
-    summary {
-      cursor: pointer;
-      font-weight: 600;
-      font-size: 0.9rem;
-      color: #ccc;
-      list-style: none;
+    .modal-tabs {
+      display: flex; gap: .4rem; margin-bottom: 1rem;
     }
-
-    summary::after { content: " ▸"; }
-    details[open] summary::after { content: " ▾"; }
-
-    .field { margin-top: 0.8rem; display: flex; flex-direction: column; gap: 0.3rem; }
-    label { font-size: 0.8rem; color: #888; }
-
-    input, select {
-      background: #0f3460;
-      border: 1px solid #334;
-      color: #e0e0e0;
-      border-radius: 6px;
-      padding: 0.5rem 0.7rem;
-      font-size: 0.9rem;
+    .tab-btn {
+      flex: 1; padding: .45rem;
+      border: none; border-radius: 6px;
+      font-size: .82rem; cursor: pointer;
+      background: var(--dim); color: var(--fg2);
     }
-
-    /* Transcript area */
-    #transcript-section {
-      width: 100%;
-      max-width: 420px;
-      display: none;
+    .tab-btn.active { background: var(--bg2); color: #fff; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .instr-box {
+      background: #0a0a1a; color: #aaccff;
+      font-family: monospace; font-size: .72rem;
+      border-radius: 6px; padding: .6rem;
+      white-space: pre-wrap; line-height: 1.5;
+      margin-bottom: .8rem;
     }
-
-    #transcript-section.visible { display: block; }
-
-    #transcript {
-      width: 100%;
-      min-height: 140px;
-      background: #16213e;
-      border: 1px solid #334;
-      border-radius: 10px;
-      padding: 0.8rem;
-      color: #e0e0e0;
-      font-size: 0.9rem;
-      resize: vertical;
+    .modal input {
+      width: 100%; background: var(--bg3);
+      border: 1px solid #334; color: var(--fg);
+      border-radius: 6px; padding: .45rem .6rem;
+      font-size: .85rem; margin-top: .25rem;
     }
-
-    .actions {
-      display: flex;
-      gap: 0.6rem;
-      margin-top: 0.7rem;
-      flex-wrap: wrap;
+    .modal-field { margin-bottom: .7rem; }
+    .modal-field label { font-size: .75rem; color: var(--fg2); }
+    .radio-opt {
+      background: var(--bg2); border-radius: 8px;
+      padding: .7rem; margin-bottom: .5rem; cursor: pointer;
     }
-
-    .btn {
-      flex: 1;
-      padding: 0.7rem;
-      border: none;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 0.9rem;
-      font-weight: 600;
-      transition: opacity 0.2s;
+    .radio-opt input { width: auto; margin: 0; vertical-align: middle; }
+    .radio-opt-label { font-size: .88rem; color: var(--fg); margin-left: .3rem; }
+    .radio-opt-desc  { font-size: .75rem; color: var(--fg2); margin-top: .25rem; margin-left: 1.2rem; }
+    .modal-save {
+      width: 100%; padding: .65rem;
+      border: none; border-radius: 8px;
+      background: #2e5e8e; color: #fff;
+      font-size: .9rem; font-weight: 700;
+      cursor: pointer; margin-top: .6rem;
     }
-    .btn:hover { opacity: 0.85; }
-    .btn-primary { background: #dc3232; color: #fff; }
-    .btn-secondary { background: #334; color: #ccc; }
-
-    /* Participants */
-    #participants-field { margin-top: 0.8rem; }
+    .modal-close {
+      width: 100%; padding: .6rem;
+      border: none; border-radius: 8px;
+      background: var(--dim); color: #ccc;
+      font-size: .85rem; cursor: pointer; margin-top: .4rem;
+    }
+    .save-status { font-size: .8rem; min-height: 1.2rem; margin-top: .4rem; }
   </style>
 </head>
 <body>
 
-<h1>🎙 MeetNote</h1>
-<p class="subtitle">Enregistrement → Transcription → Notion</p>
+<header>
+  <h1>🎙 MeetNote</h1>
+  <p>Enregistrement → Whisper → Notion</p>
+</header>
 
-<button id="btn-record" title="Démarrer / Arrêter">
-  <!-- Mic icon -->
-  <svg id="icon-mic" width="48" height="48" viewBox="0 0 24 24" fill="white">
-    <path d="M12 1a4 4 0 0 0-4 4v7a4 4 0 0 0 8 0V5a4 4 0 0 0-4-4z"/>
-    <path d="M19 10v2a7 7 0 0 1-14 0v-2H3v2a9 9 0 0 0 8 8.94V23h2v-2.06A9 9 0 0 0 21 12v-2z"/>
-  </svg>
-  <!-- Stop icon (hidden by default) -->
-  <svg id="icon-stop" width="48" height="48" viewBox="0 0 24 24" fill="white" style="display:none">
-    <rect x="4" y="4" width="16" height="16" rx="2"/>
-  </svg>
-</button>
+<!-- Bouton d'enregistrement -->
+<div class="record-area">
+  <button id="btn-record" title="Démarrer / Arrêter">
+    <svg id="icon-mic" width="44" height="44" viewBox="0 0 24 24" fill="white">
+      <path d="M12 1a4 4 0 0 0-4 4v7a4 4 0 0 0 8 0V5a4 4 0 0 0-4-4z"/>
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2H3v2a9 9 0 0 0 8 8.94V23h2v-2.06A9 9 0 0 0 21 12v-2z"/>
+    </svg>
+    <svg id="icon-stop" width="44" height="44" viewBox="0 0 24 24" fill="white" style="display:none">
+      <rect x="4" y="4" width="16" height="16" rx="2"/>
+    </svg>
+  </button>
+  <div id="status">Appuyer pour démarrer</div>
+</div>
 
-<div id="status">Appuyer pour démarrer</div>
+<!-- SOURCE AUDIO -->
+<div class="section">
+  <div class="section-title">SOURCE AUDIO</div>
+  <div class="section-body">
+    <div class="field">
+      <label for="sel-source">Source</label>
+      <select id="sel-source">
+        <option value="micro">🎤  Microphone uniquement</option>
+        <option value="loopback" disabled>🔊  Loopback (non dispo sur mobile)</option>
+        <option value="mixte" disabled>🎤🔊  Mixte (non dispo sur mobile)</option>
+      </select>
+      <div class="field-hint" id="source-hint">Capte uniquement votre voix via le micro. Sur mobile, seul le micro est disponible.</div>
+    </div>
+  </div>
+</div>
 
-<!-- Settings -->
-<details id="settings">
-  <summary>Paramètres</summary>
-  <div class="field">
-    <label for="notion-token">Notion Token</label>
-    <input type="password" id="notion-token" placeholder="secret_..." />
+<!-- TRANSCRIPTION -->
+<div class="section">
+  <div class="section-title">TRANSCRIPTION</div>
+  <div class="section-body">
+    <div class="row2">
+      <div class="field">
+        <label for="sel-model">Modèle Whisper</label>
+        <select id="sel-model">
+          <option value="Xenova/whisper-tiny">tiny</option>
+          <option value="Xenova/whisper-base" selected>base</option>
+          <option value="Xenova/whisper-small">small</option>
+          <option value="Xenova/whisper-medium">medium</option>
+        </select>
+        <div class="field-hint" id="model-hint">Rapide — qualité correcte</div>
+      </div>
+      <div class="field">
+        <label for="sel-lang">Langue audio</label>
+        <select id="sel-lang">
+          <option value="auto" selected>auto</option>
+          <option value="fr">fr</option>
+          <option value="en">en</option>
+          <option value="es">es</option>
+          <option value="de">de</option>
+          <option value="it">it</option>
+          <option value="pt">pt</option>
+          <option value="nl">nl</option>
+          <option value="ja">ja</option>
+          <option value="zh">zh</option>
+        </select>
+        <div class="field-hint" id="lang-hint">Détection automatique</div>
+      </div>
+    </div>
+    <div class="field" style="margin-top:.2rem">
+      <label for="sel-type">Type de réunion</label>
+      <select id="sel-type">
+        <option value="">—</option>
+        <option value="Gouvernance">Gouvernance</option>
+        <option value="Technique">Technique</option>
+        <option value="Projet">Projet</option>
+        <option value="RH">RH</option>
+        <option value="Fournisseur">Fournisseur</option>
+        <option value="Autre">Autre</option>
+      </select>
+    </div>
   </div>
-  <div class="field">
-    <label for="notion-db">Database ID Notion</label>
-    <input type="text" id="notion-db" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
-  </div>
-  <div class="field">
-    <label for="whisper-model">Modèle Whisper</label>
-    <select id="whisper-model">
-      <option value="Xenova/whisper-tiny">tiny (rapide)</option>
-      <option value="Xenova/whisper-base" selected>base (recommandé)</option>
-      <option value="Xenova/whisper-small">small (précis)</option>
-    </select>
-  </div>
-  <div class="field">
-    <label for="whisper-lang">Langue</label>
-    <select id="whisper-lang">
-      <option value="fr" selected>Français</option>
-      <option value="en">English</option>
-      <option value="es">Español</option>
-      <option value="de">Deutsch</option>
-    </select>
-  </div>
-</details>
+</div>
 
-<!-- Transcript result -->
-<div id="transcript-section">
-  <div id="participants-field" class="field">
-    <label for="participants">Participants (optionnel)</label>
-    <input type="text" id="participants" placeholder="Alice, Bob, Charlie…" />
+<!-- NIVEAUX -->
+<div class="section">
+  <div class="section-title">NIVEAUX</div>
+  <div class="section-body">
+    <div class="progress-row">
+      <span>Micro</span>
+      <div class="bar-track"><div class="bar-fill" id="bar-level"></div></div>
+    </div>
+    <div class="progress-row">
+      <span>Transcription</span>
+      <div class="bar-track"><div class="bar-fill" id="bar-prog"></div></div>
+    </div>
   </div>
-  <textarea id="transcript" placeholder="Transcript…"></textarea>
-  <div class="actions">
-    <button class="btn btn-primary" id="btn-push">Envoyer vers Notion</button>
-    <button class="btn btn-secondary" id="btn-discard">Annuler</button>
+</div>
+
+<!-- Boutons stop/cancel (cachés par défaut) -->
+<div class="btn-group" id="action-btns" style="display:none">
+  <button class="btn btn-stop"   id="btn-stop">⏹  Arrêter et transcrire</button>
+  <button class="btn btn-cancel" id="btn-cancel">✕  Annuler (sans push)</button>
+</div>
+
+<!-- Transcript -->
+<div class="section" id="transcript-section">
+  <div class="section-title">TRANSCRIPT</div>
+  <div class="section-body">
+    <div class="field">
+      <label for="participants">Participants (optionnel)</label>
+      <input type="text" id="participants" placeholder="Alice, Bob…" />
+    </div>
+    <textarea id="transcript" placeholder="Transcript…"></textarea>
+    <div class="push-row">
+      <button class="btn btn-push"    id="btn-push">Envoyer vers Notion</button>
+      <button class="btn btn-discard" id="btn-discard">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<!-- Journal -->
+<div class="section">
+  <div class="section-title">JOURNAL</div>
+  <div id="journal-text"></div>
+</div>
+
+<!-- Barre du bas -->
+<div class="bottom-bar">
+  <button class="btn-sm btn-settings" id="btn-open-settings">⚙ Paramètres</button>
+</div>
+
+<!-- Modal Paramètres -->
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal">
+    <h2>⚙ Paramètres MeetNote</h2>
+
+    <div class="modal-tabs">
+      <button class="tab-btn active" data-tab="tab-notion">Notion</button>
+      <button class="tab-btn"        data-tab="tab-general">Général</button>
+    </div>
+
+    <!-- Onglet Notion -->
+    <div class="tab-panel active" id="tab-notion">
+      <div class="instr-box">1. Créer une intégration Notion
+   → notion.so/my-integrations
+   → "New integration" → donner un nom (ex: MeetNote)
+   → Copier le "Internal Integration Secret"
+     (commence par ntn_ ou secret_)
+   → Le coller dans le champ Token ci-dessous
+
+2. Obtenir le Database ID
+   → Ouvrir votre database dans le navigateur
+   → URL : notion.so/XXXXXXXXXXXXXXXX?v=...
+   → Copier les 32 caractères avant "?v="
+
+3. Partager la database avec l'intégration
+   → Dans Notion, ouvrir la database
+   → "···" en haut à droite → "Connections"
+   → Ajouter votre intégration MeetNote</div>
+
+      <div class="modal-field">
+        <label>Notion Token (ntn_... ou secret_...)</label>
+        <input type="password" id="set-token" placeholder="ntn_..." />
+      </div>
+      <div class="modal-field">
+        <label>Database ID (32 caractères)</label>
+        <input type="text" id="set-db" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" />
+      </div>
+      <div class="save-status" id="save-status"></div>
+      <button class="modal-save" id="btn-save-notion">Enregistrer</button>
+    </div>
+
+    <!-- Onglet Général -->
+    <div class="tab-panel" id="tab-general">
+      <p style="font-size:.8rem;color:var(--fg2);margin-bottom:.8rem">
+        Choisissez où envoyer le transcript après transcription :
+      </p>
+      <label class="radio-opt">
+        <input type="radio" name="output" value="notion" id="out-notion" />
+        <span class="radio-opt-label">Envoyer vers Notion</span>
+        <div class="radio-opt-desc">Crée une page Notion avec toutes les métadonnées. Nécessite un proxy CORS (Cloudflare Worker) depuis le navigateur.</div>
+      </label>
+      <label class="radio-opt">
+        <input type="radio" name="output" value="download" id="out-download" />
+        <span class="radio-opt-label">Télécharger en fichier texte</span>
+        <div class="radio-opt-desc">Le transcript est téléchargé directement sur votre téléphone en .txt. Aucun compte nécessaire.</div>
+      </label>
+      <p style="font-size:.75rem;color:#00cc66;margin-top:.6rem">✓ La sélection est appliquée immédiatement.</p>
+    </div>
+
+    <button class="modal-close" id="btn-close-modal">Fermer</button>
   </div>
 </div>
 

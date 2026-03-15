@@ -1,12 +1,15 @@
 /**
- * recorder.js — MediaRecorder + Wake Lock API
+ * recorder.js — MediaRecorder + Wake Lock + AnalyserNode (VU-meter)
  */
 export class AudioRecorder {
   constructor() {
     this._mediaRecorder = null;
-    this._chunks = [];
-    this._wakeLock = null;
-    this._stream = null;
+    this._chunks        = [];
+    this._wakeLock      = null;
+    this._stream        = null;
+    this._analyser      = null;
+    this._analyserData  = null;
+    this._audioCtx      = null;
   }
 
   async start() {
@@ -18,16 +21,38 @@ export class AudioRecorder {
     this._mediaRecorder.ondataavailable = (e) => {
       if (e.data.size > 0) this._chunks.push(e.data);
     };
-    this._mediaRecorder.start(1000); // collecte par tranches de 1s
+    this._mediaRecorder.start(1000);
+
+    // AnalyserNode for VU-meter
+    try {
+      this._audioCtx     = new (window.AudioContext || window.webkitAudioContext)();
+      const source       = this._audioCtx.createMediaStreamSource(this._stream);
+      this._analyser     = this._audioCtx.createAnalyser();
+      this._analyser.fftSize = 256;
+      this._analyserData = new Uint8Array(this._analyser.frequencyBinCount);
+      source.connect(this._analyser);
+    } catch (_) {
+      this._analyser = null;
+    }
 
     // Wake Lock — empêche le verrouillage écran sur mobile
     if ('wakeLock' in navigator) {
       try {
         this._wakeLock = await navigator.wakeLock.request('screen');
-      } catch (_) {
-        // Wake Lock non disponible — pas bloquant
-      }
+      } catch (_) {}
     }
+  }
+
+  /** Returns RMS level 0..1 for VU-meter */
+  getLevel() {
+    if (!this._analyser) return 0;
+    this._analyser.getByteTimeDomainData(this._analyserData);
+    let sum = 0;
+    for (let i = 0; i < this._analyserData.length; i++) {
+      const v = (this._analyserData[i] - 128) / 128;
+      sum += v * v;
+    }
+    return Math.sqrt(sum / this._analyserData.length);
   }
 
   async stop() {
@@ -38,6 +63,12 @@ export class AudioRecorder {
       };
       this._mediaRecorder.stop();
       this._stream?.getTracks().forEach((t) => t.stop());
+
+      if (this._analyser) {
+        try { this._audioCtx?.close(); } catch (_) {}
+        this._analyser    = null;
+        this._analyserData = null;
+      }
 
       if (this._wakeLock) {
         this._wakeLock.release().catch(() => {});
