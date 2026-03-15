@@ -161,10 +161,12 @@ tabBtns.forEach(btn => btn.addEventListener('click', () => {
 
 btnSaveNotion.addEventListener('click', saveNotion);
 
-// ─── Record button (starts recording) ────────────────────────────────────────
+// ─── Record button (toggle) ───────────────────────────────────────────────────
 btnRecord.addEventListener('click', async () => {
   if (!isRecording) {
     await startRecording();
+  } else {
+    await stopAndTranscribe();
   }
 });
 
