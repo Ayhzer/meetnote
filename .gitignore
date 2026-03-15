@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+
+# Audio temp files
+pc/tmp/
+pwa/tmp/
+
+# Whisper model cache
+pc/.cache/
+*.gguf
+
+# Secrets
+pc/config.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/settings.json

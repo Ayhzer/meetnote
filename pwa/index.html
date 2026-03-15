@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MeetNote</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#dc3232" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.25rem;
+      color: #fff;
+    }
+
+    .subtitle {
+      font-size: 0.85rem;
+      color: #888;
+      margin-bottom: 2.5rem;
+    }
+
+    /* Big record button */
+    #btn-record {
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      border: none;
+      cursor: pointer;
+      background: #dc3232;
+      box-shadow: 0 0 0 0 rgba(220, 50, 50, 0.5);
+      transition: background 0.2s, transform 0.1s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 1.5rem;
+    }
+
+    #btn-record.recording {
+      background: #555;
+      animation: pulse 1.5s infinite;
+    }
+
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(220, 50, 50, 0.5); }
+      70%  { box-shadow: 0 0 0 20px rgba(220, 50, 50, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(220, 50, 50, 0); }
+    }
+
+    #btn-record svg { pointer-events: none; }
+
+    #status {
+      font-size: 1rem;
+      min-height: 1.5rem;
+      margin-bottom: 2rem;
+      color: #aaa;
+      text-align: center;
+    }
+
+    /* Settings panel */
+    details {
+      width: 100%;
+      max-width: 420px;
+      background: #16213e;
+      border-radius: 10px;
+      padding: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: #ccc;
+      list-style: none;
+    }
+
+    summary::after { content: " ▸"; }
+    details[open] summary::after { content: " ▾"; }
+
+    .field { margin-top: 0.8rem; display: flex; flex-direction: column; gap: 0.3rem; }
+    label { font-size: 0.8rem; color: #888; }
+
+    input, select {
+      background: #0f3460;
+      border: 1px solid #334;
+      color: #e0e0e0;
+      border-radius: 6px;
+      padding: 0.5rem 0.7rem;
+      font-size: 0.9rem;
+    }
+
+    /* Transcript area */
+    #transcript-section {
+      width: 100%;
+      max-width: 420px;
+      display: none;
+    }
+
+    #transcript-section.visible { display: block; }
+
+    #transcript {
+      width: 100%;
+      min-height: 140px;
+      background: #16213e;
+      border: 1px solid #334;
+      border-radius: 10px;
+      padding: 0.8rem;
+      color: #e0e0e0;
+      font-size: 0.9rem;
+      resize: vertical;
+    }
+
+    .actions {
+      display: flex;
+      gap: 0.6rem;
+      margin-top: 0.7rem;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      flex: 1;
+      padding: 0.7rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: #dc3232; color: #fff; }
+    .btn-secondary { background: #334; color: #ccc; }
+
+    /* Participants */
+    #participants-field { margin-top: 0.8rem; }
+  </style>
+</head>
+<body>
+
+<h1>🎙 MeetNote</h1>
+<p class="subtitle">Enregistrement → Transcription → Notion</p>
+
+<button id="btn-record" title="Démarrer / Arrêter">
+  <!-- Mic icon -->
+  <svg id="icon-mic" width="48" height="48" viewBox="0 0 24 24" fill="white">
+    <path d="M12 1a4 4 0 0 0-4 4v7a4 4 0 0 0 8 0V5a4 4 0 0 0-4-4z"/>
+    <path d="M19 10v2a7 7 0 0 1-14 0v-2H3v2a9 9 0 0 0 8 8.94V23h2v-2.06A9 9 0 0 0 21 12v-2z"/>
+  </svg>
+  <!-- Stop icon (hidden by default) -->
+  <svg id="icon-stop" width="48" height="48" viewBox="0 0 24 24" fill="white" style="display:none">
+    <rect x="4" y="4" width="16" height="16" rx="2"/>
+  </svg>
+</button>
+
+<div id="status">Appuyer pour démarrer</div>
+
+<!-- Settings -->
+<details id="settings">
+  <summary>Paramètres</summary>
+  <div class="field">
+    <label for="notion-token">Notion Token</label>
+    <input type="password" id="notion-token" placeholder="secret_..." />
+  </div>
+  <div class="field">
+    <label for="notion-db">Database ID Notion</label>
+    <input type="text" id="notion-db" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+  </div>
+  <div class="field">
+    <label for="whisper-model">Modèle Whisper</label>
+    <select id="whisper-model">
+      <option value="Xenova/whisper-tiny">tiny (rapide)</option>
+      <option value="Xenova/whisper-base" selected>base (recommandé)</option>
+      <option value="Xenova/whisper-small">small (précis)</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="whisper-lang">Langue</label>
+    <select id="whisper-lang">
+      <option value="fr" selected>Français</option>
+      <option value="en">English</option>
+      <option value="es">Español</option>
+      <option value="de">Deutsch</option>
+    </select>
+  </div>
+</details>
+
+<!-- Transcript result -->
+<div id="transcript-section">
+  <div id="participants-field" class="field">
+    <label for="participants">Participants (optionnel)</label>
+    <input type="text" id="participants" placeholder="Alice, Bob, Charlie…" />
+  </div>
+  <textarea id="transcript" placeholder="Transcript…"></textarea>
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-push">Envoyer vers Notion</button>
+    <button class="btn btn-secondary" id="btn-discard">Annuler</button>
+  </div>
+</div>
+
+<script type="module" src="app.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>
