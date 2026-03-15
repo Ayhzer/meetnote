@@ -41,7 +41,7 @@ export async function pushToNotion({
       const fileUploadId = await _uploadAudio(token, audioBlob, now);
       if (fileUploadId) {
         const fname = `meetnote_${now.toISOString().slice(0,19).replace(/[:T]/g,'-')}.webm`;
-        props['Enregistrement'] = {
+        props['Files & media'] = {
           files: [{
             type: 'file_upload',
             file_upload: { id: fileUploadId },

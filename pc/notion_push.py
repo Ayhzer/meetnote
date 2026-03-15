@@ -83,7 +83,7 @@ def push_to_notion(
             print(f"[notion_push] Warning: audio upload failed: {e}", file=sys.stderr)
 
     if file_upload_id:
-        props["Enregistrement"] = {
+        props["Files & media"] = {
             "files": [{
                 "type": "file_upload",
                 "file_upload": {"id": file_upload_id},
@@ -98,7 +98,14 @@ def push_to_notion(
     }
 
     resp = requests.post(f"{NOTION_API}/pages", json=payload, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
+    if not resp.ok:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise requests.HTTPError(
+            f"{resp.status_code} {resp.reason} — {detail}", response=resp
+        )
     return resp.json()
 
 
