@@ -6,7 +6,7 @@
 
 // Si vous avez un Cloudflare Worker proxy, remplacez par son URL :
 // ex: 'https://meetnote-proxy.your-name.workers.dev'
-const NOTION_API = 'https://api.notion.com/v1';
+const NOTION_API = 'https://notion-cors-proxy.pottier-alexandre-01.workers.dev/v1';
 
 export async function pushToNotion({
   token,
