@@ -17,6 +17,7 @@ export async function pushToNotion({
   detectedLang = null,
   audioBlob = null,
   recordingDate = null,
+  status = 'À traiter',
 }) {
   const now   = recordingDate || new Date();
   const title = `Réunion ${now.toLocaleDateString('fr-FR')} ${now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`;
@@ -27,7 +28,7 @@ export async function pushToNotion({
     Titre:  { title:  [{ text: { content: title } }] },
     Date:   { date:   { start: now.toISOString() } },
     Source: { select: { name: source } },
-    Statut: { select: { name: 'À traiter' } },
+    Statut: { select: { name: status } },
   };
 
   if (participants) props['Participants'] = { select: { name: participants.slice(0, 100) } };
@@ -40,7 +41,8 @@ export async function pushToNotion({
     try {
       const fileUploadId = await _uploadAudio(token, audioBlob, now);
       if (fileUploadId) {
-        const fname = `meetnote_${now.toISOString().slice(0,19).replace(/[:T]/g,'-')}.webm`;
+        const ext2  = (audioBlob.type || '').includes('ogg') ? 'ogg' : (audioBlob.type || '').includes('mp4') ? 'mp4' : 'webm';
+      const fname = `meetnote_${now.toISOString().slice(0,19).replace(/[:T]/g,'-')}.${ext2}`;
         props['Files & media'] = {
           files: [{
             type: 'file_upload',
@@ -86,8 +88,9 @@ export async function pushToNotion({
 
 // ── Upload audio en 2 étapes ────────────────────────────────────────────────
 async function _uploadAudio(token, blob, date) {
-  const fname = `meetnote_${date.toISOString().slice(0,19).replace(/[:T]/g,'-')}.webm`;
   const mime  = blob.type || 'audio/webm';
+  const ext   = mime.includes('ogg') ? 'ogg' : mime.includes('mp4') ? 'mp4' : 'webm';
+  const fname = `meetnote_${date.toISOString().slice(0,19).replace(/[:T]/g,'-')}.${ext}`;
 
   // Étape 1 — créer l'objet file_upload
   const r1 = await fetch(`${NOTION_API}/file_uploads`, {

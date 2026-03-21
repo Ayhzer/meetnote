@@ -1,8 +1,8 @@
 /**
- * app.js — Orchestration principale PWA MeetNote
+ * app.js — Orchestration principale PWA MeetNote (mobile, sans transcription locale)
+ * Flow : enregistrement → envoi audio vers Notion → transcription sur PC
  */
 import { AudioRecorder } from './recorder.js';
-import { transcribe }    from './whisper.js';
 import { pushToNotion }  from './notion.js';
 
 // ─── DOM refs ───────────────────────────────────────────────────────────────
@@ -10,36 +10,33 @@ const btnRecord      = document.getElementById('btn-record');
 const iconMic        = document.getElementById('icon-mic');
 const iconStop       = document.getElementById('icon-stop');
 const statusEl       = document.getElementById('status');
+const timerEl        = document.getElementById('timer');
 
 // Sections
 const actionBtns     = document.getElementById('action-btns');
-const btnStop        = document.getElementById('btn-stop');
+const btnStopNotion  = document.getElementById('btn-stop-notion');
+const btnStopOnly    = document.getElementById('btn-stop-only');
 const btnCancel      = document.getElementById('btn-cancel');
-const transcriptSec  = document.getElementById('transcript-section');
+const sendSection    = document.getElementById('send-section');
+const sendMeta       = document.getElementById('send-meta');
 
-// Source / Transcription controls
+// Meeting info
 const selSource      = document.getElementById('sel-source');
-const sourceHint     = document.getElementById('source-hint');
-const selModel       = document.getElementById('sel-model');
-const modelHint      = document.getElementById('model-hint');
-const selLang        = document.getElementById('sel-lang');
-const langHint       = document.getElementById('lang-hint');
 const selType        = document.getElementById('sel-type');
-
-// NIVEAUX bars
-const barLevel       = document.getElementById('bar-level');
-const barProg        = document.getElementById('bar-prog');
-
-// Transcript section
-const transcriptArea = document.getElementById('transcript');
 const participantsEl = document.getElementById('participants');
+
+// Levels
+const barLevel       = document.getElementById('bar-level');
+
+// Send section
 const btnPush        = document.getElementById('btn-push');
+const btnDownload    = document.getElementById('btn-download');
 const btnDiscard     = document.getElementById('btn-discard');
 
 // Journal
 const journalText    = document.getElementById('journal-text');
 
-// Bottom bar / modal
+// Settings modal
 const btnOpenSettings  = document.getElementById('btn-open-settings');
 const modalBackdrop    = document.getElementById('modal-backdrop');
 const btnCloseModal    = document.getElementById('btn-close-modal');
@@ -47,63 +44,21 @@ const setToken         = document.getElementById('set-token');
 const setDb            = document.getElementById('set-db');
 const btnSaveNotion    = document.getElementById('btn-save-notion');
 const saveStatus       = document.getElementById('save-status');
-const outNotion        = document.getElementById('out-notion');
-const outDownload      = document.getElementById('out-download');
-const tabBtns          = document.querySelectorAll('.tab-btn');
-const tabPanels        = document.querySelectorAll('.tab-panel');
 
 // ─── State ───────────────────────────────────────────────────────────────────
-const recorder = new AudioRecorder();
-let isRecording      = false;
-let _recStartTime    = null;
-let _vuInterval      = null;
-let _detectedLang    = null;
-let _detectedModel   = null;
-let _lastAudioBlob   = null;
+const recorder    = new AudioRecorder();
+let isRecording   = false;
+let _recStartTime = null;
+let _vuInterval   = null;
+let _timerInterval = null;
+let _lastAudioBlob = null;
+let _pendingNotion = false;   // stop triggered by "Stop & Notion" button
 
-// ─── Hints ───────────────────────────────────────────────────────────────────
-const SOURCE_HINTS = {
-  micro:    'Capte uniquement votre voix via le micro. Sur mobile, seul le micro est disponible.',
-  loopback: 'Capte tous les sons du PC (non disponible sur mobile).',
-  mixte:    'Capte le micro ET les sons du PC simultanément (non disponible sur mobile).',
-};
-
-const MODEL_HINTS = {
-  'Xenova/whisper-tiny':   'Très rapide — qualité limitée (~75 Mo)',
-  'Xenova/whisper-base':   'Rapide — qualité correcte (~145 Mo)',
-  'Xenova/whisper-small':  'Bon équilibre qualité/vitesse (~460 Mo)',
-  'Xenova/whisper-medium': 'Haute qualité — lent sur mobile (~1.5 Go)',
-};
-
-const LANG_HINTS = {
-  auto: 'Détection automatique — transcrit en langue source, traduit en anglais si non-français',
-  fr:   'Français forcé',
-  en:   'Anglais forcé',
-  es:   'Espagnol forcé',
-  de:   'Allemand forcé',
-  it:   'Italien forcé',
-  pt:   'Portugais forcé',
-  nl:   'Néerlandais forcé',
-  ja:   'Japonais forcé',
-  zh:   'Chinois forcé',
-};
-
-// ─── Settings persistence ────────────────────────────────────────────────────
+// ─── Settings ────────────────────────────────────────────────────────────────
 function loadSettings() {
-  // Notion
-  setToken.value  = localStorage.getItem('mn_token') || '';
-  setDb.value     = localStorage.getItem('mn_db')    || '';
-  // Main controls
-  selModel.value  = localStorage.getItem('mn_model') || 'Xenova/whisper-base';
-  selLang.value   = localStorage.getItem('mn_lang')  || 'auto';
-  selType.value   = localStorage.getItem('mn_type')  || '';
-  // Output mode
-  const out = localStorage.getItem('mn_output') || 'notion';
-  if (out === 'download') outDownload.checked = true;
-  else                    outNotion.checked   = true;
-  // Update hints
-  updateModelHint();
-  updateLangHint();
+  setToken.value = localStorage.getItem('mn_token') || '';
+  setDb.value    = localStorage.getItem('mn_db')    || '';
+  selType.value  = localStorage.getItem('mn_type')  || '';
 }
 
 function saveNotion() {
@@ -114,65 +69,37 @@ function saveNotion() {
   setTimeout(() => { saveStatus.textContent = ''; }, 2000);
 }
 
-function updateModelHint() {
-  modelHint.textContent = MODEL_HINTS[selModel.value] || '';
-  localStorage.setItem('mn_model', selModel.value);
-}
-
-function updateLangHint() {
-  langHint.textContent = LANG_HINTS[selLang.value] || '';
-  localStorage.setItem('mn_lang', selLang.value);
-}
-
-selSource.addEventListener('change', () => {
-  sourceHint.textContent = SOURCE_HINTS[selSource.value] || '';
-});
-selModel.addEventListener('change', updateModelHint);
-selLang.addEventListener('change', updateLangHint);
 selType.addEventListener('change', () => {
   localStorage.setItem('mn_type', selType.value);
 });
-[outNotion, outDownload].forEach(r => r.addEventListener('change', () => {
-  localStorage.setItem('mn_output', r.value);
-  updatePushButton();
-}));
 
-function updatePushButton() {
-  const out = localStorage.getItem('mn_output') || 'notion';
-  btnPush.textContent = out === 'download' ? 'Télécharger .txt' : 'Envoyer vers Notion';
-}
-
-// ─── Modal & Tabs ─────────────────────────────────────────────────────────────
-btnOpenSettings.addEventListener('click', () => {
-  modalBackdrop.classList.add('open');
-});
-btnCloseModal.addEventListener('click', () => {
-  modalBackdrop.classList.remove('open');
-});
+// ─── Modal ────────────────────────────────────────────────────────────────────
+btnOpenSettings.addEventListener('click', () => modalBackdrop.classList.add('open'));
+btnCloseModal.addEventListener('click',   () => modalBackdrop.classList.remove('open'));
 modalBackdrop.addEventListener('click', (e) => {
   if (e.target === modalBackdrop) modalBackdrop.classList.remove('open');
 });
-
-tabBtns.forEach(btn => btn.addEventListener('click', () => {
-  tabBtns.forEach(b => b.classList.remove('active'));
-  tabPanels.forEach(p => p.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById(btn.dataset.tab).classList.add('active');
-}));
-
 btnSaveNotion.addEventListener('click', saveNotion);
 
-// ─── Record button (toggle) ───────────────────────────────────────────────────
+// ─── Record button (toggle start/stop+notion) ─────────────────────────────
 btnRecord.addEventListener('click', async () => {
   if (!isRecording) {
     await startRecording();
   } else {
-    await stopAndTranscribe();
+    // Main button stops and triggers Notion push
+    _pendingNotion = true;
+    await stopRecording();
   }
 });
 
-btnStop.addEventListener('click', async () => {
-  await stopAndTranscribe();
+btnStopNotion.addEventListener('click', async () => {
+  _pendingNotion = true;
+  await stopRecording();
+});
+
+btnStopOnly.addEventListener('click', async () => {
+  _pendingNotion = false;
+  await stopRecording();
 });
 
 btnCancel.addEventListener('click', async () => {
@@ -183,17 +110,17 @@ btnCancel.addEventListener('click', async () => {
 async function startRecording() {
   try {
     await recorder.start();
-    isRecording  = true;
+    isRecording   = true;
     _recStartTime = new Date();
-    _detectedLang = null;
+    _pendingNotion = false;
+    _lastAudioBlob = null;
 
     // UI → recording state
     btnRecord.classList.add('recording');
     iconMic.style.display  = 'none';
     iconStop.style.display = '';
     actionBtns.style.display = '';
-    transcriptSec.classList.remove('visible');
-    barProg.style.width = '0%';
+    sendSection.classList.remove('visible');
     setStatus('Enregistrement en cours…');
     journal('');
 
@@ -203,26 +130,26 @@ async function startRecording() {
       barLevel.style.width = Math.min(100, Math.round(level * 100)) + '%';
     }, 80);
 
+    // Timer
+    _timerInterval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - _recStartTime.getTime()) / 1000);
+      const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+      const s = String(elapsed % 60).padStart(2, '0');
+      timerEl.textContent = `${m}:${s}`;
+    }, 1000);
+
   } catch (err) {
     journal('Erreur démarrage : ' + err.message);
     setStatus('Erreur micro : ' + err.message);
   }
 }
 
-async function cancelRecording() {
+async function stopRecording() {
   isRecording = false;
   clearInterval(_vuInterval);
+  clearInterval(_timerInterval);
   barLevel.style.width = '0%';
-  try { await recorder.stop(); } catch (_) {}
-  resetRecordingUI();
-  setStatus('Annulé.');
-}
-
-async function stopAndTranscribe() {
-  isRecording = false;
-  clearInterval(_vuInterval);
-  barLevel.style.width = '0%';
-  setStatus('Arrêt de l\'enregistrement…');
+  setStatus('Arrêt…');
 
   let blob;
   try {
@@ -237,33 +164,32 @@ async function stopAndTranscribe() {
 
   resetRecordingUI();
 
-  const model = selModel.value;
-  const lang  = selLang.value;
+  const durationMin = _recStartTime
+    ? (Date.now() - _recStartTime.getTime()) / 60000
+    : 0;
+  const dStr = durationMin >= 1
+    ? `${Math.round(durationMin)} min`
+    : `${Math.round(durationMin * 60)} sec`;
 
-  setStatus('Transcription en cours…');
-  barProg.style.width = '10%';
+  sendMeta.textContent = `Durée : ${dStr}  ·  ${formatDate(_recStartTime)}`;
+  sendSection.classList.add('visible');
+  setStatus('Enregistrement terminé.');
 
-  try {
-    const text = await transcribe(blob, {
-      model,
-      language: lang,
-      onProgress: (msg, pct) => {
-        setStatus(msg);
-        if (pct !== undefined) barProg.style.width = pct + '%';
-      },
-      onLangDetected: (l) => { _detectedLang = l; },
-    });
-
-    barProg.style.width = '100%';
-    transcriptArea.value = text;
-    transcriptSec.classList.add('visible');
-    setStatus('Transcript prêt — vérifiez et envoyez.');
-
-  } catch (err) {
-    barProg.style.width = '0%';
-    journal('Erreur transcription : ' + err.message);
-    setStatus('Erreur transcription : ' + err.message);
+  if (_pendingNotion) {
+    await pushAudioToNotion();
   }
+}
+
+async function cancelRecording() {
+  isRecording = false;
+  clearInterval(_vuInterval);
+  clearInterval(_timerInterval);
+  barLevel.style.width = '0%';
+  timerEl.textContent = '';
+  try { await recorder.stop(); } catch (_) {}
+  _lastAudioBlob = null;
+  resetRecordingUI();
+  setStatus('Annulé.');
 }
 
 function resetRecordingUI() {
@@ -271,24 +197,44 @@ function resetRecordingUI() {
   iconMic.style.display   = '';
   iconStop.style.display  = 'none';
   actionBtns.style.display = 'none';
+  timerEl.textContent = '';
 }
 
 // ─── Push / Download ──────────────────────────────────────────────────────────
-btnPush.addEventListener('click', async () => {
-  const out = localStorage.getItem('mn_output') || 'notion';
+btnPush.addEventListener('click', pushAudioToNotion);
 
-  if (out === 'download') {
-    downloadTxt();
-    return;
-  }
+btnDownload.addEventListener('click', () => {
+  if (!_lastAudioBlob) return;
+  const date  = (_recStartTime || new Date()).toISOString().slice(0, 16).replace('T', '_').replace(':', 'h');
+  const ext   = _lastAudioBlob.type.includes('ogg') ? 'ogg'
+              : _lastAudioBlob.type.includes('mp4') ? 'mp4' : 'webm';
+  const fname = `MeetNote_${date}.${ext}`;
+  const url   = URL.createObjectURL(_lastAudioBlob);
+  const a     = document.createElement('a');
+  a.href      = url;
+  a.download  = fname;
+  a.click();
+  URL.revokeObjectURL(url);
+  journal(`Audio téléchargé : ${fname}`);
+});
 
-  // Notion push
+btnDiscard.addEventListener('click', () => {
+  clearSendSection();
+  setStatus('Annulé.');
+});
+
+async function pushAudioToNotion() {
   const token = setToken.value.trim() || localStorage.getItem('mn_token') || '';
   const dbId  = setDb.value.trim()    || localStorage.getItem('mn_db')    || '';
 
   if (!token || !dbId) {
     setStatus('Renseignez le token et le database ID dans Paramètres.');
     modalBackdrop.classList.add('open');
+    return;
+  }
+
+  if (!_lastAudioBlob) {
+    setStatus('Aucun audio à envoyer.');
     return;
   }
 
@@ -302,53 +248,33 @@ btnPush.addEventListener('click', async () => {
   try {
     await pushToNotion({
       token,
-      databaseId:    dbId,
-      transcript:    transcriptArea.value,
-      participants:  participantsEl.value.trim(),
-      source:        'Mobile',
-      meetingType:   selType.value,
-      durationMin:   Math.round(durationMin * 10) / 10,
-      whisperModel:  selModel.value.replace('Xenova/whisper-', ''),
-      detectedLang:  _detectedLang,
-      audioBlob:     _lastAudioBlob,
+      databaseId:   dbId,
+      transcript:   'Audio enregistré sur mobile — à transcrire sur PC',
+      participants: participantsEl.value.trim(),
+      source:       'Mobile',
+      meetingType:  selType.value,
+      durationMin:  Math.round(durationMin * 10) / 10,
+      whisperModel: '',
       recordingDate: _recStartTime,
+      audioBlob:    _lastAudioBlob,
+      status:       'À transcrire sur PC',
     });
-    setStatus('✓ Page créée dans Notion !');
-    clearTranscript();
+    setStatus('✓ Audio envoyé vers Notion ! Ouvrez MeetNote PC pour transcrire.');
+    journal('Audio envoyé vers Notion avec statut "À transcrire sur PC".');
+    clearSendSection();
   } catch (err) {
     journal('Erreur Notion : ' + err.message);
     setStatus('Erreur Notion : ' + err.message);
   } finally {
     btnPush.disabled = false;
   }
-});
-
-btnDiscard.addEventListener('click', () => {
-  clearTranscript();
-  setStatus('Annulé.');
-});
-
-function downloadTxt() {
-  const text   = transcriptArea.value;
-  const date   = (_recStartTime || new Date()).toISOString().slice(0, 16).replace('T', '_').replace(':', 'h');
-  const fname  = `MeetNote_${date}.txt`;
-  const blob   = new Blob([text], { type: 'text/plain;charset=utf-8' });
-  const url    = URL.createObjectURL(blob);
-  const a      = document.createElement('a');
-  a.href       = url;
-  a.download   = fname;
-  a.click();
-  URL.revokeObjectURL(url);
-  setStatus(`✓ Fichier téléchargé : ${fname}`);
-  clearTranscript();
 }
 
-function clearTranscript() {
-  transcriptSec.classList.remove('visible');
-  transcriptArea.value  = '';
-  participantsEl.value  = '';
-  barProg.style.width   = '0%';
-  _lastAudioBlob        = null;
+function clearSendSection() {
+  sendSection.classList.remove('visible');
+  participantsEl.value = '';
+  _lastAudioBlob = null;
+  _recStartTime  = null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -363,8 +289,12 @@ function journal(msg) {
   journalText.scrollTop = journalText.scrollHeight;
 }
 
+function formatDate(d) {
+  if (!d) return '';
+  return d.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric' })
+    + ' ' + d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+}
+
 // ─── Init ──────────────────────────────────────────────────────────────────────
 loadSettings();
-updatePushButton();
-sourceHint.textContent = SOURCE_HINTS['micro'];
 setStatus('Appuyer pour démarrer');
