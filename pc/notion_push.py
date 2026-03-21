@@ -36,9 +36,10 @@ def push_to_notion(
     whisper_model: str = "",
     start_time: datetime.datetime = None,
     audio_path: str = None,
+    title_override: str = "",
 ) -> dict:
     now   = start_time or datetime.datetime.now()
-    title = f"Réunion {now.strftime('%Y-%m-%d %H:%M')}"
+    title = title_override.strip() if title_override and title_override.strip() else f"Réunion {now.strftime('%Y-%m-%d %H:%M')}"
 
     blocks = []
     for para in transcript.split("\n"):
@@ -68,33 +69,42 @@ def push_to_notion(
         props["Modèle Whisper"] = {"select": {"name": whisper_model}}
 
     # ── Upload audio si fourni ────────────────────────────────────────────────
-    file_upload_id = None
-    audio_filename = None
     if audio_path and os.path.isfile(audio_path):
         try:
             compressed = _compress_audio(audio_path, now)
-            file_upload_id, audio_filename = _upload_file(compressed)
-            # Supprimer le fichier compressé temporaire
+            segments   = _split_audio_for_upload(compressed, segment_min=config.NOTION_UPLOAD_SEGMENT_MIN)
+
+            file_objects = []
+            for seg_path in segments:
+                fid, fname = _upload_file(seg_path)
+                file_objects.append({
+                    "type": "file_upload",
+                    "file_upload": {"id": fid},
+                    "name": fname,
+                })
+                if seg_path != compressed and seg_path != audio_path:
+                    try: os.remove(seg_path)
+                    except OSError: pass
+
             if compressed != audio_path:
                 try: os.remove(compressed)
                 except OSError: pass
+
+            if file_objects:
+                props["Files & media"] = {"files": file_objects}
+
         except Exception as e:
             # L'upload audio est non-bloquant : on continue sans fichier
             print(f"[notion_push] Warning: audio upload failed: {e}", file=sys.stderr)
 
-    if file_upload_id:
-        props["Files & media"] = {
-            "files": [{
-                "type": "file_upload",
-                "file_upload": {"id": file_upload_id},
-                "name": audio_filename,
-            }]
-        }
+    # Découpage en batches de 100 blocs (limite API Notion)
+    first_batch  = blocks[:100]
+    extra_blocks = blocks[100:]
 
     payload = {
         "parent":     {"database_id": config.NOTION_DATABASE_ID},
         "properties": props,
-        "children":   blocks[:100],
+        "children":   first_batch,
     }
 
     resp = requests.post(f"{NOTION_API}/pages", json=payload, headers=HEADERS, timeout=30)
@@ -106,7 +116,30 @@ def push_to_notion(
         raise requests.HTTPError(
             f"{resp.status_code} {resp.reason} — {detail}", response=resp
         )
-    return resp.json()
+    page = resp.json()
+    page_id = page["id"]
+
+    # Ajouter les blocs supplémentaires via PATCH /blocks/{id}/children
+    while extra_blocks:
+        batch = extra_blocks[:100]
+        extra_blocks = extra_blocks[100:]
+        r = requests.patch(
+            f"{NOTION_API}/blocks/{page_id}/children",
+            json={"children": batch},
+            headers=HEADERS,
+            timeout=30,
+        )
+        if not r.ok:
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(
+                f"Ajout blocs supplémentaires : {r.status_code} {r.reason} — {detail}",
+                response=r,
+            )
+
+    return page
 
 
 def _compress_audio(wav_path: str, dt: datetime.datetime) -> str:
@@ -141,6 +174,76 @@ def _find_ffmpeg() -> str | None:
         if os.path.isfile(candidate):
             return candidate
     return shutil.which("ffmpeg")
+
+
+def _find_ffprobe() -> str | None:
+    """Cherche ffprobe : déduit du chemin ffmpeg, puis dans PATH."""
+    import shutil
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg:
+        # Cherche ffprobe dans le même dossier que ffmpeg
+        ffprobe = os.path.join(os.path.dirname(ffmpeg),
+                               "ffprobe.exe" if sys.platform == "win32" else "ffprobe")
+        if os.path.isfile(ffprobe):
+            return ffprobe
+    return shutil.which("ffprobe")
+
+
+def _split_audio_for_upload(opus_path: str, segment_min: int = 10) -> list:
+    """
+    Découpe un fichier opus en segments de N minutes via ffmpeg.
+    Retourne la liste des chemins de segments.
+    Si le fichier est assez court, retourne [opus_path] sans modification.
+    """
+    import json as _json
+    import glob as _glob
+
+    ffmpeg  = _find_ffmpeg()
+    ffprobe = _find_ffprobe()
+
+    if not ffmpeg:
+        return [opus_path]
+
+    # Déterminer la durée
+    duration_s = None
+    if ffprobe:
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "quiet", "-print_format", "json",
+                 "-show_format", opus_path],
+                capture_output=True, timeout=15,
+            )
+            if r.returncode == 0:
+                duration_s = float(_json.loads(r.stdout)["format"]["duration"])
+        except Exception:
+            pass
+
+    # Si on n'a pas pu mesurer la durée, on découpe si le fichier > 50 Mo
+    if duration_s is None:
+        size_mb = os.path.getsize(opus_path) / (1024 * 1024)
+        if size_mb <= segment_min * 0.3:   # ~0.3 Mo/min à 24 kbps
+            return [opus_path]
+        # durée estimée
+        duration_s = size_mb / 0.3 * 60
+
+    if duration_s <= segment_min * 60:
+        return [opus_path]
+
+    base    = os.path.splitext(opus_path)[0]
+    pattern = f"{base}_part%03d.opus"
+    cmd = [
+        ffmpeg, "-y", "-i", opus_path,
+        "-f", "segment",
+        "-segment_time", str(segment_min * 60),
+        "-c", "copy",
+        pattern,
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=600)
+    if result.returncode != 0:
+        return [opus_path]   # échec silencieux → envoyer le fichier entier
+
+    parts = sorted(_glob.glob(f"{base}_part*.opus"))
+    return parts if parts else [opus_path]
 
 
 def _upload_file(path: str) -> tuple[str, str]:

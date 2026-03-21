@@ -83,6 +83,16 @@ sc_dir = os.path.join(SITE_PKG, "soundcard")
 if os.path.isdir(sc_dir):
     datas_lines.append(f"    (r'{sc_dir.replace(chr(92), '/')}', 'soundcard'),")
 
+# ─── Embed ffmpeg + ffprobe si disponibles (avant écriture du spec) ───────────
+import shutil as _shutil
+for _bin in ("ffmpeg.exe", "ffprobe.exe"):
+    _found = _shutil.which(_bin.replace(".exe", "")) or _shutil.which(_bin)
+    if _found:
+        datas_lines.append(f"    (r'{_found.replace(chr(92), '/')}', r'.'),")
+        print(f"[build_spec] Bundling {_bin}: {_found}")
+    else:
+        print(f"[build_spec] {_bin} not found in PATH — audio compression requires ffmpeg at runtime")
+
 datas_block = "\n".join(datas_lines)
 
 # ─── Hidden imports ───────────────────────────────────────────────────────────
@@ -124,6 +134,24 @@ hidden_imports = [
     "notion_push",
     "config",
     "user_config",
+    "history",
+    "outlook_cal",
+    "wave",
+    "glob",
+    "json",
+    "collections",
+    "dataclasses",
+    "shutil",
+    "scipy",
+    "scipy.signal",
+    "noisereduce",
+    "pycaw",
+    "pycaw.pycaw",
+    "comtypes",
+    "psutil",
+    "win32com",
+    "win32com.client",
+    "pywintypes",
 ]
 hidden_imports_str = ",\n    ".join(f"'{h}'" for h in hidden_imports)
 
@@ -155,7 +183,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
-    excludes=['matplotlib', 'scipy', 'pandas', 'jupyter', 'IPython', 'PyQt5', 'wx'],
+    excludes=['pandas', 'jupyter', 'IPython', 'PyQt5', 'wx'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
