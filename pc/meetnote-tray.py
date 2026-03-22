@@ -51,7 +51,7 @@ def _allow_sleep():
     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
 # ─── State ───────────────────────────────────────────────────────────────────
-_rec_gain        = 1.0   # gain numérique appliqué aux samples capturés
+_rec_gain        = 4.0   # gain numérique appliqué aux samples capturés
 _recording       = False
 _audio_chunks    = []
 _wav_stream      = None
@@ -369,6 +369,142 @@ def _save_transcript_local(job: _Job) -> str | None:
         return None
 
 
+# ─── Diarisation (MFCC + DBSCAN, sans dépendance externe) ───────────────────
+def _diarize(audio_path: str, segments: list) -> dict:
+    """
+    Identifie les locuteurs sur chaque segment Whisper via embeddings MFCC + DBSCAN.
+    Distinction H/F via pitch moyen (F0 autocorrélation).
+    Retourne {segment_idx: "SPKR_X (H|F)"} ou {} en cas d'échec.
+    Dépendances : numpy, scipy, sklearn, soundfile — toutes déjà présentes.
+    """
+    if len(segments) < 2:
+        return {}
+    try:
+        import warnings
+        warnings.filterwarnings("ignore")
+        import numpy as np_d
+        import soundfile as sf
+        from scipy.signal import resample_poly
+        from scipy.fft import dct
+        from sklearn.cluster import DBSCAN
+        from sklearn.preprocessing import normalize
+        from math import gcd
+
+        SR = 16000
+
+        # ── Charge audio ──────────────────────────────────────────────────────
+        wav, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr != SR:
+            g = gcd(SR, sr)
+            wav = resample_poly(wav, SR // g, sr // g).astype(np_d.float32)
+        wav = np_d.clip(wav, -1.0, 1.0)
+
+        # ── MFCC léger (13 coefficients, fenêtres de 25ms / pas 10ms) ────────
+        def _mfcc_mean(chunk, n_mfcc=13, n_filt=26):
+            N = len(chunk)
+            if N < 400:
+                return None
+            frame_len = 400          # 25ms @ 16kHz
+            hop       = 160          # 10ms
+            n_fft     = 512
+            # Découpe en frames
+            frames = np_d.lib.stride_tricks.sliding_window_view(
+                np_d.pad(chunk, (0, frame_len)), frame_len
+            )[::hop]
+            # Fenêtre de Hamming
+            win = np_d.hamming(frame_len)
+            frames = frames * win
+            # Spectre de puissance
+            mag   = np_d.abs(np_d.fft.rfft(frames, n=n_fft)) ** 2
+            freqs = np_d.fft.rfftfreq(n_fft, d=1.0 / SR)
+            # Banc de filtres mel
+            f_min, f_max = 80.0, 7600.0
+            mel_min  = 2595 * np_d.log10(1 + f_min / 700)
+            mel_max  = 2595 * np_d.log10(1 + f_max / 700)
+            mel_pts  = np_d.linspace(mel_min, mel_max, n_filt + 2)
+            hz_pts   = 700 * (10 ** (mel_pts / 2595) - 1)
+            bin_pts  = np_d.floor((n_fft + 1) * hz_pts / SR).astype(int)
+            fbank    = np_d.zeros((n_filt, n_fft // 2 + 1))
+            for m in range(1, n_filt + 1):
+                lo, ctr, hi = bin_pts[m-1], bin_pts[m], bin_pts[m+1]
+                fbank[m-1, lo:ctr] = (np_d.arange(lo, ctr) - lo) / (ctr - lo + 1e-9)
+                fbank[m-1, ctr:hi] = (hi - np_d.arange(ctr, hi)) / (hi - ctr + 1e-9)
+            filter_banks = np_d.dot(mag, fbank.T)
+            filter_banks = np_d.log(filter_banks + 1e-9)
+            mfcc         = dct(filter_banks, type=2, axis=1, norm="ortho")[:, 1:n_mfcc+1]
+            return mfcc.mean(axis=0)
+
+        # ── Pitch F0 par autocorrélation ──────────────────────────────────────
+        def _mean_pitch(chunk):
+            if len(chunk) < 512:
+                return 0.0
+            frame = chunk[:2048]
+            corr  = np_d.correlate(frame, frame, mode="full")[len(frame)-1:]
+            corr[0] = 0
+            lo, hi = int(SR / 300), int(SR / 80)
+            if hi >= len(corr):
+                return 0.0
+            peak = np_d.argmax(corr[lo:hi]) + lo
+            return SR / peak if peak > 0 else 0.0
+
+        # ── Embeddings par segment ────────────────────────────────────────────
+        embeds, valid_idx, pitches = [], [], []
+        for i, (start, end, _) in enumerate(segments):
+            s, e = int(start * SR), int(end * SR)
+            chunk = wav[s:e]
+            feat  = _mfcc_mean(chunk)
+            if feat is None:
+                continue
+            embeds.append(feat)
+            valid_idx.append(i)
+            pitches.append(_mean_pitch(chunk))
+
+        if len(embeds) < 2:
+            return {}
+
+        X = normalize(np_d.array(embeds))
+
+        # ── DBSCAN clustering ─────────────────────────────────────────────────
+        db     = DBSCAN(eps=0.35, min_samples=1, metric="cosine").fit(X)
+        labels = db.labels_
+
+        # ── Pitch moyen par locuteur → genre ──────────────────────────────────
+        pitch_by_lbl = {}
+        for ei, lbl in enumerate(labels):
+            pitch_by_lbl.setdefault(lbl, []).append(pitches[ei])
+        pitch_mean = {lbl: np_d.mean([v for v in ps if v > 0] or [0])
+                      for lbl, ps in pitch_by_lbl.items()}
+
+        def _genre(lbl):
+            f0 = pitch_mean.get(lbl, 0)
+            if f0 < 10:
+                return ""
+            return " (F)" if f0 >= 165 else " (H)"
+
+        # ── Numérotation par ordre d'apparition ───────────────────────────────
+        seen, counter = {}, [0]
+        def _name(lbl):
+            if lbl == -1:
+                return ""
+            if lbl not in seen:
+                counter[0] += 1
+                seen[lbl] = counter[0]
+            return f"SPKR_{seen[lbl]}{_genre(lbl)}"
+
+        result = {}
+        for ei, seg_i in enumerate(valid_idx):
+            n = _name(labels[ei])
+            if n:
+                result[seg_i] = n
+        return result
+
+    except Exception as e:
+        _log_error(f"Diarisation ignorée : {e}")
+        return {}
+
+
 # ─── Étapes de traitement ─────────────────────────────────────────────────────
 def _do_step_transcribe(job: _Job) -> bool:
     """Transcrit le fichier audio. Met à jour job.transcript + job.status_transcript."""
@@ -433,7 +569,9 @@ def _do_step_transcribe(job: _Job) -> bool:
         else:
             seg_paths = [path]  # opus/mp3/etc → Whisper lit directement via ffmpeg
         n_segs    = len(seg_paths)
-        all_lines = []
+        # ── Collecte des segments Whisper avec timestamps absolus ──────────────
+        raw_segments = []   # list of (start_abs, end_abs, text)
+        all_lines    = []
 
         for i, seg_path in enumerate(seg_paths):
             if n_segs > 1:
@@ -449,22 +587,30 @@ def _do_step_transcribe(job: _Job) -> bool:
                 no_speech_threshold=0.6,
                 temperature=0,
             )
-            seg_total = max(seg_info.duration, 1)
-            # Offset temporel si plusieurs segments (N * segment_min * 60s)
+            seg_total   = max(seg_info.duration, 1)
             time_offset = i * config.TRANSCRIPTION_SEGMENT_MIN * 60
             for seg in seg_segments:
                 text = seg.text.strip()
                 if not text:
                     continue
-                t = int(seg.start) + time_offset
-                ts = f"[{t // 3600:02d}:{(t % 3600) // 60:02d}:{t % 60:02d}]"
-                all_lines.append(f"{ts} {text}")
+                raw_segments.append((seg.start + time_offset, seg.end + time_offset, text))
                 frac = seg.end / seg_total / n_segs
-                _set_progress(min(20 + int((i / n_segs + frac) * 65), 85))
+                _set_progress(min(20 + int((i / n_segs + frac) * 55), 75))
             if seg_path != path:
                 try: os.remove(seg_path)
                 except OSError: pass
 
+        # ── Diarisation (resemblyzer + DBSCAN) ────────────────────────────────
+        speaker_map = _diarize(path, raw_segments)  # {idx: "SPKR_X (H/F)"} ou {}
+
+        for idx, (start_abs, end_abs, text) in enumerate(raw_segments):
+            t  = int(start_abs)
+            ts = f"[{t // 3600:02d}:{(t % 3600) // 60:02d}:{t % 60:02d}]"
+            spk = speaker_map.get(idx, "")
+            prefix = f"{spk}: " if spk else ""
+            all_lines.append(f"{ts} {prefix}{text}")
+
+        _set_progress(85)
         job.transcript = "\n".join(all_lines)
         job.status_transcript = "done"
         hist_mod.update(job)
@@ -1616,7 +1762,7 @@ def _build_window():
     tk.Label(rg, text="REC GAIN", font=("Segoe UI", 7),
              bg=S_CARD, fg=FG3, width=12, anchor="w").pack(side="left")
 
-    _gain_label = tk.Label(rg, text="1.0x", font=("Consolas", 7),
+    _gain_label = tk.Label(rg, text="4.0x", font=("Consolas", 7),
                            bg=S_CARD, fg=FG3, width=5, anchor="e")
     _gain_label.pack(side="right")
 
@@ -1630,7 +1776,7 @@ def _build_window():
                            bg="#dc3232", fg=FG, troughcolor=S_HIGH,
                            activebackground="#ff4444", highlightthickness=0,
                            sliderrelief="raised", bd=1, showvalue=False)
-    gain_slider.set(1.0)
+    gain_slider.set(4.0)
     gain_slider.pack(side="left", fill="x", expand=True, padx=(4, 4))
 
     # ── Volume Windows (pycaw)
