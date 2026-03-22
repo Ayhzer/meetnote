@@ -933,20 +933,46 @@ def _hide_window():
 
 # ─── Tray menu ────────────────────────────────────────────────────────────────
 def _build_menu():
+    # Statut dynamique
+    if _recording:
+        status_label = "● Enregistrement en cours…"
+    elif _job_queue or _worker_busy:
+        n = len(_job_queue) + (1 if _worker_busy else 0)
+        status_label = f"⏳ Traitement ({n} job(s))"
+    else:
+        status_label = "○ Prêt"
+
     return pystray.Menu(
-        pystray.MenuItem(
-            "● Enregistrement en cours…" if _recording else "○ Prêt",
-            lambda i, it: None, enabled=False,
-        ),
+        pystray.MenuItem(status_label, lambda i, it: None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Ouvrir", lambda i, it: _show_window(), default=True),
+        pystray.MenuItem("Ouvrir",    lambda i, it: _show_window(), default=True),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Démarrer",             lambda i, it: _do_start(),           enabled=not _recording),
-        pystray.MenuItem("Arrêter / Transcrire", lambda i, it: _do_stop_transcribe(), enabled=_recording),
-        pystray.MenuItem("Annuler",              lambda i, it: _do_cancel(),          enabled=_recording),
+        # ── Actions enregistrement
+        pystray.MenuItem("▶  Démarrer",               lambda i, it: _do_start(),            enabled=not _recording),
+        pystray.MenuItem("⏹  Arrêter et transcrire",  lambda i, it: _do_stop_transcribe(),  enabled=_recording),
+        pystray.MenuItem("⏸  Arrêter sans transcrire",lambda i, it: _do_stop_archive_only(),enabled=_recording),
+        pystray.MenuItem("✕  Annuler",                lambda i, it: _do_cancel(),           enabled=_recording),
+        pystray.Menu.SEPARATOR,
+        # ── Historique & fichiers
+        pystray.MenuItem("📋  Historique",             lambda i, it: _toggle_history_window()),
+        pystray.MenuItem("📂  Importer un fichier audio", lambda i, it: _import_audio_file()),
+        pystray.Menu.SEPARATOR,
+        # ── Dossiers
+        pystray.MenuItem("🎙  Dossier Audio",          lambda i, it: _open_audio_dir_tray()),
+        pystray.MenuItem("📄  Dossier Transcripts",    lambda i, it: _open_transcript_dir_tray()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("⚙  Paramètres",             lambda i, it: _open_settings()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quitter", _quit_app),
     )
+
+def _open_audio_dir_tray():
+    os.makedirs(config.AUDIO_ARCHIVE_DIR, exist_ok=True)
+    subprocess.Popen(f'explorer "{config.AUDIO_ARCHIVE_DIR}"')
+
+def _open_transcript_dir_tray():
+    os.makedirs(config.TRANSCRIPT_DIR, exist_ok=True)
+    subprocess.Popen(f'explorer "{config.TRANSCRIPT_DIR}"')
 
 def _quit_app(icon=None, item=None):
     if _recording:
