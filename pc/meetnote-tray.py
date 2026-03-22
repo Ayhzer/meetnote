@@ -876,7 +876,7 @@ def _do_stop_transcribe():
         duration_min=duration_min,
         model_name=_model_var.get() if _model_var else config.WHISPER_MODEL,
         language=_lang_var.get() if _lang_var else config.WHISPER_LANGUAGE,
-        meeting_type=(_type_var.get() if _type_var and _type_var.get() != "—" else ""),
+        meeting_type=(_type_var.get() if _type_var and _type_var.get() not in ("—", "Non précisé") else ""),
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
     )
@@ -936,7 +936,7 @@ def _do_stop_archive_only():
         duration_min=duration_min,
         model_name=_model_var.get() if _model_var else config.WHISPER_MODEL,
         language=_lang_var.get() if _lang_var else config.WHISPER_LANGUAGE,
-        meeting_type=(_type_var.get() if _type_var and _type_var.get() != "—" else ""),
+        meeting_type=(_type_var.get() if _type_var and _type_var.get() not in ("—", "Non précisé") else ""),
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
         status_transcript="queued",
@@ -1675,9 +1675,9 @@ def _build_window():
 
     rt = _row(sec_mtg)
     _lbl(rt, "Meeting type")
-    _type_var = tk.StringVar(value="—")
+    _type_var = tk.StringVar(value="Non précisé")
     type_combo = _combo(rt, _type_var,
-                        ["—", "Gouvernance", "Technique", "Projet", "RH", "Fournisseur", "Autre"])
+                        ["Non précisé", "Gouvernance", "Technique", "Projet", "RH", "Fournisseur", "Autre"])
     _spacer(sec_mtg)
 
     # ════════════════════════
@@ -2006,7 +2006,7 @@ def _import_audio_file():
         duration_min=0,
         model_name=model,
         language=lang,
-        meeting_type=mtype if mtype != "—" else "",
+        meeting_type=mtype if mtype not in ("—", "Non précisé") else "",
         output_mode=output,
         meeting_name=name,
         status_audio="done",
