@@ -1678,6 +1678,7 @@ def _build_window():
     _type_var = tk.StringVar(value="Non précisé")
     type_combo = _combo(rt, _type_var,
                         ["Non précisé", "Gouvernance", "Technique", "Projet", "RH", "Fournisseur", "Autre"])
+    type_combo.current(0)
     _spacer(sec_mtg)
 
     # ════════════════════════
