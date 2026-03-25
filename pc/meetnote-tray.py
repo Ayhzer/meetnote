@@ -597,18 +597,9 @@ def _do_step_transcribe(job: _Job) -> bool:
                     model_path = local_models
                 else:
                     _set_status(f"Téléchargement modèle {job.model_name}…")
-                    _log_error(f"[{job.id}] Modèle {job.model_name} absent — téléchargement depuis HuggingFace…")
-                    from huggingface_hub import snapshot_download
-                    os.makedirs(local_models, exist_ok=True)
-                    snapshot_download(
-                        repo_id=f"Systran/faster-whisper-{job.model_name}",
-                        local_dir=local_models,
-                        local_dir_use_symlinks=False,
-                        ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
-                    )
-                    if not os.path.isfile(os.path.join(local_models, "model.bin")):
-                        raise RuntimeError(f"Téléchargement incomplet — model.bin absent dans {local_models}")
-                    model_path = local_models
+                    _log_error(f"[{job.id}] Modèle {job.model_name} absent — téléchargement via faster-whisper…")
+                    # Laisser faster-whisper gérer le téléchargement + cache HF lui-même
+                    model_path = job.model_name   # nom symbolique → DL auto
             else:
                 model_path = job.model_name
             _whisper_model      = WhisperModel(model_path, device="cpu", compute_type="int8")
