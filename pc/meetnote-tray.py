@@ -1195,6 +1195,7 @@ def _show_window():
             if _history_win and _history_win.winfo_exists():
                 _history_win.deiconify()
                 _history_win.lift()
+                _history_win.focus_force()
         _root.after(0, _do)
 
 def _hide_window():
@@ -1202,6 +1203,12 @@ def _hide_window():
         _root.withdraw()
         if _history_win and _history_win.winfo_exists():
             _history_win.withdraw()
+
+def _close_history_window():
+    """Ferme (cache) la fenêtre history sans la détruire."""
+    global _history_win
+    if _history_win and _history_win.winfo_exists():
+        _history_win.withdraw()
 
 
 # ─── Tray menu ────────────────────────────────────────────────────────────────
@@ -1400,10 +1407,10 @@ def _refresh_history_panel():
 
         # ── Boutons d'action contextuels
         j = job
-        can_transcribe = os.path.isfile(j.wav_path)
+        can_transcribe    = os.path.isfile(j.wav_path)
+        can_push_notion   = j.status_transcript == "done" and bool(j.transcript)
         has_btn = (
-            can_transcribe or
-            (j.status_transcript == "done" and j.status_notion in ("pending", "error") and j.output_mode != "fichier") or
+            can_transcribe or can_push_notion or
             (j.transcript_path and os.path.isfile(j.transcript_path)) or
             bool(j.notion_url)
         )
@@ -1437,9 +1444,18 @@ def _refresh_history_panel():
                 lbl = "📝 Transcribe" if j.status_transcript in ("queued", "error") else "🔄 Re-transcribe"
                 _ghost_btn(btn_row, lbl, "#ffb3ac", _do_retranscribe)
 
-            if j.status_transcript == "done" and j.status_notion in ("pending", "error") and j.output_mode != "fichier":
-                _ghost_btn(btn_row, "→ Notion", "#88d982",
-                           lambda _j=j: (_requeue_notion(_j), _refresh_history_panel()))
+            # Notion : toujours proposer si transcript disponible
+            if can_push_notion:
+                notion_lbl = "→ Notion" if j.status_notion in ("pending", "error") else "↺ Re-push Notion"
+                notion_fg  = "#88d982" if j.status_notion in ("pending", "error") else "#9ab4e8"
+                def _do_force_notion(_j=j):
+                    _j.status_notion = "pending"
+                    _j.output_mode   = "notion"
+                    hist_mod.update(_j)
+                    _requeue_notion(_j)
+                    _refresh_history_panel()
+                _ghost_btn(btn_row, notion_lbl, notion_fg,
+                           lambda _j=j: _do_force_notion(_j))
 
             if j.transcript_path and os.path.isfile(j.transcript_path):
                 _ghost_btn(btn_row, "📄 View txt", FG2,
@@ -1489,9 +1505,14 @@ def _toggle_history_window():
     """Ouvre ou ferme la fenêtre historique (design Stitch)."""
     global _history_win, _history_list_frame
 
+    # Si déjà ouverte et visible → cacher
     if _history_win and _history_win.winfo_exists():
-        _history_win.destroy()
-        _history_win = None
+        if _history_win.state() == "withdrawn":
+            _history_win.deiconify()
+            _history_win.lift()
+            _history_win.focus_force()
+        else:
+            _history_win.withdraw()
         return
 
     if not _root:
@@ -1508,6 +1529,8 @@ def _toggle_history_window():
     _history_win.title("MeetNote — Recording History")
     _history_win.configure(bg=S_BASE)
     _history_win.resizable(True, True)
+    # Fermer = cacher (pas détruire), synchronisé avec la fenêtre principale
+    _history_win.protocol("WM_DELETE_WINDOW", _close_history_window)
 
     _root.update_idletasks()
     rx = _root.winfo_x() + _root.winfo_width() + 8
@@ -1574,16 +1597,20 @@ def _build_window():
     _root.configure(bg="#111125")
     _root.protocol("WM_DELETE_WINDOW", _hide_window)
 
-    def _on_root_state_change(e):
-        if _root.state() == "iconic":
+    def _on_root_unmap(e):
+        if e.widget is _root and _root.state() == "iconic":
             if _history_win and _history_win.winfo_exists():
                 _history_win.withdraw()
-        elif _root.state() == "normal":
-            if _history_win and _history_win.winfo_exists():
-                _history_win.deiconify()
 
-    _root.bind("<Unmap>", lambda e: _hide_window() if _root.state() == "iconic" else None)
-    _root.bind("<Map>",   _on_root_state_change)
+    def _on_root_map(e):
+        if e.widget is _root:
+            if _history_win and _history_win.winfo_exists():
+                if _history_win.state() == "withdrawn":
+                    _history_win.deiconify()
+                _history_win.lift()
+
+    _root.bind("<Unmap>", _on_root_unmap)
+    _root.bind("<Map>",   _on_root_map)
 
     _output_var       = tk.StringVar(value="notion")
     _meeting_name_var = tk.StringVar(value="")
@@ -2034,6 +2061,18 @@ def _build_window():
     console_hdr.pack(fill="x", pady=(0, 2))
     tk.Label(console_hdr, text="▶  SYSTEM CONSOLE", font=("Segoe UI", 7, "bold"),
              bg=S_BASE, fg=FG3).pack(side="left")
+
+    def _clear_log():
+        if _log_text:
+            _log_text.config(state="normal")
+            _log_text.delete("1.0", "end")
+            _log_text.config(state="disabled")
+
+    tk.Button(console_hdr, text="🗑 Clear", font=("Segoe UI", 7),
+              bg=S_BASE, fg=FG3,
+              activebackground=S_CARD, activeforeground="#ff6666",
+              relief="flat", bd=0, padx=6, pady=1, cursor="hand2",
+              command=_clear_log).pack(side="right", padx=4)
 
     log_frame = tk.Frame(right_col, bg=S_BASE)
     log_frame.pack(fill="both", expand=True)
