@@ -24,6 +24,7 @@ def _dict_to_job_dict(d: dict) -> dict:
     """Normalise un dict chargé depuis JSON (assure les clés manquantes)."""
     defaults = {
         "meeting_name": "",
+        "teams_participants": [],
         "status_audio": "done",
         "status_transcript": "queued",
         "status_notion": "pending",

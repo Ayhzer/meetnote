@@ -29,6 +29,7 @@ import user_config
 import history as hist_mod
 import outlook_cal
 from notion_push import push_to_notion
+import teams_roster
 
 # Surcharge les credentials avec les valeurs utilisateur persistées
 _uc = user_config.load()
@@ -50,9 +51,37 @@ def _prevent_sleep():
 def _allow_sleep():
     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
+# ─── Battery check ────────────────────────────────────────────────────────────
+def _is_on_battery() -> bool:
+    """Retourne True si le PC tourne sur batterie (non branché secteur)."""
+    try:
+        SYSTEM_POWER_STATUS = ctypes.c_buffer(12)
+        if ctypes.windll.kernel32.GetSystemPowerStatus(SYSTEM_POWER_STATUS):
+            ac_line = SYSTEM_POWER_STATUS[0]
+            # ac_line : 0 = batterie, 1 = secteur, 255 = inconnu
+            return ac_line == b'\x00'
+    except Exception:
+        pass
+    return False
+
+def _warn_if_on_battery() -> bool:
+    """Affiche une alerte si sur batterie. Retourne True si l'utilisateur confirme quand même."""
+    if not _is_on_battery():
+        return True
+    import tkinter.messagebox as mb
+    return mb.askyesno(
+        "⚠ Batterie",
+        "Le PC n'est pas branché sur secteur.\n\n"
+        "La transcription est très gourmande en CPU et va décharger la batterie rapidement.\n\n"
+        "Continuer quand même ?",
+        icon="warning",
+        default="no",
+    )
+
 # ─── State ───────────────────────────────────────────────────────────────────
 _rec_gain        = 4.0   # gain numérique appliqué aux samples capturés
 _recording       = False
+_teams_watcher   = teams_roster.TeamsRosterWatcher()
 _audio_chunks    = []
 _wav_stream      = None
 _wav_stream_path = None
@@ -104,7 +133,8 @@ class _Job:
     language:        str
     meeting_type:    str
     output_mode:     str
-    meeting_name:    str = ""
+    meeting_name:        str = ""
+    teams_participants:  list = dataclasses.field(default_factory=list)
     # Statuts par étape
     status_audio:      str = "done"    # done
     status_transcript: str = "queued"  # queued / running / done / error
@@ -334,7 +364,8 @@ def _archive_audio(wav_path: str, start_time: datetime.datetime) -> str | None:
             dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"meetnote_{ts}.opus")
             cmd = [ffmpeg, "-y", "-i", wav_path,
                    "-c:a", "libopus", "-b:a", "24k", "-ac", "1", "-ar", "16000", dest]
-            result = subprocess.run(cmd, capture_output=True, timeout=300)
+            result = subprocess.run(cmd, capture_output=True, timeout=300,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
             if result.returncode == 0:
                 return dest
         dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"meetnote_{ts}.wav")
@@ -500,6 +531,9 @@ def _diarize(audio_path: str, segments: list) -> dict:
                 result[seg_i] = n
         return result
 
+    except ModuleNotFoundError as e:
+        _log_error(f"Diarisation ignorée : {e} — installez le module manquant (pip install soundfile scikit-learn scipy)")
+        return {}
     except Exception as e:
         _log_error(f"Diarisation ignorée : {e}")
         return {}
@@ -517,12 +551,35 @@ def _do_step_transcribe(job: _Job) -> bool:
     _set_status(f"Transcription [{job.id}]…")
     _set_progress(0)
 
+    tmp_wav_for_whisper: str | None = None
     try:
         path = job.wav_path
-        # Si l'audio archivé est opus, on doit utiliser le WAV temp s'il existe encore
-        # (normalement le WAV temp est conservé en cas d'erreur, sinon archivé)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Fichier audio introuvable : {path}")
+
+        # Décoder opus/mp3/… en WAV avant de passer à Whisper (évite NoneType.write
+        # causé par faster-whisper qui ne gère pas opus nativement sous PyInstaller)
+        if not _is_real_wav(path):
+            from notion_push import _find_ffmpeg
+            ffmpeg = _find_ffmpeg()
+            if ffmpeg:
+                os.makedirs(config.TEMP_DIR, exist_ok=True)
+                tmp_wav_for_whisper = os.path.join(
+                    config.TEMP_DIR, f"whisper_{os.path.splitext(os.path.basename(path))[0]}.wav"
+                )
+                result = subprocess.run(
+                    [ffmpeg, "-y", "-i", path,
+                     "-ar", "16000", "-ac", "1", "-f", "wav", tmp_wav_for_whisper],
+                    capture_output=True, timeout=300,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if result.returncode == 0 and os.path.isfile(tmp_wav_for_whisper):
+                    path = tmp_wav_for_whisper
+                else:
+                    err = result.stderr.decode(errors='replace')[:200]
+                    raise RuntimeError(f"ffmpeg decode failed: {err}")
+            else:
+                raise RuntimeError("ffmpeg introuvable — impossible de décoder l'audio opus/mp3")
 
         language = None if job.language == "auto" else job.language
 
@@ -542,8 +599,13 @@ def _do_step_transcribe(job: _Job) -> bool:
                     _set_status(f"Téléchargement modèle {job.model_name}…")
                     from huggingface_hub import snapshot_download
                     os.makedirs(local_models, exist_ok=True)
-                    snapshot_download(repo_id=f"Systran/faster-whisper-{job.model_name}",
-                                      local_dir=local_models)
+                    snapshot_download(
+                        repo_id=f"Systran/faster-whisper-{job.model_name}",
+                        local_dir=local_models,
+                        local_dir_use_symlinks=False,
+                    )
+                    if not os.path.isfile(os.path.join(local_models, "model.bin")):
+                        raise RuntimeError(f"Téléchargement incomplet — model.bin absent dans {local_models}")
                     model_path = local_models
             else:
                 model_path = job.model_name
@@ -603,6 +665,34 @@ def _do_step_transcribe(job: _Job) -> bool:
         # ── Diarisation (resemblyzer + DBSCAN) ────────────────────────────────
         speaker_map = _diarize(path, raw_segments)  # {idx: "SPKR_X (H/F)"} ou {}
 
+        # ── Substitution des labels SPKR_X par les vrais noms Teams ──────────
+        if speaker_map and job.teams_participants:
+            # Collecter les speakers uniques dans leur ordre d'apparition
+            seen_spkr: list[str] = []
+            for idx_s in range(len(raw_segments)):
+                raw_lbl = speaker_map.get(idx_s, "")
+                if raw_lbl:
+                    # Extraire "SPKR_X" sans le suffixe genre
+                    base = raw_lbl.split(" ")[0]  # ex: "SPKR_0"
+                    if base not in seen_spkr:
+                        seen_spkr.append(base)
+            # Mapper chaque SPKR_X → nom Teams (dans l'ordre)
+            teams_names = list(job.teams_participants)
+            spkr_name_map: dict[str, str] = {}
+            for i, base in enumerate(seen_spkr):
+                if i < len(teams_names):
+                    spkr_name_map[base] = teams_names[i]
+            # Reconstruire speaker_map avec vrais noms
+            new_speaker_map: dict[int, str] = {}
+            for idx_s, raw_lbl in speaker_map.items():
+                base = raw_lbl.split(" ")[0]
+                gender_suffix = " ".join(raw_lbl.split(" ")[1:])  # ex: "(H)"
+                if base in spkr_name_map:
+                    new_speaker_map[idx_s] = f"{spkr_name_map[base]} {gender_suffix}".strip()
+                else:
+                    new_speaker_map[idx_s] = raw_lbl
+            speaker_map = new_speaker_map
+
         for idx, (start_abs, end_abs, text) in enumerate(raw_segments):
             t  = int(start_abs)
             ts = f"[{t // 3600:02d}:{(t % 3600) // 60:02d}:{t % 60:02d}]"
@@ -625,6 +715,11 @@ def _do_step_transcribe(job: _Job) -> bool:
         _set_status("Erreur transcription — voir journal.")
         _set_progress(0)
         return False
+
+    finally:
+        if tmp_wav_for_whisper and os.path.isfile(tmp_wav_for_whisper):
+            try: os.remove(tmp_wav_for_whisper)
+            except OSError: pass
 
 
 def _do_step_notion(job: _Job) -> bool:
@@ -736,6 +831,8 @@ def _worker_loop():
 # ─── Relance d'étapes depuis l'historique ────────────────────────────────────
 def _requeue_transcribe(job: _Job):
     """Relance la transcription (+ notion si pertinent) depuis le panel historique."""
+    if not _warn_if_on_battery():
+        return
     job.status_transcript = "queued"
     job.transcript = ""
     job.transcript_path = ""
@@ -789,6 +886,10 @@ def _do_start():
     _rec_start_time  = datetime.datetime.now()
     _stop_loop.clear()
     _prevent_sleep()
+
+    # Démarrer la surveillance des participants Teams
+    if teams_roster.is_teams_running():
+        _teams_watcher.start(_rec_start_time)
 
     # Pré-remplir le nom de la réunion depuis Outlook
     if _meeting_name_var and not _meeting_name_var.get().strip():
@@ -845,6 +946,9 @@ def _do_stop_transcribe():
     if not _recording:
         return
 
+    if not _warn_if_on_battery():
+        return
+
     _recording = False
     _stop_loop.set()
 
@@ -861,6 +965,10 @@ def _do_stop_transcribe():
     duration_min = (stop_time - start_time).total_seconds() / 60
     path = _save_audio_to_tempfile()
 
+    # Récupérer les participants Teams avant de libérer
+    _teams_watcher.stop()
+    teams_participants = _teams_watcher.get_participants()
+
     if not path:
         _allow_sleep()
         _set_status("Aucun audio enregistré.")
@@ -868,6 +976,9 @@ def _do_stop_transcribe():
         return
 
     meeting_name = (_meeting_name_var.get().strip() if _meeting_name_var else "") or ""
+    _ts_str = start_time.strftime("%Y-%m-%d %H:%M")
+    if _ts_str not in meeting_name:
+        meeting_name = f"{meeting_name} {_ts_str}".strip() if meeting_name else _ts_str
 
     job = _Job(
         id=f"{stop_time.strftime('%Y%m%d_%H%M%S')}",
@@ -879,6 +990,7 @@ def _do_stop_transcribe():
         meeting_type=(_type_var.get() if _type_var and _type_var.get() not in ("—", "Non précisé") else ""),
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
+        teams_participants=teams_participants,
     )
 
     with _all_jobs_lock:
@@ -920,6 +1032,10 @@ def _do_stop_archive_only():
     duration_min = (stop_time - start_time).total_seconds() / 60
     path = _save_audio_to_tempfile()
 
+    # Récupérer les participants Teams avant de libérer
+    _teams_watcher.stop()
+    teams_participants = _teams_watcher.get_participants()
+
     _allow_sleep()
 
     if not path:
@@ -928,6 +1044,9 @@ def _do_stop_archive_only():
         return
 
     meeting_name = (_meeting_name_var.get().strip() if _meeting_name_var else "") or ""
+    _ts_str = start_time.strftime("%Y-%m-%d %H:%M")
+    if _ts_str not in meeting_name:
+        meeting_name = f"{meeting_name} {_ts_str}".strip() if meeting_name else _ts_str
 
     job = _Job(
         id=f"{stop_time.strftime('%Y%m%d_%H%M%S')}",
@@ -939,6 +1058,7 @@ def _do_stop_archive_only():
         meeting_type=(_type_var.get() if _type_var and _type_var.get() not in ("—", "Non précisé") else ""),
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
+        teams_participants=teams_participants,
         status_transcript="queued",
         status_notion="pending",
     )
@@ -1032,10 +1152,9 @@ def _refresh_ui():
 
 def _update_window_state():
     if _recording:
-        _btn_start.config(state="disabled", bg="#4a1515")
-        _btn_stop.config(state="normal", bg="#2e7d32", fg="white")
-        _btn_stop_only.config(state="normal", bg="#5533aa", fg="white")
-        _btn_cancel.config(state="normal", fg="#ff6666")
+        if _btn_start:
+            _btn_start.config(text="⏹  STOP RECORDING",
+                              bg="#1a6b1a", activebackground="#2e7d32")
         _source_combo.config(state="disabled")
         if _speaker_combo: _speaker_combo.config(state="disabled")
         _status_var.set("Recording in progress…")
@@ -1044,10 +1163,9 @@ def _update_window_state():
         if _root and hasattr(_root, "_toggle_whisper"):
             _root._toggle_whisper(False)
     else:
-        _btn_start.config(state="normal", bg="#b81c1c")
-        _btn_stop.config(state="disabled", bg="#1e1e32", fg="#ab8985")
-        _btn_stop_only.config(state="disabled", bg="#1e1e32", fg="#ab8985")
-        _btn_cancel.config(state="disabled", fg="#ab8985")
+        if _btn_start:
+            _btn_start.config(text="⏺  START RECORDING",
+                              bg="#b81c1c", activebackground="#dc3232")
         _source_combo.config(state="readonly")
         if _speaker_combo: _speaker_combo.config(state="readonly")
         if _root and hasattr(_root, "_toggle_whisper"):
@@ -1068,13 +1186,20 @@ def _update_window_state():
 # ─── Window show / hide ───────────────────────────────────────────────────────
 def _show_window():
     if _root:
-        _root.after(0, lambda: (
-            _root.deiconify(), _root.lift(), _root.focus_force(),
-        ))
+        def _do():
+            _root.deiconify()
+            _root.lift()
+            _root.focus_force()
+            if _history_win and _history_win.winfo_exists():
+                _history_win.deiconify()
+                _history_win.lift()
+        _root.after(0, _do)
 
 def _hide_window():
     if _root:
         _root.withdraw()
+        if _history_win and _history_win.winfo_exists():
+            _history_win.withdraw()
 
 
 # ─── Tray menu ────────────────────────────────────────────────────────────────
@@ -1093,21 +1218,8 @@ def _build_menu():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Ouvrir",    lambda i, it: _show_window(), default=True),
         pystray.Menu.SEPARATOR,
-        # ── Actions enregistrement
-        pystray.MenuItem("▶  Démarrer",               lambda i, it: _do_start(),            enabled=not _recording),
-        pystray.MenuItem("⏹  Arrêter et transcrire",  lambda i, it: _do_stop_transcribe(),  enabled=_recording),
-        pystray.MenuItem("⏸  Arrêter sans transcrire",lambda i, it: _do_stop_archive_only(),enabled=_recording),
-        pystray.MenuItem("✕  Annuler",                lambda i, it: _do_cancel(),           enabled=_recording),
-        pystray.Menu.SEPARATOR,
-        # ── Historique & fichiers
-        pystray.MenuItem("📋  Historique",             lambda i, it: _toggle_history_window()),
-        pystray.MenuItem("📂  Importer un fichier audio", lambda i, it: _import_audio_file()),
-        pystray.Menu.SEPARATOR,
-        # ── Dossiers
-        pystray.MenuItem("🎙  Dossier Audio",          lambda i, it: _open_audio_dir_tray()),
-        pystray.MenuItem("📄  Dossier Transcripts",    lambda i, it: _open_transcript_dir_tray()),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("⚙  Paramètres",             lambda i, it: _open_settings()),
+        pystray.MenuItem("▶  Démarrer l'enregistrement", lambda i, it: _do_start(),             enabled=not _recording),
+        pystray.MenuItem("⏹  Arrêter l'enregistrement",  lambda i, it: _do_stop_archive_only(), enabled=_recording),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quitter", _quit_app),
     )
@@ -1238,11 +1350,28 @@ def _refresh_history_panel():
                              bg=S_HIGH, fg=FG3, padx=6, pady=1)
         dur_badge.pack(side="right")
 
-        # Titre réunion
+        # Titre réunion (éditable inline)
         title_row = tk.Frame(card, bg=S_CARD)
-        title_row.pack(fill="x", padx=10, pady=(0, 6))
-        tk.Label(title_row, text=title, font=("Segoe UI", 9, "bold"),
-                 bg=S_CARD, fg=FG, anchor="w", wraplength=380).pack(fill="x")
+        title_row.pack(fill="x", padx=10, pady=(0, 2))
+
+        name_var = tk.StringVar(value=job.meeting_name or "")
+        name_entry = tk.Entry(
+            title_row, textvariable=name_var,
+            font=("Segoe UI", 9, "bold"),
+            bg=S_CARD, fg=FG, insertbackground=FG,
+            relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=S_CARD, highlightcolor=S_TOP,
+        )
+        name_entry.pack(fill="x", expand=True)
+
+        def _save_name(_j=job, _var=name_var):
+            new_name = _var.get().strip()
+            if new_name != _j.meeting_name:
+                _j.meeting_name = new_name
+                hist_mod.update(_j)
+
+        name_entry.bind("<FocusOut>", lambda e, _j=job, _v=name_var: _save_name(_j, _v))
+        name_entry.bind("<Return>",   lambda e, _j=job, _v=name_var: (_save_name(_j, _v), name_entry.master.focus_set()))
 
         # ── Ligne badges statuts
         badges_row = tk.Frame(card, bg=S_CARD)
@@ -1257,6 +1386,15 @@ def _refresh_history_panel():
                             font=("Segoe UI", 7, "bold"),
                             bg=b_bg, fg=b_fg, padx=6, pady=2, relief="flat")
             pill.pack(side="left", padx=(0, 4))
+
+        # ── Participants Teams (si disponibles)
+        if job.teams_participants:
+            teams_row = tk.Frame(card, bg=S_CARD)
+            teams_row.pack(fill="x", padx=10, pady=(0, 4))
+            names_str = "  ·  ".join(job.teams_participants)
+            tk.Label(teams_row, text=f"👥 {names_str}",
+                     font=("Segoe UI", 7), bg=S_CARD, fg="#9ab4e8",
+                     anchor="w", wraplength=420, justify="left").pack(fill="x")
 
         # ── Boutons d'action contextuels
         j = job
@@ -1307,7 +1445,7 @@ def _refresh_history_panel():
 
             if j.notion_url:
                 _ghost_btn(btn_row, "🌐 Open Notion", "#e4b5ff",
-                           lambda u=j.notion_url: subprocess.Popen(f'start "" "{u}"', shell=True))
+                           lambda u=j.notion_url: os.startfile(u))
         else:
             tk.Frame(card, bg=S_CARD, height=2).pack()
 
@@ -1429,10 +1567,21 @@ def _build_window():
 
     _root = tk.Tk()
     _root.title("MeetNote")
-    _root.resizable(False, False)
+    _root.resizable(True, True)
+    _root.minsize(720, 560)
     _root.configure(bg="#111125")
     _root.protocol("WM_DELETE_WINDOW", _hide_window)
+
+    def _on_root_state_change(e):
+        if _root.state() == "iconic":
+            if _history_win and _history_win.winfo_exists():
+                _history_win.withdraw()
+        elif _root.state() == "normal":
+            if _history_win and _history_win.winfo_exists():
+                _history_win.deiconify()
+
     _root.bind("<Unmap>", lambda e: _hide_window() if _root.state() == "iconic" else None)
+    _root.bind("<Map>",   _on_root_state_change)
 
     _output_var       = tk.StringVar(value="notion")
     _meeting_name_var = tk.StringVar(value="")
@@ -1571,12 +1720,11 @@ def _build_window():
     body.pack(fill="both", expand=True)
 
     left_col  = tk.Frame(body, bg=S_BASE, width=LEFT_W)
-    left_col.pack(side="left", fill="y", padx=(10, 4), pady=10)
+    left_col.pack(side="left", fill="both", padx=(10, 4), pady=10)
     left_col.pack_propagate(False)
 
-    right_col = tk.Frame(body, bg=S_BASE, width=RIGHT_W)
-    right_col.pack(side="left", fill="y", padx=(4, 10), pady=10)
-    right_col.pack_propagate(False)
+    right_col = tk.Frame(body, bg=S_BASE)
+    right_col.pack(side="left", fill="both", expand=True, padx=(4, 10), pady=10)
 
     # ─────────────────────────────────────────
     # HELPERS SECTIONS (colonne gauche)
@@ -1843,45 +1991,25 @@ def _build_window():
     btns_frame = tk.Frame(right_col, bg=S_BASE)
     btns_frame.pack(fill="x", pady=(0, 8))
 
+    def _toggle_recording():
+        if _recording:
+            _do_stop_archive_only()
+        else:
+            _do_start()
+
     _btn_start = tk.Button(
         btns_frame, text="⏺  START RECORDING",
         font=("Segoe UI", 11, "bold"),
         bg=RED_DIM, fg="white",
         activebackground=RED, activeforeground="white",
         relief="flat", bd=0, pady=12, cursor="hand2",
-        command=_do_start,
+        command=_toggle_recording,
     )
     _btn_start.pack(fill="x", pady=(0, 4))
 
-    _btn_stop = tk.Button(
-        btns_frame, text="⏹  Stop and transcribe",
-        font=("Segoe UI", 9),
-        bg=S_CARD, fg=FG3,
-        activebackground=GRN, activeforeground="white",
-        relief="flat", bd=0, pady=8, cursor="hand2",
-        state="disabled", command=_do_stop_transcribe,
-    )
-    _btn_stop.pack(fill="x", pady=(0, 4))
-
-    _btn_stop_only = tk.Button(
-        btns_frame, text="⏸  Stop without transcribing",
-        font=("Segoe UI", 9),
-        bg=S_CARD, fg=FG3,
-        activebackground=PURPLE, activeforeground="white",
-        relief="flat", bd=0, pady=8, cursor="hand2",
-        state="disabled", command=_do_stop_archive_only,
-    )
-    _btn_stop_only.pack(fill="x", pady=(0, 4))
-
-    _btn_cancel = tk.Button(
-        btns_frame, text="✕  Cancel",
-        font=("Segoe UI", 9),
-        bg=S_CARD, fg=FG3,
-        activebackground=S_HIGH, activeforeground=ERR,
-        relief="flat", bd=0, pady=8, cursor="hand2",
-        state="disabled", command=_do_cancel,
-    )
-    _btn_cancel.pack(fill="x")
+    _btn_stop        = None
+    _btn_stop_only   = None
+    _btn_cancel      = None
 
     # ── Indicateur de statut
     status_frame = tk.Frame(right_col, bg=S_CARD)

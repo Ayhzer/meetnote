@@ -159,7 +159,8 @@ def _compress_audio(wav_path: str, dt: datetime.datetime) -> str:
         "-ar", "16000",   # 16 kHz (déjà le cas, mais on force)
         out,
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, timeout=120,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg error: {result.stderr.decode(errors='replace')[-300:]}")
     return out
@@ -212,6 +213,7 @@ def _split_audio_for_upload(opus_path: str, segment_min: int = 10) -> list:
                 [ffprobe, "-v", "quiet", "-print_format", "json",
                  "-show_format", opus_path],
                 capture_output=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             if r.returncode == 0:
                 duration_s = float(_json.loads(r.stdout)["format"]["duration"])
@@ -238,7 +240,8 @@ def _split_audio_for_upload(opus_path: str, segment_min: int = 10) -> list:
         "-c", "copy",
         pattern,
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=600)
+    result = subprocess.run(cmd, capture_output=True, timeout=600,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
     if result.returncode != 0:
         return [opus_path]   # échec silencieux → envoyer le fichier entier
 

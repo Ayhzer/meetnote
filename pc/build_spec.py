@@ -136,6 +136,9 @@ hidden_imports = [
     "user_config",
     "history",
     "outlook_cal",
+    "teams_roster",
+    "soundfile",
+    "_soundfile",
     "wave",
     "glob",
     "json",
@@ -243,6 +246,23 @@ result = subprocess.run(
 if result.returncode == 0:
     dist_dir = os.path.join(SCRIPT_DIR, "dist", "MeetNote")
     print(f"\n[build_spec] SUCCESS — output: {dist_dir}")
+
+    # Copier les modèles extra (medium, large…) depuis le cache HF vers dist/models/
+    EXTRA_MODELS = ["medium"]
+    for mname in EXTRA_MODELS:
+        snap = find_model_snapshot(mname)
+        if snap:
+            dest_model = os.path.join(dist_dir, "models", mname)
+            if not os.path.isfile(os.path.join(dest_model, "model.bin")):
+                print(f"[build_spec] Copying model '{mname}' to {dest_model} ...")
+                import shutil as _shutil2
+                _shutil2.copytree(snap, dest_model, dirs_exist_ok=True)
+                print(f"[build_spec] Model '{mname}' copied.")
+            else:
+                print(f"[build_spec] Model '{mname}' already present — skipping copy.")
+        else:
+            print(f"[build_spec] Model '{mname}' not in HF cache — will be downloaded on first use.")
+
     # Report size
     total = 0
     count = 0
