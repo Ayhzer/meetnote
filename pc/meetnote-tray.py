@@ -1667,7 +1667,7 @@ def _toggle_history_window():
               bg="#1a3a5c", fg="#88ccff", activebackground="#22456e",
               activeforeground="white", relief="flat", bd=0, cursor="hand2",
               command=_bulk_transcribe_all).pack(side="right", padx=(0, 4), pady=(0, 10))
-    tk.Button(hdr2, text="🗑 Supprimer terminés", font=("Segoe UI", 8),
+    tk.Button(hdr2, text="🗑 Supprimer", font=("Segoe UI", 8),
               bg="#3a1010", fg="#ffb4ab", activebackground="#551515",
               activeforeground="white", relief="flat", bd=0, cursor="hand2",
               command=_delete_all_done).pack(side="right", padx=(0, 4), pady=(0, 10))
@@ -1712,17 +1712,27 @@ def _build_window():
     _root.configure(bg="#111125")
     _root.protocol("WM_DELETE_WINDOW", _hide_window)
 
+    _history_was_visible = [False]  # list pour mutation dans closures
+
     def _on_root_unmap(e):
-        if e.widget is _root and _root.state() == "iconic":
-            if _history_win and _history_win.winfo_exists():
-                _history_win.withdraw()
+        if e.widget is not _root:
+            return
+        def _check_iconic():
+            if _root.state() == "iconic":
+                if _history_win and _history_win.winfo_exists():
+                    _history_was_visible[0] = _history_win.state() != "withdrawn"
+                    if _history_was_visible[0]:
+                        _history_win.withdraw()
+        _root.after(50, _check_iconic)
 
     def _on_root_map(e):
-        if e.widget is _root:
+        if e.widget is not _root:
+            return
+        if _root.state() == "normal" and _history_was_visible[0]:
             if _history_win and _history_win.winfo_exists():
-                if _history_win.state() == "withdrawn":
-                    _history_win.deiconify()
+                _history_win.deiconify()
                 _history_win.lift()
+            _history_was_visible[0] = False
 
     _root.bind("<Unmap>", _on_root_unmap)
     _root.bind("<Map>",   _on_root_map)
@@ -1823,7 +1833,7 @@ def _build_window():
     tk.Frame(nav_frame, bg=S_HIGH, height=1).pack(fill="x")
     quit_row = tk.Frame(nav_frame, bg=S_MAIN, cursor="hand2")
     quit_row.pack(fill="x")
-    tk.Label(quit_row, text="⏻  Quit", font=("Segoe UI", 9),
+    tk.Label(quit_row, text="✕  Quit", font=("Segoe UI", 9),
              bg=S_MAIN, fg="#cc4444", anchor="w", pady=10, padx=15).pack(fill="x")
     quit_row.bind("<Button-1>", lambda e: _quit_app())
     for w in quit_row.winfo_children():
@@ -1848,7 +1858,7 @@ def _build_window():
               bg=S_MAIN, fg=FG3, activebackground=S_CARD, activeforeground=FG,
               relief="flat", bd=0, cursor="hand2",
               command=_open_settings).pack(side="left", padx=4)
-    tk.Button(hdr_btns, text="⏻", font=("Segoe UI", 10),
+    tk.Button(hdr_btns, text="✕", font=("Segoe UI", 10),
               bg=S_MAIN, fg="#cc4444", activebackground=S_CARD, activeforeground="#ff6666",
               relief="flat", bd=0, cursor="hand2",
               command=_quit_app).pack(side="left", padx=4)
@@ -2236,9 +2246,17 @@ def _build_window():
     def _poll_outlook():
         if not _recording and _meeting_name_var:
             def _fetch():
-                mtg = outlook_cal.get_current_or_next_meeting(window_minutes=30)
-                if mtg and _meeting_name_var and _root:
+                try:
+                    mtg = outlook_cal.get_current_or_next_meeting(window_minutes=30)
+                except Exception as e:
+                    _log_with_tags(f"[Outlook] Erreur: {e}")
+                    return
+                if not mtg:
+                    _log_with_tags("[Outlook] Aucune réunion dans les 30 prochaines minutes.")
+                    return
+                if _meeting_name_var and _root:
                     subject = mtg["subject"]
+                    _log_with_tags(f"[Outlook] Réunion détectée : {subject}")
                     def _set():
                         # Ne pas écraser une valeur saisie manuellement
                         current = _meeting_name_var.get().strip()

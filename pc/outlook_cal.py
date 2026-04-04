@@ -3,12 +3,20 @@ Lecture du calendrier Outlook via win32com (COM local).
 Silencieux si Outlook n'est pas disponible ou non ouvert.
 """
 import datetime
+import logging
+
+log = logging.getLogger(__name__)
 
 try:
     import win32com.client
     _AVAILABLE = True
 except ImportError:
     _AVAILABLE = False
+
+
+def _to_naive_local(dt) -> datetime.datetime:
+    """Convertit un pywintypes.datetime (heure locale mal étiquetée UTC) en datetime naïf local."""
+    return datetime.datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
 
 
 def get_current_or_next_meeting(window_minutes: int = 30) -> dict | None:
@@ -59,20 +67,10 @@ def get_current_or_next_meeting(window_minutes: int = 30) -> dict | None:
                 if not subject or subject.lower() in _IGNORE:
                     continue
 
-                start = item.Start
-                end   = item.End
-
-                # Convertir pywintypes.datetime en datetime standard si nécessaire
-                if not isinstance(start, datetime.datetime):
-                    start = datetime.datetime(
-                        start.year, start.month, start.day,
-                        start.hour, start.minute, start.second
-                    )
-                if not isinstance(end, datetime.datetime):
-                    end = datetime.datetime(
-                        end.year, end.month, end.day,
-                        end.hour, end.minute, end.second
-                    )
+                # pywintypes.datetime retourne l'heure locale avec un tzinfo incorrect (+00:00)
+                # → on strip le tzinfo pour obtenir un datetime naïf local
+                start = _to_naive_local(item.Start)
+                end   = _to_naive_local(item.End)
 
                 # Ignorer les blocs de durée absurde (> 12h = pas une vraie réunion)
                 duration_h = (end - start).total_seconds() / 3600
@@ -80,11 +78,12 @@ def get_current_or_next_meeting(window_minutes: int = 30) -> dict | None:
                     continue
 
                 return {"subject": subject, "start": start, "end": end}
-            except Exception:
+            except Exception as e:
+                log.debug("outlook_cal: item skip (%s)", e)
                 continue
 
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("outlook_cal: unavailable (%s)", e)
     return None
 
 
