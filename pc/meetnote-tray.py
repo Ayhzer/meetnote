@@ -154,6 +154,49 @@ _worker_busy = False
 _all_jobs: list[_Job] = []
 _all_jobs_lock = threading.Lock()
 
+# ─── Lecture audio historique ────────────────────────────────────────────────
+_playback_job_id: str | None = None   # ID du job en cours de lecture
+_playback_stop_event = threading.Event()
+
+
+def _play_audio(job_id: str, wav_path: str):
+    """Lance la lecture audio dans un thread de fond. Arrête toute lecture en cours."""
+    global _playback_job_id
+    _stop_audio()                         # arrête la lecture précédente si active
+    _playback_stop_event.clear()
+    _playback_job_id = job_id
+
+    def _run():
+        global _playback_job_id
+        try:
+            import soundfile as sf
+            data, samplerate = sf.read(wav_path, dtype="float32")
+            import sounddevice as sd_pb
+            chunk = 1024
+            idx = 0
+            with sd_pb.OutputStream(samplerate=samplerate,
+                                    channels=data.ndim if data.ndim > 1 else 1) as stream:
+                while idx < len(data) and not _playback_stop_event.is_set():
+                    block = data[idx: idx + chunk]
+                    stream.write(block)
+                    idx += chunk
+        except Exception:
+            pass
+        finally:
+            _playback_job_id = None
+            if _history_win and _history_win.winfo_exists():
+                _history_win.after(0, _refresh_history_panel)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _stop_audio():
+    """Arrête la lecture en cours."""
+    global _playback_job_id
+    _playback_stop_event.set()
+    _playback_job_id = None
+
+
 CHUNK_FRAMES = 1024
 
 # ─── Whisper ─────────────────────────────────────────────────────────────────
@@ -857,6 +900,68 @@ def _requeue_notion(job: _Job):
     threading.Thread(target=_push_thread, daemon=True).start()
 
 
+def _delete_all_done():
+    """Supprime de l'historique tous les jobs terminés (transcript=done ET notion=done/skipped)."""
+    import tkinter.messagebox as mb
+    def _is_done(j: _Job) -> bool:
+        return (j.status_transcript == "done" and
+                j.status_notion in ("done", "skipped"))
+    with _all_jobs_lock:
+        to_delete = [j for j in _all_jobs if _is_done(j)]
+    if not to_delete:
+        mb.showinfo("Supprimer terminés", "Aucun enregistrement terminé à supprimer.")
+        return
+    if not mb.askyesno("Supprimer terminés",
+                        f"Supprimer {len(to_delete)} enregistrement(s) terminé(s) ?\n\n"
+                        "(Les fichiers audio/transcript locaux ne sont pas supprimés.)",
+                        default="no"):
+        return
+    ids = {j.id for j in to_delete}
+    with _all_jobs_lock:
+        _all_jobs[:] = [j for j in _all_jobs if j.id not in ids]
+    entries = hist_mod.load()
+    entries = [e for e in entries if e.get("id") not in ids]
+    hist_mod.save(entries)
+    _refresh_history_panel()
+
+
+def _bulk_transcribe_all():
+    """Lance la transcription de tous les jobs en attente/erreur (AC uniquement)."""
+    import tkinter.messagebox as mb
+    if _is_on_battery():
+        mb.showwarning("Sur batterie",
+                       "La transcription en masse n'est disponible que sur secteur.\n\n"
+                       "Branchez le PC et réessayez.")
+        return
+    with _all_jobs_lock:
+        candidates = [
+            j for j in _all_jobs
+            if j.status_transcript in ("queued", "error")
+            and os.path.isfile(j.wav_path)
+        ]
+    if not candidates:
+        mb.showinfo("Transcrire tout", "Aucun enregistrement à transcrire.")
+        return
+    if not mb.askyesno("Transcrire tout",
+                        f"Lancer la transcription + push Notion de "
+                        f"{len(candidates)} enregistrement(s) ?",
+                        default="yes"):
+        return
+    for job in candidates:
+        job.status_transcript = "queued"
+        job.transcript = ""
+        job.transcript_path = ""
+        if job.output_mode != "fichier":
+            job.status_notion = "pending"
+        hist_mod.update(job)
+        with _queue_lock:
+            _job_queue.append(job)
+    _work_event.set()
+    _refresh_ui()
+    if _history_win and _history_win.winfo_exists():
+        _refresh_history_panel()
+
+
 # ─── Recording actions ────────────────────────────────────────────────────────
 _SOURCE_MAP = {
     "🎤  Microphone uniquement": "micro",
@@ -980,7 +1085,7 @@ def _do_stop_transcribe():
         duration_min=duration_min,
         model_name=_model_var.get() if _model_var else config.WHISPER_MODEL,
         language=_lang_var.get() if _lang_var else config.WHISPER_LANGUAGE,
-        meeting_type=(_type_var.get() if _type_var and _type_var.get() not in ("—", "Non précisé") else ""),
+        meeting_type=(_type_var.get() if _type_var else "A classifier") or "A classifier",
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
         teams_participants=teams_participants,
@@ -1048,7 +1153,7 @@ def _do_stop_archive_only():
         duration_min=duration_min,
         model_name=_model_var.get() if _model_var else config.WHISPER_MODEL,
         language=_lang_var.get() if _lang_var else config.WHISPER_LANGUAGE,
-        meeting_type=(_type_var.get() if _type_var and _type_var.get() not in ("—", "Non précisé") else ""),
+        meeting_type=(_type_var.get() if _type_var else "A classifier") or "A classifier",
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
         teams_participants=teams_participants,
@@ -1399,6 +1504,7 @@ def _refresh_history_panel():
         # ── Boutons d'action contextuels
         j = job
         can_transcribe    = os.path.isfile(j.wav_path)
+        can_play_audio    = can_transcribe
         can_push_notion   = j.status_transcript == "done" and bool(j.transcript)
         has_btn = (
             can_transcribe or can_push_notion or
@@ -1417,6 +1523,16 @@ def _refresh_history_panel():
                               relief="flat", bd=0, padx=8, pady=3,
                               cursor="hand2", command=cmd)
                 b.pack(side="left", padx=(0, 4))
+
+            # Lecture audio
+            if can_play_audio:
+                is_playing = (_playback_job_id == j.id)
+                if is_playing:
+                    _ghost_btn(btn_row, "⏹ Stop", "#ffb4ab",
+                               lambda: _stop_audio() or _refresh_history_panel())
+                else:
+                    _ghost_btn(btn_row, "▶ Play", "#a8d8a8",
+                               lambda _j=j: _play_audio(_j.id, _j.wav_path))
 
             # Transcription : combo modèle + bouton (dispo si fichier audio présent)
             if can_transcribe:
@@ -1547,6 +1663,14 @@ def _toggle_history_window():
               bg=RED, fg="white", activebackground="#ff4444",
               activeforeground="white", relief="flat", bd=0, cursor="hand2",
               command=_import_audio_file).pack(side="right", padx=(0, 4), pady=(0, 10))
+    tk.Button(hdr2, text="📝 Transcrire tout", font=("Segoe UI", 8),
+              bg="#1a3a5c", fg="#88ccff", activebackground="#22456e",
+              activeforeground="white", relief="flat", bd=0, cursor="hand2",
+              command=_bulk_transcribe_all).pack(side="right", padx=(0, 4), pady=(0, 10))
+    tk.Button(hdr2, text="🗑 Supprimer terminés", font=("Segoe UI", 8),
+              bg="#3a1010", fg="#ffb4ab", activebackground="#551515",
+              activeforeground="white", relief="flat", bd=0, cursor="hand2",
+              command=_delete_all_done).pack(side="right", padx=(0, 4), pady=(0, 10))
 
     # ── Zone scrollable
     canvas = tk.Canvas(_history_win, bg=S_BASE, highlightthickness=0)
@@ -1843,9 +1967,9 @@ def _build_window():
 
     rt = _row(sec_mtg)
     _lbl(rt, "Meeting type")
-    _type_var = tk.StringVar(value="Non précisé")
+    _type_var = tk.StringVar(value="A classifier")
     type_combo = _combo(rt, _type_var,
-                        ["Non précisé", "Gouvernance", "Technique", "Projet", "RH", "Fournisseur", "Autre"])
+                        ["A classifier", "Gouvernance", "Technique", "Projet", "RH", "Fournisseur", "Autre"])
     type_combo.current(0)
     _spacer(sec_mtg)
 
@@ -2167,7 +2291,7 @@ def _import_audio_file():
         duration_min=0,
         model_name=model,
         language=lang,
-        meeting_type=mtype if mtype not in ("—", "Non précisé") else "",
+        meeting_type=mtype if mtype not in ("—",) else "A classifier",
         output_mode=output,
         meeting_name=name,
         status_audio="done",
