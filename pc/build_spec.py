@@ -14,11 +14,12 @@ import subprocess
 # ─── Paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 HF_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
-VENV        = os.path.join(os.path.dirname(os.path.dirname(SCRIPT_DIR)), ".venv")
-SITE_PKG    = os.path.join(VENV, "Lib", "site-packages")
+_PY312      = r"C:\Users\apottier\AppData\Local\Programs\Python\Python312"
+VENV        = _PY312
+SITE_PKG    = os.path.join(_PY312, "Lib", "site-packages")
 
 # ─── Discover faster-whisper model snapshots ─────────────────────────────────
-MODEL_NAMES = ["tiny", "base", "small"]   # large-v3 is 3 GB — excluded by default
+MODEL_NAMES = ["tiny", "base", "small", "medium"]   # large-v3 is 3 GB — excluded by default
 
 def find_model_snapshot(name: str):
     """Return the snapshot dir for a given model name if it exists."""
