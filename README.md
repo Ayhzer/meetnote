@@ -14,9 +14,26 @@ Enregistrement de réunions → Transcription Whisper → Notion
 Dépendances :
 ```bash
 pip install -r requirements.txt
+pip install pycaw noisereduce psutil  # dépendances supplémentaires non listées dans requirements.txt
 ```
 
-Le fichier `requirements.txt` inclut : `faster-whisper`, `sounddevice`, `soundcard`, `pystray`, `Pillow`, `requests`, `pywin32`, `pycaw`, `noisereduce`, `scipy`, `psutil`.
+Le fichier `requirements.txt` inclut : `faster-whisper`, `sounddevice`, `soundcard`, `soundfile`, `numpy`, `scipy`, `scikit-learn`, `pystray`, `Pillow`, `requests`, `pywin32`.
+
+> **Important** : créer le fichier `pc/config.py` (gitignored) à partir du modèle ci-dessous avant le premier lancement :
+> ```python
+> import os
+> SAMPLE_RATE = 16000
+> CHUNK_SECONDS = 5
+> _BASE = os.path.join(os.path.expanduser("~"), "Documents", "MeetNote")
+> AUDIO_ARCHIVE_DIR = os.path.join(_BASE, "audio")
+> TRANSCRIPT_DIR    = os.path.join(_BASE, "transcripts")
+> TEMP_DIR          = os.path.join(_BASE, "tmp")
+> WHISPER_MODEL    = "medium"
+> WHISPER_LANGUAGE = "fr"
+> TRANSCRIPTION_SEGMENT_MIN = 10
+> NOTION_TOKEN       = ""
+> NOTION_DATABASE_ID = ""
+> ```
 
 Lancer :
 ```
@@ -42,7 +59,7 @@ L'application s'ouvre dans une fenêtre tkinter avec une icône systray. L'inter
 
 Les trois étapes sont découplées et chacune est relançable indépendamment depuis l'historique :
 1. **Enregistrement audio** → archivé dans `Documents\MeetNote\audio\` (opus via ffmpeg ou wav en fallback)
-2. **Transcription** (faster-whisper, local) → sauvegardée dans `Documents\MeetNote\transcripts\` avec timestamps `[HH:MM:SS]` par segment
+2. **Transcription** (faster-whisper, local) → sauvegardée dans `Documents\MeetNote\transcripts\` avec timestamps `[HH:MM:SS]` par segment. Diarisation automatique (MFCC + DBSCAN) : identification des locuteurs `SPKR_1 (H)` / `SPKR_2 (F)` avec détection H/F via pitch F0.
 3. **Upload Notion** → ou export fichier local selon le mode choisi dans les paramètres
 
 #### Fenêtre Historique
@@ -51,6 +68,8 @@ Accessible via la sidebar (History). Affiche des cartes avec :
 - Badges de statut colorés : AUDIO / TRANSCRIPT / NOTION
 - Boutons contextuels : Transcribe (avec sélecteur de modèle), Re-transcribe, → Notion, View txt, Open Notion
 - Bouton Delete (suppression de l'entrée)
+- **Bouton "🗑 Supprimer"** : supprime en masse tous les jobs terminés (transcript + notion = done)
+- **Bouton "📝 Transcrire tout"** : met en queue tous les jobs en attente ou en erreur
 - Bouton Import audio (supporte wav, mp3, opus, ogg, m4a, flac, webm, mp4)
 
 #### Paramètres
@@ -81,13 +100,16 @@ Renseigner dans les Paramètres de l'appli :
 
 Créer la database **Transcripts** avec ces propriétés :
 
-| Propriété | Type |
-|-----------|------|
-| Titre | title |
-| Date | date |
-| Participants | text |
-| Source | select : PC / Mobile |
-| Tag | select : À traiter / Traité |
+| Propriété | Type | Valeurs |
+|-----------|------|---------|
+| Titre | title | — |
+| Date | date | — |
+| Participants | select | noms des participants |
+| Source | select | PC / Mobile |
+| Statut | select | À traiter / Traité |
+| Type | select | Gouvernance / Technique / Projet / RH / Fournisseur / Autre / A classifier |
+| Durée (min) | number | — |
+| Modèle Whisper | select | tiny / base / small / medium / large-v3 |
 
 Créer une intégration sur [notion.so/my-integrations](https://www.notion.so/my-integrations) et partager la database avec elle.
 
