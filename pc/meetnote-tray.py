@@ -2400,6 +2400,7 @@ def _open_settings():
 
     act_notion  = _make_tab("notion",  "  Notion  ")
     act_general = _make_tab("general", "  Général  ")
+    act_outlook = _make_tab("outlook", "  Outlook  ")
     tk.Frame(win, bg=S_HIGH, height=1).pack(fill="x")
 
     # ── Tab : Notion
@@ -2484,6 +2485,99 @@ def _open_settings():
         except Exception as e:
             status_lbl.config(text=f"Erreur : {e}", fg=ERR)
 
+    # ── Tab : Outlook (EWS — Nouvel Outlook on-premise)
+    tab_o = tab_bodies["outlook"][0]
+
+    tk.Label(tab_o,
+             text="Connexion Exchange (EWS)\nNécessaire avec le Nouvel Outlook on-premise",
+             font=("Segoe UI", 9, "bold"), bg=S_CARD, fg=FG, justify="left").pack(
+        anchor="w", pady=(0, 6))
+
+    _ews_instr = (
+        "1. Email      : votre adresse Exchange (prenom.nom@hopital.fr)\n"
+        "2. Utilisateur : DOMAINE\\prenom.nom  (barre oblique inversée)\n"
+        "3. Mot de passe : stocké dans le Gestionnaire d'identifiants Windows\n"
+        "4. URL EWS    : laisser vide → Autodiscover (recommandé)\n"
+        "   Sinon : https://mail.hopital.fr/EWS/Exchange.asmx"
+    )
+    oi_frame = tk.Frame(tab_o, bg=S_BASE)
+    oi_frame.pack(fill="x", pady=(0, 10))
+    oi_txt = tk.Text(oi_frame, height=6, bg=S_BASE, fg=FG2,
+                     font=("Consolas", 8), relief="flat", bd=0,
+                     wrap="word", state="normal")
+    oi_txt.insert("1.0", _ews_instr)
+    oi_txt.config(state="disabled")
+    oi_txt.pack(fill="x", padx=8, pady=6)
+
+    ews_email_var = _field(tab_o, "Email Exchange",  user_config.get("ews_email", ""))
+    ews_user_var  = _field(tab_o, "Utilisateur (DOMAINE\\login)", user_config.get("ews_username", ""))
+    ews_pass_var  = _field_with_eye(tab_o, "Mot de passe", "")
+    ews_url_var   = _field(tab_o, "URL EWS (vide = Autodiscover)", user_config.get("ews_url", ""))
+
+    try:
+        import keyring as _kr
+        _saved_user = user_config.get("ews_username", "")
+        if _saved_user:
+            _saved_pw = _kr.get_password("MeetNote_EWS", _saved_user) or ""
+            ews_pass_var.set(_saved_pw)
+    except Exception:
+        pass
+
+    ews_status_lbl = tk.Label(tab_o, text="", font=("Segoe UI", 8),
+                              bg=S_CARD, fg=FG3, wraplength=360)
+    ews_status_lbl.pack(pady=(6, 0))
+
+    def _test_ews():
+        import threading
+        ews_status_lbl.config(text="Connexion en cours…", fg=FG3)
+        win.update_idletasks()
+
+        def _run():
+            try:
+                import ews_cal
+                result = ews_cal.get_current_or_next_meeting(
+                    email=ews_email_var.get().strip(),
+                    username=ews_user_var.get().strip(),
+                    password=ews_pass_var.get(),
+                    ews_url=ews_url_var.get().strip(),
+                    window_minutes=1440,
+                )
+                if result is not None:
+                    msg = f"✓ Connexion OK — prochain RDV : {result['subject']}"
+                else:
+                    msg = "✓ Connexion OK — aucun RDV dans les 24h"
+                color = "#00cc66"
+            except Exception as e:
+                msg = f"Erreur : {e}"
+                color = ERR
+            win.after(0, lambda: ews_status_lbl.config(text=msg, fg=color))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    tk.Button(tab_o, text="Tester la connexion",
+              font=("Segoe UI", 8), bg=S_HIGH, fg=FG,
+              activebackground=S_TOP, activeforeground=FG,
+              relief="flat", bd=0, pady=5, cursor="hand2",
+              command=_test_ews).pack(anchor="w", pady=(4, 0))
+
+    def _save_ews():
+        new_email = ews_email_var.get().strip()
+        new_user  = ews_user_var.get().strip()
+        new_pw    = ews_pass_var.get()
+        new_url   = ews_url_var.get().strip()
+        try:
+            import keyring as _kr
+            if new_user and new_pw:
+                _kr.set_password("MeetNote_EWS", new_user, new_pw)
+            user_config.save({
+                "ews_email":    new_email,
+                "ews_username": new_user,
+                "ews_url":      new_url,
+            })
+            ews_status_lbl.config(text="✓ Configuration EWS sauvegardée.", fg="#00cc66")
+        except Exception as e:
+            ews_status_lbl.config(text=f"Erreur : {e}", fg=ERR)
+
     # ── Tab : Général
     tab_g = tab_bodies["general"][0]
 
@@ -2528,10 +2622,17 @@ def _open_settings():
               bg=S_MAIN, fg=ERR, activebackground=S_CARD, activeforeground=ERR,
               relief="flat", bd=0, pady=9, cursor="hand2",
               command=win.destroy).pack(side="left", padx=16, pady=10)
+    def _save_active():
+        tab = _active_tab.get()
+        if tab == "notion":
+            _save_notion()
+        elif tab == "outlook":
+            _save_ews()
+
     tk.Button(footer, text="SAVE CONFIGURATION", font=("Segoe UI", 9, "bold"),
               bg=RED_DIM, fg="white", activebackground=RED, activeforeground="white",
               relief="flat", bd=0, pady=9, cursor="hand2",
-              command=_save_notion).pack(side="right", padx=16, pady=10, ipadx=12)
+              command=_save_active).pack(side="right", padx=16, pady=10, ipadx=12)
 
     # Activer onglet Notion par défaut
     act_notion()
