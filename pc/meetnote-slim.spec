@@ -63,6 +63,7 @@ a = Analysis(
     'user_config',
     'history',
     'outlook_cal',
+    'calendar_digest',
     'teams_roster',
     'soundfile',
     '_soundfile',

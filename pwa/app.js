@@ -18,7 +18,20 @@ const btnStopNotion  = document.getElementById('btn-stop-notion');
 const btnStopOnly    = document.getElementById('btn-stop-only');
 const btnCancel      = document.getElementById('btn-cancel');
 const sendSection    = document.getElementById('send-section');
+const sendSectionTitle = document.getElementById('send-section-title');
+const sendCardTitle  = document.getElementById('send-card-title');
 const sendMeta       = document.getElementById('send-meta');
+
+// Import transcript
+const tabFile        = document.getElementById('tab-file');
+const tabPaste       = document.getElementById('tab-paste');
+const panelFile      = document.getElementById('panel-file');
+const panelPaste     = document.getElementById('panel-paste');
+const importFileInput = document.getElementById('import-file-input');
+const btnImportFile  = document.getElementById('btn-import-file');
+const importFileName = document.getElementById('import-file-name');
+const importPaste    = document.getElementById('import-paste');
+const btnImportPaste = document.getElementById('btn-import-paste');
 
 // Meeting info
 const selSource      = document.getElementById('sel-source');
@@ -52,6 +65,7 @@ let _recStartTime = null;
 let _vuInterval   = null;
 let _timerInterval = null;
 let _lastAudioBlob = null;
+let _lastTranscript = null;   // transcript importé (fichier ou coller)
 let _pendingNotion = false;   // stop triggered by "Stop & Notion" button
 
 // ─── Settings ────────────────────────────────────────────────────────────────
@@ -80,6 +94,61 @@ modalBackdrop.addEventListener('click', (e) => {
   if (e.target === modalBackdrop) modalBackdrop.classList.remove('open');
 });
 btnSaveNotion.addEventListener('click', saveNotion);
+
+// ─── Import transcript ────────────────────────────────────────────────────────
+tabFile.addEventListener('click', () => {
+  tabFile.classList.add('active');
+  tabPaste.classList.remove('active');
+  panelFile.style.display  = '';
+  panelPaste.style.display = 'none';
+});
+
+tabPaste.addEventListener('click', () => {
+  tabPaste.classList.add('active');
+  tabFile.classList.remove('active');
+  panelPaste.style.display = '';
+  panelFile.style.display  = 'none';
+  importPaste.focus();
+});
+
+btnImportFile.addEventListener('click', () => importFileInput.click());
+
+importFileInput.addEventListener('change', () => {
+  const file = importFileInput.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const text = e.target.result.trim();
+    if (!text) { journal('Fichier vide.'); return; }
+    _applyImportedTranscript(text, file.name);
+  };
+  reader.readAsText(file, 'utf-8');
+  importFileInput.value = '';
+});
+
+btnImportPaste.addEventListener('click', () => {
+  const text = importPaste.value.trim();
+  if (!text) { journal('Rien à importer : zone de texte vide.'); return; }
+  _applyImportedTranscript(text, null);
+  importPaste.value = '';
+});
+
+function _applyImportedTranscript(text, filename) {
+  _lastTranscript = text;
+  _lastAudioBlob  = null;
+
+  const wordCount = text.split(/\s+/).filter(Boolean).length;
+  const label     = filename ? `📄 ${filename}` : `📋 Texte collé`;
+  importFileName.textContent = filename ? `✓ ${filename}` : '';
+
+  sendSectionTitle.textContent = 'TRANSCRIPT IMPORTÉ';
+  sendCardTitle.innerHTML = `${label} <span class="badge-transcript">TRANSCRIPT</span>`;
+  sendMeta.textContent = `${wordCount} mots · ${formatDate(new Date())}`;
+  btnDownload.style.display = 'none';
+  sendSection.classList.add('visible');
+  setStatus('Transcript prêt — vérifiez les infos de réunion puis envoyez.');
+  journal(`Transcript importé : ${wordCount} mots${filename ? ' (' + filename + ')' : ''}.`);
+}
 
 // ─── Record button (toggle start/stop+notion) ─────────────────────────────
 btnRecord.addEventListener('click', async () => {
@@ -171,7 +240,10 @@ async function stopRecording() {
     ? `${Math.round(durationMin)} min`
     : `${Math.round(durationMin * 60)} sec`;
 
+  sendSectionTitle.textContent = 'ENREGISTREMENT PRÊT';
+  sendCardTitle.innerHTML = 'Audio capturé <span class="badge-pc">À TRANSCRIRE SUR PC</span>';
   sendMeta.textContent = `Durée : ${dStr}  ·  ${formatDate(_recStartTime)}`;
+  btnDownload.style.display = '';
   sendSection.classList.add('visible');
   setStatus('Enregistrement terminé.');
 
@@ -233,8 +305,10 @@ async function pushAudioToNotion() {
     return;
   }
 
-  if (!_lastAudioBlob) {
-    setStatus('Aucun audio à envoyer.');
+  const isTranscriptMode = !_lastAudioBlob && _lastTranscript;
+
+  if (!_lastAudioBlob && !_lastTranscript) {
+    setStatus('Aucun contenu à envoyer.');
     return;
   }
 
@@ -246,21 +320,39 @@ async function pushAudioToNotion() {
     : 0;
 
   try {
-    await pushToNotion({
-      token,
-      databaseId:   dbId,
-      transcript:   'Audio enregistré sur mobile — à transcrire sur PC',
-      participants: participantsEl.value.trim(),
-      source:       'Mobile',
-      meetingType:  selType.value,
-      durationMin:  Math.round(durationMin * 10) / 10,
-      whisperModel: '',
-      recordingDate: _recStartTime,
-      audioBlob:    _lastAudioBlob,
-      status:       'À transcrire sur PC',
-    });
-    setStatus('✓ Audio envoyé vers Notion ! Ouvrez MeetNote PC pour transcrire.');
-    journal('Audio envoyé vers Notion avec statut "À transcrire sur PC".');
+    if (isTranscriptMode) {
+      await pushToNotion({
+        token,
+        databaseId:   dbId,
+        transcript:   _lastTranscript,
+        participants: participantsEl.value.trim(),
+        source:       'Transcript importé',
+        meetingType:  selType.value,
+        durationMin:  0,
+        whisperModel: '',
+        recordingDate: new Date(),
+        audioBlob:    null,
+        status:       'Transcrit',
+      });
+      setStatus('✓ Transcript envoyé vers Notion !');
+      journal('Transcript envoyé vers Notion avec statut "Transcrit".');
+    } else {
+      await pushToNotion({
+        token,
+        databaseId:   dbId,
+        transcript:   'Audio enregistré sur mobile — à transcrire sur PC',
+        participants: participantsEl.value.trim(),
+        source:       'Mobile',
+        meetingType:  selType.value,
+        durationMin:  Math.round(durationMin * 10) / 10,
+        whisperModel: '',
+        recordingDate: _recStartTime,
+        audioBlob:    _lastAudioBlob,
+        status:       'À transcrire sur PC',
+      });
+      setStatus('✓ Audio envoyé vers Notion ! Ouvrez MeetNote PC pour transcrire.');
+      journal('Audio envoyé vers Notion avec statut "À transcrire sur PC".');
+    }
     clearSendSection();
   } catch (err) {
     journal('Erreur Notion : ' + err.message);
@@ -273,8 +365,11 @@ async function pushAudioToNotion() {
 function clearSendSection() {
   sendSection.classList.remove('visible');
   participantsEl.value = '';
-  _lastAudioBlob = null;
-  _recStartTime  = null;
+  _lastAudioBlob  = null;
+  _lastTranscript = null;
+  _recStartTime   = null;
+  btnDownload.style.display = '';
+  importFileName.textContent = '';
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

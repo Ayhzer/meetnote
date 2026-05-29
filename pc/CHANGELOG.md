@@ -1,5 +1,34 @@
 # MeetNote PC — Changelog
 
+## [3.2] — 2026-05-18
+
+### Nouvelles fonctionnalités
+- **Arrêt de transcription en cours** : dans le panel historique, le bouton "⏹ Stop transcript" interrompt la transcription Whisper entre deux segments. Le job repasse en statut gris (◷ TRANSCRIPT) — relançable via "📝 Transcribe".
+- **Type Notion "Audio"** : les enregistrements audio sont désormais envoyés dans Notion avec la propriété `Type = Audio` (identique au principe des emails envoyés avec `Type = Email`).
+
+### Correctifs
+- **Crash "App disparue brutalement" après fin de réunion** : le moniteur de périphérique audio pouvait afficher la dialog "Redémarrer MeetNote ?" pendant que la fenêtre "Transcript Teams" était ouverte — si `grab_set()` avait échoué (mode tray), le guard `grab_current()` ne fonctionnait pas. Désormais, un flag `_modal_dialog_open` empêche tout dialog de type "restart" ou "auto-start" de s'intercaler pendant un dialog modal.
+- **Auto-start Outlook pendant le dialog Teams** : `_poll_outlook` pouvait déclencher un auto-start d'une nouvelle réunion pendant que `wait_window()` était actif (`_recording = False`). Ce démarrage fantôme est maintenant bloqué par le même flag.
+
+---
+
+## [3.1] — 2026-05-04
+
+### Correctifs
+- Crash après "Stop sans transcription" : l'archivage audio démarre maintenant avant l'ouverture du dialog "coller le transcript Teams", évitant la perte de l'audio.
+- Garde de None sur `_source_combo` et `_status_var` dans `_update_window_state()`.
+- Moniteur de périphérique audio : ne plus interrompre quand un dialog modal est ouvert.
+
+### Agenda Outlook
+- **Liste d'exclusion** : les réunions dont l'intitulé contient un motif configuré (Settings → Outlook → Exclusions) ne déclenchent plus l'auto-start. Un motif par ligne, insensible à la casse.
+- **Popup fin de RDV pour enregistrements manuels** : si un RDV Outlook est en cours au démarrage de l'enregistrement, la popup "Fin de réunion imminente" se déclenche à l'approche de la fin.
+- **Bouton 🔄 Sync agenda** dans la section MEETING pour forcer immédiatement le polling Outlook (sans attendre le cycle de 60 s).
+
+### UI
+- Menu "ℹ v3.1" en bas de la sidebar : affiche cette release note détaillée.
+
+---
+
 ## [3.0] — 2026-03-21
 
 ### UI — Refonte "Digital Control Room" (Stitch design)

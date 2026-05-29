@@ -188,6 +188,71 @@
       overflow-y: auto; white-space: pre-wrap; word-break: break-all;
     }
 
+    /* ── Historique */
+    .history-list {
+      display: flex; flex-direction: column; gap: .4rem;
+    }
+    .history-item {
+      display: flex; align-items: center; gap: .5rem;
+      background: var(--bg2); border-radius: 8px;
+      padding: .5rem .7rem; font-size: .8rem;
+    }
+    .history-item-info { flex: 1; overflow: hidden; }
+    .history-item-title {
+      color: var(--fg); white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .history-item-meta { color: var(--fg2); font-size: .72rem; }
+    .badge-status {
+      font-size: .68rem; font-weight: 700;
+      padding: .12rem .4rem; border-radius: 4px; white-space: nowrap;
+    }
+    .badge-pending  { background: #1a1a00; color: #ffcc00; }
+    .badge-complete { background: #001a0a; color: #00cc66; }
+    .btn-del-item {
+      background: none; border: none; color: var(--fg2);
+      font-size: 1rem; cursor: pointer; padding: 0 .2rem;
+    }
+    .btn-del-item:hover { color: var(--red); }
+    .history-empty { color: var(--fg2); font-size: .8rem; text-align: center; padding: .5rem 0; }
+    .history-actions { display: flex; justify-content: flex-end; margin-bottom: .5rem; }
+    .btn-delete-all {
+      background: none; border: 1px solid #445;
+      color: var(--fg2); font-size: .75rem;
+      padding: .3rem .7rem; border-radius: 6px; cursor: pointer;
+    }
+    .btn-delete-all:hover { border-color: var(--red); color: var(--red); }
+
+    /* ── Popup confirmation suppression */
+    .delete-popup {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.6); z-index: 200;
+      align-items: center; justify-content: center;
+    }
+    .delete-popup.open { display: flex; }
+    .delete-popup-box {
+      background: var(--bg2); border-radius: 12px;
+      padding: 1.2rem 1.2rem 1rem;
+      width: min(320px, 90vw); text-align: center;
+    }
+    .delete-popup-box p { font-size: .9rem; color: var(--fg); margin-bottom: 1rem; }
+    .delete-popup-btns { display: flex; flex-direction: column; gap: .5rem; }
+    .btn-del-complete {
+      background: #1a3a00; color: #66cc44;
+      border: none; border-radius: 8px;
+      padding: .65rem; font-size: .9rem; font-weight: 700; cursor: pointer;
+    }
+    .btn-del-all-confirm {
+      background: var(--red); color: #fff;
+      border: none; border-radius: 8px;
+      padding: .65rem; font-size: .9rem; font-weight: 700; cursor: pointer;
+    }
+    .btn-del-cancel {
+      background: var(--dim); color: #ccc;
+      border: none; border-radius: 8px;
+      padding: .55rem; font-size: .85rem; cursor: pointer;
+    }
+
     /* ── Bottom bar */
     .bottom-bar {
       display: flex; gap: .5rem;
@@ -247,6 +312,57 @@
       font-size: .85rem; cursor: pointer; margin-top: .4rem;
     }
     .save-status { font-size: .8rem; min-height: 1.2rem; margin-top: .4rem; }
+
+    /* ── Import transcript */
+    .import-tabs {
+      display: flex; gap: .4rem; margin-bottom: .7rem;
+    }
+    .import-tab {
+      flex: 1; padding: .45rem .5rem;
+      border: 1px solid #334; border-radius: 6px;
+      background: var(--bg3); color: var(--fg2);
+      font-size: .82rem; cursor: pointer;
+      transition: background .15s, color .15s;
+    }
+    .import-tab.active {
+      background: #2e5e8e; color: #fff; border-color: #2e5e8e;
+    }
+    .btn-import-file {
+      width: 100%; padding: .7rem;
+      border: 1px dashed #446; border-radius: 8px;
+      background: var(--bg3); color: var(--fg);
+      font-size: .88rem; cursor: pointer;
+      text-align: center;
+    }
+    .btn-import-file:hover { border-color: #6699cc; color: var(--hint); }
+    .import-hint {
+      font-size: .72rem; color: var(--hint);
+      margin-top: .35rem; text-align: center;
+      min-height: 1rem;
+    }
+    #import-paste {
+      width: 100%; min-height: 100px;
+      background: var(--bg3); color: var(--fg);
+      border: 1px solid #334; border-radius: 6px;
+      padding: .5rem .6rem; font-size: .82rem;
+      resize: vertical; font-family: inherit;
+      line-height: 1.45;
+    }
+    #import-paste::placeholder { color: var(--fg2); }
+    .btn-import-use {
+      width: 100%; margin-top: .5rem; padding: .65rem;
+      border: none; border-radius: 8px;
+      background: #2e5e8e; color: #fff;
+      font-size: .88rem; font-weight: 700; cursor: pointer;
+    }
+    .btn-import-use:disabled { opacity: .4; cursor: default; }
+    .badge-transcript {
+      display: inline-block;
+      background: #001a33; color: #66aaff;
+      font-size: .72rem; font-weight: 700;
+      padding: .15rem .5rem; border-radius: 4px;
+      letter-spacing: .04em; margin-left: .4rem;
+    }
   </style>
 </head>
 <body>
@@ -321,16 +437,51 @@
   <button class="btn btn-cancel"      id="btn-cancel">✕  Annuler l'enregistrement</button>
 </div>
 
-<!-- Section envoi (post-enregistrement) -->
+<!-- IMPORTER UN TRANSCRIPT -->
+<div class="section">
+  <div class="section-title">IMPORTER UN TRANSCRIPT</div>
+  <div class="section-body">
+    <div class="import-tabs">
+      <button class="import-tab active" id="tab-file">📄 Fichier</button>
+      <button class="import-tab"        id="tab-paste">📋 Copier-coller</button>
+    </div>
+    <!-- Panneau fichier -->
+    <div id="panel-file">
+      <input type="file" id="import-file-input" accept=".txt,.md,.srt,.vtt" style="display:none" />
+      <button class="btn-import-file" id="btn-import-file">Choisir un fichier texte…</button>
+      <div class="import-hint" id="import-file-name"></div>
+    </div>
+    <!-- Panneau copier-coller -->
+    <div id="panel-paste" style="display:none">
+      <textarea id="import-paste" placeholder="Collez votre transcript ici…"></textarea>
+      <button class="btn-import-use" id="btn-import-paste">Utiliser ce texte</button>
+    </div>
+  </div>
+</div>
+
+<!-- Section envoi (post-enregistrement ou post-import) -->
 <div class="section" id="send-section">
-  <div class="section-title">ENREGISTREMENT PRÊT</div>
+  <div class="section-title" id="send-section-title">ENREGISTREMENT PRÊT</div>
   <div class="send-card">
-    <div class="send-card-title">Audio capturé <span class="badge-pc">À TRANSCRIRE SUR PC</span></div>
+    <div class="send-card-title" id="send-card-title">Audio capturé <span class="badge-pc">À TRANSCRIRE SUR PC</span></div>
     <div class="send-card-meta" id="send-meta">—</div>
     <div class="push-row">
-      <button class="btn-push" id="btn-push">Envoyer vers Notion</button>
+      <button class="btn-push"     id="btn-push">Envoyer vers Notion</button>
       <button class="btn-download" id="btn-download">⬇ Audio</button>
-      <button class="btn-discard" id="btn-discard">✕</button>
+      <button class="btn-discard"  id="btn-discard">✕</button>
+    </div>
+  </div>
+</div>
+
+<!-- Historique -->
+<div class="section">
+  <div class="section-title">HISTORIQUE</div>
+  <div class="section-body">
+    <div class="history-actions">
+      <button class="btn-delete-all" id="btn-delete-all">Supprimer tout…</button>
+    </div>
+    <div class="history-list" id="history-list">
+      <div class="history-empty">Aucun envoi enregistré</div>
     </div>
   </div>
 </div>
@@ -344,6 +495,18 @@
 <!-- Barre du bas -->
 <div class="bottom-bar">
   <button class="btn-sm btn-settings" id="btn-open-settings">⚙ Paramètres Notion</button>
+</div>
+
+<!-- Popup suppression historique -->
+<div class="delete-popup" id="delete-popup">
+  <div class="delete-popup-box">
+    <p>Supprimer des entrées de l'historique local ?</p>
+    <div class="delete-popup-btns">
+      <button class="btn-del-complete" id="btn-del-complete">✓ Complets seulement</button>
+      <button class="btn-del-all-confirm" id="btn-del-all-confirm">✕ Supprimer tout</button>
+      <button class="btn-del-cancel" id="btn-del-cancel">Annuler</button>
+    </div>
+  </div>
 </div>
 
 <!-- Modal Paramètres -->

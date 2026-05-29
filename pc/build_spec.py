@@ -11,6 +11,40 @@ import os
 import sys
 import subprocess
 
+# ─── Signature numérique ─────────────────────────────────────────────────────
+# Certificat auto-signé MeetNote, installé dans CurrentUser\My + TrustedPublisher.
+# Créé une seule fois via New-SelfSignedCertificate (voir setup_codesign.ps1).
+_CODESIGN_SUBJECT = "CN=MeetNote"          # filtre pour retrouver le cert
+_TIMESTAMP_SERVER = "http://timestamp.digicert.com"  # TSA publique gratuite
+
+
+def _sign_exe(exe_path: str):
+    """Signe exe_path avec le certificat MeetNote trouvé dans CurrentUser\\My."""
+    ps = f"""
+$cert = Get-ChildItem Cert:\\CurrentUser\\My |
+    Where-Object {{ $_.Subject -like '*MeetNote*' -and $_.HasPrivateKey }} |
+    Sort-Object NotAfter -Descending |
+    Select-Object -First 1
+if (-not $cert) {{
+    Write-Error 'Certificat MeetNote introuvable dans CurrentUser\\My'
+    exit 1
+}}
+$r = Set-AuthenticodeSignature -FilePath '{exe_path}' -Certificate $cert -HashAlgorithm SHA256 -TimestampServer '{_TIMESTAMP_SERVER}'
+if ($r.Status -ne 'Valid') {{
+    Write-Error ("Signature echouee: " + $r.StatusMessage)
+    exit 1
+}}
+Write-Host ("[build_spec] EXE signe: " + $r.Status + " — " + $cert.Thumbprint)
+"""
+    r = subprocess.run(
+        ["powershell", "-NonInteractive", "-Command", ps],
+        capture_output=True, text=True, timeout=30,
+    )
+    print(r.stdout.strip())
+    if r.returncode != 0:
+        print(f"[build_spec] WARNING: signature échouée — {r.stderr.strip()[:300]}")
+
+
 # ─── Paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 HF_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
@@ -137,6 +171,8 @@ hidden_imports = [
     "user_config",
     "history",
     "outlook_cal",
+    "outlook_mail",
+    "calendar_digest",
     "teams_roster",
     "soundfile",
     "_soundfile",
@@ -155,7 +191,9 @@ hidden_imports = [
     "psutil",
     "win32com",
     "win32com.client",
+    "win32timezone",
     "pywintypes",
+    "pythoncom",
     # EWS / Nouvel Outlook on-premise
     "ews_cal",
     "exchangelib",
@@ -258,20 +296,43 @@ with open(spec_path, "w", encoding="utf-8") as f:
 print(f"[build_spec] Wrote {spec_path}")
 
 # ─── Run PyInstaller ──────────────────────────────────────────────────────────
+# workpath et distpath hors OneDrive pour éviter les verrouillages de sync
+WORK_DIR = r"C:\Temp\meetnote_build\work"
+DIST_DIR_TMP = r"C:\Temp\meetnote_build\dist"
+os.makedirs(WORK_DIR, exist_ok=True)
+os.makedirs(DIST_DIR_TMP, exist_ok=True)
+
 print("[build_spec] Starting PyInstaller build...")
 pyinstaller_exe = os.path.join(VENV, "Scripts", "pyinstaller.exe")
 if not os.path.exists(pyinstaller_exe):
     pyinstaller_exe = "pyinstaller"   # fallback to PATH
 
 result = subprocess.run(
-    [pyinstaller_exe, "--clean", "--noconfirm", spec_path],
+    [pyinstaller_exe, "--clean", "--noconfirm",
+     "--workpath", WORK_DIR,
+     "--distpath", DIST_DIR_TMP,
+     spec_path],
     cwd=SCRIPT_DIR,
     capture_output=False,
 )
 
 if result.returncode == 0:
-    dist_dir = os.path.join(SCRIPT_DIR, "dist", "MeetNote")
+    import shutil as _shutil_final
+    dist_dir_final = os.path.join(SCRIPT_DIR, "dist", "MeetNote")
+
+    # Arrêter MeetNote s'il tourne (sinon MeetNote.exe est verrouillé)
+    subprocess.run(["taskkill", "/F", "/IM", "MeetNote.exe"],
+                   capture_output=True)
+    import time as _time; _time.sleep(1)
+
+    print(f"[build_spec] Copying output to {dist_dir_final} ...")
+    _shutil_final.copytree(os.path.join(DIST_DIR_TMP, "MeetNote"), dist_dir_final,
+                           dirs_exist_ok=True)
+    dist_dir = dist_dir_final
     print(f"\n[build_spec] SUCCESS — output: {dist_dir}")
+
+    # ── Signature numérique (certificat auto-signé, stocké dans CurrentUser\My) ──
+    _sign_exe(os.path.join(dist_dir, "MeetNote.exe"))
 
     # Copier les modèles extra (medium, large…) depuis le cache HF vers dist/models/
     EXTRA_MODELS = ["medium"]

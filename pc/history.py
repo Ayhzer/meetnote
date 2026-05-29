@@ -29,9 +29,12 @@ def _dict_to_job_dict(d: dict) -> dict:
         "status_transcript": "queued",
         "status_notion": "pending",
         "transcript": "",
+        "whisper_transcript": "",
+        "teams_transcript": "",
         "transcript_path": "",
         "notion_url": "",
         "error_msg": "",
+        "attachments": [],
     }
     for k, v in defaults.items():
         if k not in d:

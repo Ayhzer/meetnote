@@ -37,6 +37,7 @@ def push_to_notion(
     start_time: datetime.datetime = None,
     audio_path: str = None,
     title_override: str = "",
+    attachments: list = None,
 ) -> dict:
     now   = start_time or datetime.datetime.now()
     title = title_override.strip() if title_override and title_override.strip() else f"Réunion {now.strftime('%Y-%m-%d %H:%M')}"
@@ -69,12 +70,12 @@ def push_to_notion(
         props["Modèle Whisper"] = {"select": {"name": whisper_model}}
 
     # ── Upload audio si fourni ────────────────────────────────────────────────
+    file_objects = []
     if audio_path and os.path.isfile(audio_path):
         try:
             compressed = _compress_audio(audio_path, now)
             segments   = _split_audio_for_upload(compressed, segment_min=config.NOTION_UPLOAD_SEGMENT_MIN)
 
-            file_objects = []
             for seg_path in segments:
                 fid, fname = _upload_file(seg_path)
                 file_objects.append({
@@ -90,12 +91,25 @@ def push_to_notion(
                 try: os.remove(compressed)
                 except OSError: pass
 
-            if file_objects:
-                props["Files & media"] = {"files": file_objects}
-
         except Exception as e:
-            # L'upload audio est non-bloquant : on continue sans fichier
             print(f"[notion_push] Warning: audio upload failed: {e}", file=sys.stderr)
+
+    # ── Upload pièces jointes si fournies ─────────────────────────────────────
+    for att_path in (attachments or []):
+        if not os.path.isfile(att_path):
+            continue
+        try:
+            fid, fname = _upload_file(att_path)
+            file_objects.append({
+                "type": "file_upload",
+                "file_upload": {"id": fid},
+                "name": fname,
+            })
+        except Exception as e:
+            print(f"[notion_push] Warning: attachment upload failed ({att_path}): {e}", file=sys.stderr)
+
+    if file_objects:
+        props["Files & media"] = {"files": file_objects}
 
     # Découpage en batches de 100 blocs (limite API Notion)
     first_batch  = blocks[:100]
@@ -259,11 +273,31 @@ def _upload_file(path: str) -> tuple[str, str]:
     filename = os.path.basename(path)
     ext      = os.path.splitext(filename)[1].lower()
     mime     = {
+        # Audio
         ".opus": "audio/ogg",
         ".ogg":  "audio/ogg",
         ".mp3":  "audio/mpeg",
         ".wav":  "audio/wav",
         ".webm": "audio/webm",
+        ".m4a":  "audio/mp4",
+        # Documents
+        ".pdf":  "application/pdf",
+        ".doc":  "application/msword",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xls":  "application/vnd.ms-excel",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".ppt":  "application/vnd.ms-powerpoint",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".txt":  "text/plain",
+        ".csv":  "text/csv",
+        # Images
+        ".png":  "image/png",
+        ".jpg":  "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif":  "image/gif",
+        ".webp": "image/webp",
+        # Archives
+        ".zip":  "application/zip",
     }.get(ext, "application/octet-stream")
 
     auth_headers = {
@@ -291,7 +325,57 @@ def _upload_file(path: str) -> tuple[str, str]:
         )
     r2.raise_for_status()
 
+    # Notion limits file name to 100 characters
+    if len(filename) > 100:
+        ext = os.path.splitext(filename)[1]
+        filename = filename[:100 - len(ext)] + ext
     return file_upload_id, filename
+
+
+def append_blocks_to_page(page_id: str, text: str, token: str) -> None:
+    """Appende une section 'Transcript Teams' à une page Notion existante."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Notion-Version": NOTION_VERSION,
+    }
+    blocks = [
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": "─── Transcript Teams ───"}}]
+            },
+        }
+    ]
+    for para in text.split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        while len(para) > 2000:
+            blocks.append(_paragraph_block(para[:2000]))
+            para = para[2000:]
+        if para:
+            blocks.append(_paragraph_block(para))
+
+    while blocks:
+        batch  = blocks[:100]
+        blocks = blocks[100:]
+        r = requests.patch(
+            f"{NOTION_API}/blocks/{page_id}/children",
+            json={"children": batch},
+            headers=headers,
+            timeout=30,
+        )
+        if not r.ok:
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text
+            raise requests.HTTPError(
+                f"append_blocks_to_page : {r.status_code} {r.reason} — {detail}",
+                response=r,
+            )
 
 
 def _paragraph_block(text: str) -> dict:

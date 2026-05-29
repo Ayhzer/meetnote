@@ -9,6 +9,7 @@ import sys
 import os
 import threading
 import collections
+import queue
 import ctypes
 import subprocess
 import tkinter as tk
@@ -19,6 +20,8 @@ import sounddevice as sd
 import soundcard as sc
 import numpy as np
 import wave
+import struct
+import atexit
 import datetime
 import shutil
 import dataclasses
@@ -28,8 +31,87 @@ import config
 import user_config
 import history as hist_mod
 import outlook_cal
+import calendar_digest
 from notion_push import push_to_notion
 import teams_roster
+
+VERSION = "3.1"
+
+RELEASE_NOTES = """\
+## [3.1] — 2026-05-04
+
+### Correctifs
+- Crash après "Stop sans transcription" : l'archivage audio démarre maintenant avant
+  l'ouverture du dialog "coller le transcript Teams", évitant la perte de l'audio.
+- Garde de None sur _source_combo et _status_var dans _update_window_state().
+- Moniteur de périphérique audio : ne plus interrompre quand un dialog modal est ouvert.
+
+### Agenda Outlook
+- Liste d'exclusion : les réunions dont l'intitulé contient un motif configuré
+  (Settings → Outlook → Exclusions) ne déclenchent plus l'auto-start.
+  (un motif par ligne, insensible à la casse)
+- Popup "Fin de réunion imminente" étendue aux enregistrements manuels :
+  si un RDV Outlook est en cours au démarrage de l'enregistrement, la popup
+  se déclenche à l'approche de la fin du RDV.
+- Bouton 🔄 dans la section MEETING pour forcer immédiatement le polling Outlook
+  (sans attendre le cycle de 60 s).
+
+---
+
+## [3.0] — 2026-03-21
+
+### UI — Refonte "Digital Control Room" (Stitch design)
+- Layout 2 colonnes avec sidebar de navigation gauche fixe
+- Nouvelle palette de couleurs Material Design (surface hierarchy)
+- Boutons d'action avec états visuels distincts (rouge/vert/violet/gris)
+- Indicateur de statut (dot coloré) : gris/vert/jaune selon l'état
+- System Console avec timestamps et tags colorés (erreurs en rouge)
+- Fenêtre historique redesignée : cartes avec badges statut colorés
+
+### Nouvelles fonctionnalités
+- Étapes indépendantes : audio, transcription, Notion — chacune relançable depuis l'historique
+- "Stop without transcribing" : archive l'audio, diffère la transcription
+- Import audio externe : bouton dans l'historique, supporte wav/mp3/opus/ogg/m4a/flac/webm/mp4
+- Retranscription avec modèle différent : combo modèle sur chaque carte de l'historique
+- Suppression d'entrées depuis l'historique
+- Timestamps [HH:MM:SS] dans les transcripts (par segment Whisper)
+- Agenda Outlook : pré-remplissage automatique du nom de réunion (polling 60s)
+- Slider REC GAIN (0.5x–4x) : gain numérique appliqué aux samples, toutes sources
+- Slider WIN VOLUME : contrôle du volume master Windows via pycaw
+- Instance unique : au démarrage, l'instance précédente est automatiquement terminée
+
+### Qualité audio & transcription
+- Resampling scipy resample_poly (remplace np.interp)
+- Débruitage noisereduce (prop_decrease=0.75, stationary)
+- Mix Mixte : 60% mic / 40% loopback (voix moins atténuée)
+- Whisper : beam_size=5, no_speech_threshold=0.6, vad min_silence=500ms
+- Détection RIFF magic bytes pour fichiers opus renommés en .wav
+
+### Corrections
+- Status "Processing N job(s)" ne se remettait pas à "Idle" après la fin des jobs
+- Fichiers opus archivés avec extension .wav causaient une erreur à la retranscription
+- Nom de réunion Outlook retournait "OFF" (bloc hors-bureau) au lieu du vrai RDV
+- S_TOP non défini dans _open_settings causait une NameError
+
+---
+
+## [2.0] — 2026-03-17
+
+### Traitement en arrière-plan (job queue)
+- Enregistrement et transcription entièrement découplés
+- Démarrer un nouvel enregistrement pendant qu'un job est en cours de traitement
+- Worker daemon unique (traitement séquentiel pour éviter la surcharge CPU)
+
+### Nouvelles fonctionnalités
+- Prévention de veille étendue à toute la durée du traitement (transcription + upload Notion)
+- Archive audio locale : Documents\\MeetNote\\audio\\ (Opus 24 kbps si ffmpeg, sinon WAV)
+- Découpage audio en segments de 10 min pour les uploads Notion longs
+- condition_on_previous_text=False pour éliminer les boucles de répétition Whisper
+
+### Corrections
+- La veille PC ne s'activait plus après l'arrêt de l'enregistrement
+- Le fichier WAV temporaire était supprimé avant d'être archivé localement
+"""
 
 # Surcharge les credentials avec les valeurs utilisateur persistées
 _uc = user_config.load()
@@ -37,6 +119,16 @@ if _uc.get("notion_token"):
     config.NOTION_TOKEN = _uc["notion_token"]
 if _uc.get("notion_database_id"):
     config.NOTION_DATABASE_ID = _uc["notion_database_id"]
+_auto_start_exclusions = [
+    s.strip().lower()
+    for s in _uc.get("auto_start_exclusions", "").splitlines()
+    if s.strip()
+]
+
+# Synchronise les HEADERS de notion_push avec le token effectif (user_config
+# est chargé APRÈS l'import de notion_push, donc HEADERS aurait l'ancienne valeur)
+import notion_push as _np_mod
+_np_mod.HEADERS["Authorization"] = f"Bearer {config.NOTION_TOKEN}"
 
 # ─── Win32 sleep prevention ──────────────────────────────────────────────────
 ES_CONTINUOUS        = 0x80000000
@@ -102,6 +194,7 @@ _lang_var        = None
 _type_var        = None
 _output_var      = None
 _meeting_name_var = None   # champ nom réunion (pré-rempli depuis Outlook)
+_outlook_poll_fn  = None   # handle pour forcer le polling Outlook depuis le bouton
 _log_text        = None
 _btn_start       = None
 _btn_stop        = None
@@ -111,10 +204,20 @@ _source_combo    = None
 _speaker_frame   = None
 _speaker_combo   = None
 _rec_start_time  = None
+_audio_device_monitor_started = False  # un seul thread de surveillance
+_modal_dialog_open = False             # True pendant wait_window() d'un dialog modal
 
 # Fenêtre historique (Toplevel indépendante)
 _history_win:       tk.Toplevel | None = None
+_conflict_win:      tk.Toplevel | None = None
+_end_warn_win:      tk.Toplevel | None = None
 _history_list_frame: tk.Frame | None   = None
+
+# Fin de réunion imminente
+_current_meeting_end:  datetime.datetime | None = None
+_end_warned_key:       str | None = None  # ISO[:16] de la fin déjà signalée
+
+# Auto-start : sujets exclus (motifs en minuscules, chargés depuis user_config l.122)
 
 # Indicateur de statut (dot coloré)
 _status_dot:        tk.Label | None   = None
@@ -140,15 +243,20 @@ class _Job:
     status_transcript: str = "queued"  # queued / running / done / error
     status_notion:     str = "pending" # pending / running / done / error / skipped
     # Résultats
-    transcript:      str = ""
+    transcript:         str = ""
+    whisper_transcript: str = ""   # Transcription Whisper brute (avant concat Teams)
+    teams_transcript:   str = ""   # Transcript Teams collé manuellement
     transcript_path: str = ""
     notion_url:      str = ""
     error_msg:       str = ""
+    attachments:     list = dataclasses.field(default_factory=list)  # chemins fichiers joints (mails)
 
-_job_queue   = collections.deque()
-_queue_lock  = threading.Lock()
-_work_event  = threading.Event()
-_worker_busy = False
+_job_queue            = collections.deque()
+_queue_lock           = threading.Lock()
+_work_event           = threading.Event()
+_worker_busy          = False
+_worker_cancel_event  = threading.Event()   # set() pour annuler la transcription en cours
+_current_job: "_Job | None" = None          # job actuellement traité par le worker
 
 # Tous les jobs chargés (en mémoire, pour l'historique)
 _all_jobs: list[_Job] = []
@@ -308,11 +416,14 @@ def _push_level(mono: np.ndarray):
 
 
 # ─── Audio buffer ────────────────────────────────────────────────────────────
+_loopback_active = False  # True quand le thread loopback est actif
+
 def _append_audio(samples: np.ndarray):
     global _flush_frame_count
     if _rec_gain != 1.0:
         samples = np.clip(samples * _rec_gain, -1.0, 1.0)
-    samples = _denoise(samples)
+    if not _loopback_active:
+        samples = _denoise(samples)
     _audio_chunks.append(samples.copy())
     _flush_frame_count += len(samples)
     if _flush_frame_count >= _FLUSH_FRAMES and _wav_stream is not None:
@@ -328,6 +439,32 @@ def _flush_audio_to_wav():
     _wav_stream.writeframes((data * 32767).astype(np.int16).tobytes())
     _audio_chunks = []
     _flush_frame_count = 0
+    # Patch le header WAV avec les tailles réelles pour que le fichier soit
+    # valide en cas de crash (normalement écrit seulement à wave.close()).
+    try:
+        f = _wav_stream._file
+        pos = f.tell()
+        data_size = pos - 44  # octets de données audio (header WAV = 44 octets)
+        f.seek(4)
+        f.write(struct.pack('<I', data_size + 36))  # RIFF chunk size
+        f.seek(40)
+        f.write(struct.pack('<I', data_size))        # data chunk size
+        f.seek(pos)
+        f.flush()
+    except Exception:
+        pass
+
+
+def _emergency_flush():
+    """Appelé par atexit : flush les chunks restants et ferme proprement le WAV."""
+    try:
+        _flush_audio_to_wav()
+        if _wav_stream is not None:
+            _wav_stream.close()
+    except Exception:
+        pass
+
+atexit.register(_emergency_flush)
 
 
 # ─── sounddevice callback ────────────────────────────────────────────────────
@@ -342,40 +479,258 @@ def _mic_callback(indata, frames, time, status):
     _push_level(gained)
 
 
-# ─── soundcard loopback thread ───────────────────────────────────────────────
+# ─── sounddevice loopback thread ─────────────────────────────────────────────
+def _find_wasapi_output_device(spk_name: str | None) -> tuple[int, int] | None:
+    """Cherche le device de sortie WASAPI correspondant au haut-parleur sélectionné.
+    Retourne (device_index, samplerate) pour utilisation avec WasapiSettings(loopback=True).
+    """
+    try:
+        hostapis = sd.query_hostapis()
+        wasapi_idx = next((i for i, h in enumerate(hostapis) if 'WASAPI' in h['name']), None)
+        if wasapi_idx is None:
+            print("[audio] WASAPI host API non trouvé", file=sys.stderr)
+            return None
+        devs = sd.query_devices()
+        needle = spk_name.lower()[:20] if spk_name else None
+        # Cherche l'output WASAPI correspondant au haut-parleur sélectionné
+        for i, d in enumerate(devs):
+            if d.get('hostapi') != wasapi_idx:
+                continue
+            if d['max_output_channels'] == 0:
+                continue
+            if needle and needle not in d['name'].lower():
+                continue
+            rate = int(d['default_samplerate']) or 48000
+            print(f"[audio] loopback WASAPI output #{i} '{d['name']}' {rate} Hz", file=sys.stderr)
+            return i, rate
+        # Fallback : default output WASAPI
+        def_out = int(sd.default.device[1])
+        if sd.query_devices(def_out).get('hostapi') == wasapi_idx:
+            rate = int(sd.query_devices(def_out)['default_samplerate']) or 48000
+            print(f"[audio] loopback WASAPI default output #{def_out} {rate} Hz", file=sys.stderr)
+            return def_out, rate
+        print("[audio] aucun device WASAPI output trouvé", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[audio] erreur recherche WASAPI: {e}", file=sys.stderr)
+        return None
+
+
 def _loopback_thread_fn(mic_also: bool):
+    global _loopback_active
+    _loopback_active = True
     ctypes.windll.ole32.CoInitialize(None)
     spk_name = _speaker_var.get() if _speaker_var else None
-    if spk_name:
+
+    try:
+        import pyaudiowpatch as pawp
+
+        pa = pawp.PyAudio()
+        try:
+            wasapi_info = pa.get_host_api_info_by_type(pawp.paWASAPI)
+
+            all_loopbacks = list(pa.get_loopback_device_info_generator())
+            _AUTO = "— Sortie par défaut Windows —"
+            auto_mode = (not spk_name) or spk_name == _AUTO
+
+            def _best_loopback(target_name: str):
+                """Retourne le loopback dont le nom correspond le mieux à target_name.
+                Priorité : containment exact > score par mots-clés."""
+                target_low = target_name.lower()
+                keywords = [w for w in target_low.split() if len(w) > 3]
+                best, best_score = None, -1
+                for lb in all_loopbacks:
+                    lb_low = lb['name'].lower()
+                    # Priorité max : le nom du loopback contient le nom du device de sortie
+                    if target_low in lb_low:
+                        score = 1000
+                    else:
+                        score = sum(1 for kw in keywords if kw in lb_low)
+                    if score > best_score:
+                        best_score, best = score, lb
+                return best
+
+            loopback_dev = None
+            if auto_mode:
+                # Utiliser le loopback du périphérique de sortie Windows par défaut
+                default_out = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+                loopback_dev = _best_loopback(default_out['name'])
+                print(f"[audio] auto loopback → '{default_out['name']}' → '{loopback_dev and loopback_dev['name']}'", file=sys.stderr)
+            else:
+                loopback_dev = _best_loopback(spk_name)
+                print(f"[audio] spk loopback '{spk_name}' → '{loopback_dev and loopback_dev['name']}'", file=sys.stderr)
+
+            if loopback_dev is None and all_loopbacks:
+                loopback_dev = all_loopbacks[0]
+                print(f"[audio] fallback premier loopback: '{loopback_dev['name']}'", file=sys.stderr)
+            if loopback_dev is None:
+                raise RuntimeError("Aucun device loopback WASAPI trouvé")
+
+            loop_rate   = int(loopback_dev['defaultSampleRate'])
+            n_ch        = int(loopback_dev['maxInputChannels'])
+            # En mode mixte : blocs de 100 ms pour ne pas bloquer sur silence loopback
+            # En mode loopback seul : 1 s pour minimiser artefacts de resampling
+            loop_frames = loop_rate // 10 if mic_also else loop_rate
+            print(f"[audio] pyaudiowpatch loopback: '{loopback_dev['name']}' {loop_rate}Hz {n_ch}ch",
+                  file=sys.stderr)
+
+            loop_stream = pa.open(
+                format=pawp.paFloat32, channels=n_ch, rate=loop_rate,
+                input=True, input_device_index=loopback_dev['index'],
+                frames_per_buffer=loop_frames,
+            )
+            loop_stream.start_stream()
+
+            # ── Mode mixte : deux threads readers indépendants ─────────────────
+            # WASAPI loopback bloque quand rien ne joue → on ne peut pas l'utiliser
+            # comme horloge principale. On met mic ET loopback dans des queues
+            # et on mélange périodiquement (100 ms).
+            mic_q:      queue.Queue = queue.Queue()
+            lb_q:       queue.Queue = queue.Queue()
+            stop_readers = threading.Event()
+            mic_stream   = None
+            mic_rate     = loop_rate
+
+            # ── Thread loopback reader ─────────────────────────────────────────
+            def _lb_reader():
+                while not stop_readers.is_set():
+                    try:
+                        data = loop_stream.read(loop_frames, exception_on_overflow=False)
+                        arr  = np.frombuffer(data, dtype=np.float32).copy()
+                        mono = arr.reshape(-1, n_ch).mean(axis=1) if n_ch > 1 else arr
+                        lb_q.put(mono)
+                    except Exception:
+                        break
+            lb_reader = threading.Thread(target=_lb_reader, daemon=True)
+            lb_reader.start()
+
+            # ── Thread mic reader (mixte seulement) ────────────────────────────
+            if mic_also:
+                try:
+                    mic_info  = pa.get_default_input_device_info()
+                    mic_rate  = int(mic_info['defaultSampleRate'])
+                    mic_block = max(mic_rate // 10, 512)   # ~100 ms
+                    mic_stream = pa.open(
+                        format=pawp.paFloat32, channels=1, rate=mic_rate,
+                        input=True, input_device_index=int(mic_info['index']),
+                        frames_per_buffer=mic_block,
+                    )
+                    mic_stream.start_stream()
+                    print(f"[audio] mic stream (mixte): '{mic_info['name']}' {mic_rate}Hz", file=sys.stderr, flush=True)
+                    def _mic_reader():
+                        while not stop_readers.is_set():
+                            try:
+                                raw = mic_stream.read(mic_block, exception_on_overflow=False)
+                                arr = np.frombuffer(raw, dtype=np.float32).copy()
+                                mic_q.put(arr)
+                                if _recording:
+                                    _push_level(arr)
+                            except Exception:
+                                break
+                    threading.Thread(target=_mic_reader, daemon=True).start()
+                except Exception as e:
+                    print(f"[audio] mic setup error: {e}", file=sys.stderr, flush=True)
+                    mic_stream = None
+
+            # ── Boucle de mixage (100 ms) ──────────────────────────────────────
+            MIX_S   = 0.1          # période de mixage
+            mix_len = int(config.SAMPLE_RATE * MIX_S)
+            try:
+                while not _stop_loop.is_set():
+                    import time as _time
+                    _time.sleep(MIX_S)
+
+                    # Drainer loopback
+                    lb_parts = []
+                    while True:
+                        try:  lb_parts.append(lb_q.get_nowait())
+                        except queue.Empty: break
+                    lb_rs = _resample(np.concatenate(lb_parts), loop_rate, config.SAMPLE_RATE) \
+                            if lb_parts else np.zeros(mix_len, dtype=np.float32)
+
+                    if mic_also and mic_stream:
+                        # Drainer mic
+                        mic_parts = []
+                        while True:
+                            try:  mic_parts.append(mic_q.get_nowait())
+                            except queue.Empty: break
+                        mic_rs = _resample(np.concatenate(mic_parts), mic_rate, config.SAMPLE_RATE) \
+                                 if mic_parts else np.zeros(mix_len, dtype=np.float32)
+
+                        # Aligner les longueurs
+                        tgt = max(len(mic_rs), len(lb_rs), mix_len)
+                        if len(mic_rs) < tgt: mic_rs = np.pad(mic_rs, (0, tgt - len(mic_rs)))
+                        if len(lb_rs)  < tgt: lb_rs  = np.pad(lb_rs,  (0, tgt - len(lb_rs)))
+                        out = np.clip(mic_rs * 0.6 + lb_rs * 0.4, -1.0, 1.0)
+                    else:
+                        out = lb_rs
+                        if len(out): _push_level(out)
+
+                    if len(out) == 0:
+                        continue
+                    with _lock:
+                        if _recording:
+                            _append_audio(out)
+            finally:
+                stop_readers.set()
+                try:  loop_stream.stop_stream()
+                except Exception: pass
+                if mic_stream:
+                    try:  mic_stream.stop_stream(); mic_stream.close()
+                    except Exception: pass
+
+            loop_stream.close()
+        finally:
+            pa.terminate()
+
+    except Exception as e:
+        print(f"[audio] erreur pyaudiowpatch: {e} — fallback soundcard", file=sys.stderr)
+        _loopback_thread_fn_soundcard(mic_also)
+    finally:
+        _loopback_active = False
+
+
+class _NullCtx:
+    """Context manager no-op."""
+    def __enter__(self): return self
+    def __exit__(self, *_): pass
+
+
+def _loopback_thread_fn_soundcard(mic_also: bool):
+    """Fallback : loopback via soundcard (MediaFoundation)."""
+    spk_name = _speaker_var.get() if _speaker_var else None
+    _AUTO = "— Sortie par défaut Windows —"
+    if spk_name and spk_name != _AUTO:
         spk = next((s for s in sc.all_speakers() if s.name == spk_name), sc.default_speaker())
     else:
         spk = sc.default_speaker()
     loopback = sc.get_microphone(spk.id, include_loopback=True)
     mic_dev  = sc.default_microphone() if mic_also else None
-    loop_rate = config.SAMPLE_RATE
+    native_rate = getattr(config, "LOOPBACK_NATIVE_RATE", 0) or 48000
+    loop_frames = max(native_rate // 4, 2048)
 
-    with loopback.recorder(samplerate=loop_rate, channels=1, blocksize=CHUNK_FRAMES) as loop_rec:
+    with loopback.recorder(samplerate=native_rate, channels=1, blocksize=loop_frames) as loop_rec:
         if mic_also and mic_dev:
-            with mic_dev.recorder(samplerate=loop_rate, channels=1, blocksize=CHUNK_FRAMES) as mic_rec:
+            with mic_dev.recorder(samplerate=native_rate, channels=1, blocksize=loop_frames) as mic_rec:
                 while not _stop_loop.is_set():
-                    loop_chunk = loop_rec.record(numframes=CHUNK_FRAMES)[:, 0]
-                    mic_chunk  = mic_rec.record(numframes=CHUNK_FRAMES)[:, 0]
+                    loop_chunk = loop_rec.record(numframes=loop_frames)[:, 0]
+                    mic_chunk  = mic_rec.record(numframes=loop_frames)[:, 0]
                     if len(mic_chunk) != len(loop_chunk):
                         mic_chunk = np.resize(mic_chunk, len(loop_chunk))
-                    mixed = np.clip(mic_chunk * 0.6 + loop_chunk * 0.4, -1.0, 1.0)
-                    gained = np.clip(mixed * _rec_gain, -1.0, 1.0) if _rec_gain != 1.0 else mixed
+                    mixed     = np.clip(mic_chunk * 0.6 + loop_chunk * 0.4, -1.0, 1.0)
+                    resampled = _resample(mixed, native_rate, config.SAMPLE_RATE)
                     with _lock:
                         if _recording:
-                            _append_audio(mixed)  # gain appliqué dans _append_audio
-                    _push_level(gained)
+                            _append_audio(resampled)
+                    _push_level(resampled)
         else:
             while not _stop_loop.is_set():
-                chunk = loop_rec.record(numframes=CHUNK_FRAMES)[:, 0]
-                gained = np.clip(chunk * _rec_gain, -1.0, 1.0) if _rec_gain != 1.0 else chunk
+                chunk     = loop_rec.record(numframes=loop_frames)[:, 0]
+                resampled = _resample(chunk, native_rate, config.SAMPLE_RATE)
                 with _lock:
                     if _recording:
-                        _append_audio(chunk)  # gain appliqué dans _append_audio
-                _push_level(gained)
+                        _append_audio(resampled)
+                _push_level(resampled)
 
 
 # ─── Save audio to temp ───────────────────────────────────────────────────────
@@ -397,26 +752,141 @@ def _save_audio_to_tempfile() -> str | None:
 
 
 # ─── Archive audio locale ────────────────────────────────────────────────────
-def _archive_audio(wav_path: str, start_time: datetime.datetime) -> str | None:
+def _archive_audio(wav_path: str, start_time: datetime.datetime,
+                   meeting_name: str = "") -> str | None:
+    import re
     from notion_push import _find_ffmpeg
     try:
         os.makedirs(config.AUDIO_ARCHIVE_DIR, exist_ok=True)
         ts = start_time.strftime("%Y%m%d_%H%M%S")
+        if meeting_name:
+            safe = re.sub(r'[\\/:*?"<>|\s]+', '_', meeting_name).strip("_")[:60]
+            basename = f"meetnote_{ts}_{safe}"
+        else:
+            basename = f"meetnote_{ts}"
         ffmpeg = _find_ffmpeg()
         if ffmpeg:
-            dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"meetnote_{ts}.opus")
+            dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"{basename}.opus")
             cmd = [ffmpeg, "-y", "-i", wav_path,
                    "-c:a", "libopus", "-b:a", "24k", "-ac", "1", "-ar", "16000", dest]
             result = subprocess.run(cmd, capture_output=True, timeout=300,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
             if result.returncode == 0:
                 return dest
-        dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"meetnote_{ts}.wav")
+        dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"{basename}.wav")
         shutil.copy2(wav_path, dest)
         return dest
     except Exception as e:
         _log_error(f"Archive audio : {e}")
         return None
+
+
+# ─── Transcript Teams ────────────────────────────────────────────────────────
+
+def _combine_transcripts(whisper: str, teams: str) -> str:
+    """Concatène le transcript Whisper et le transcript Teams avec séparateur."""
+    parts = []
+    if whisper.strip():
+        parts.append("─── Transcription automatique (Whisper) ───\n\n" + whisper.strip())
+    if teams.strip():
+        parts.append("─── Transcript Teams ───\n\n" + teams.strip())
+    return "\n\n".join(parts)
+
+
+def _open_teams_transcript_dialog() -> str:
+    """Ouvre un dialog modal pour coller le transcript Teams.
+    Bloquant (wait_window). Retourne le texte collé ou '' si ignoré."""
+    global _modal_dialog_open
+    if not _root:
+        return ""
+    result = {"text": ""}
+    win = tk.Toplevel(_root)
+    win.title("Transcript Teams")
+    win.configure(bg="#111125")
+    win.attributes("-topmost", True)
+    win.resizable(True, True)
+
+    tk.Label(win,
+             text="Colle le transcript Teams ci-dessous (optionnel) :",
+             bg="#111125", fg="#e2e0fc",
+             font=("Segoe UI", 9, "bold")).pack(padx=16, pady=(14, 6), anchor="w")
+
+    frame = tk.Frame(win, bg="#111125")
+    frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+    txt = tk.Text(frame, bg="#1a1a30", fg="#e2e0fc",
+                  font=("Consolas", 8), insertbackground="#e2e0fc",
+                  relief="flat", wrap="word", height=12)
+    sb = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+    txt.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    txt.pack(side="left", fill="both", expand=True)
+    txt.focus_set()
+
+    btn_row = tk.Frame(win, bg="#111125")
+    btn_row.pack(fill="x", padx=16, pady=(0, 14))
+
+    def _close():
+        win.destroy()
+
+    def _confirm():
+        result["text"] = txt.get("1.0", "end-1c").strip()
+        win.destroy()
+
+    tk.Button(btn_row, text="Ignorer", command=_close,
+              bg="#2a2a4a", fg="#9ab4e8", font=("Segoe UI", 9),
+              relief="flat", padx=10, pady=4).pack(side="left")
+    tk.Button(btn_row, text="✓ Valider", command=_confirm,
+              bg="#5b5be8", fg="white", font=("Segoe UI", 9, "bold"),
+              relief="flat", padx=10, pady=4).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", _close)
+    win.update_idletasks()
+    # Centrer sur l'écran si la fenêtre principale est masquée (tray), sinon sur la fenêtre
+    root_visible = _root.state() not in ("withdrawn", "iconic")
+    if root_visible and _root.winfo_width() > 1:
+        x = _root.winfo_x() + (_root.winfo_width()  - 420) // 2
+        y = _root.winfo_y() + (_root.winfo_height() - 320) // 2
+    else:
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x = (sw - 420) // 2
+        y = (sh - 320) // 2
+    win.geometry(f"420x320+{x}+{y}")
+    try:
+        win.grab_set()
+    except Exception:
+        pass  # grab échoue si _root est withdrawn (tray) — sans conséquence
+    _modal_dialog_open = True
+    try:
+        win.wait_window()
+    except Exception:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+    finally:
+        _modal_dialog_open = False
+    return result["text"]
+
+
+def _append_teams_to_notion(job: "_Job"):
+    """Appende le transcript Teams à la page Notion existante du job."""
+    if not job.notion_url or not job.teams_transcript.strip():
+        return
+    try:
+        import notion_push as _np
+        # Extraire le page_id depuis l'URL Notion (format: https://notion.so/TITLE-PAGEID32)
+        raw = job.notion_url.rstrip("/").split("/")[-1]
+        page_id_raw = raw.split("-")[-1] if "-" in raw else raw
+        if len(page_id_raw) == 32:
+            page_id = (f"{page_id_raw[:8]}-{page_id_raw[8:12]}-"
+                       f"{page_id_raw[12:16]}-{page_id_raw[16:20]}-{page_id_raw[20:]}")
+        else:
+            page_id = page_id_raw
+        _np.append_blocks_to_page(page_id, job.teams_transcript, config.NOTION_TOKEN)
+    except Exception as e:
+        _log_error(f"[{job.id}] Append Teams→Notion : {e}")
 
 
 # ─── Sauvegarde transcript local ─────────────────────────────────────────────
@@ -672,6 +1142,17 @@ def _do_step_transcribe(job: _Job) -> bool:
         all_lines    = []
 
         for i, seg_path in enumerate(seg_paths):
+            if _worker_cancel_event.is_set():
+                for remaining in seg_paths[i:]:
+                    if remaining != path:
+                        try: os.remove(remaining)
+                        except OSError: pass
+                job.status_transcript = "queued"
+                job.error_msg = ""
+                hist_mod.update(job)
+                _set_status("Transcription annulée.")
+                _set_progress(0)
+                return False
             if n_segs > 1:
                 _set_status(f"Transcription segment {i+1}/{n_segs} [{lang_label}]…")
             seg_segments, seg_info = _whisper_model.transcribe(
@@ -738,6 +1219,9 @@ def _do_step_transcribe(job: _Job) -> bool:
 
         _set_progress(85)
         job.transcript = "\n".join(all_lines)
+        job.whisper_transcript = job.transcript   # sauvegarde le Whisper pur
+        if job.teams_transcript.strip():
+            job.transcript = _combine_transcripts(job.transcript, job.teams_transcript)
         job.status_transcript = "done"
         hist_mod.update(job)
         _set_progress(90)
@@ -767,15 +1251,17 @@ def _do_step_notion(job: _Job) -> bool:
 
     try:
         title = job.meeting_name or f"Réunion {job.start_time.strftime('%Y-%m-%d %H:%M')}"
+        notion_type = "Audio" if job.wav_path else job.meeting_type
         page = push_to_notion(
             job.transcript,
             source="PC",
             duration_min=job.duration_min,
             whisper_model=job.model_name,
-            meeting_type=job.meeting_type,
+            meeting_type=notion_type,
             start_time=job.start_time,
             audio_path=job.wav_path,
             title_override=title,
+            attachments=job.attachments if job.attachments else None,
         )
         job.notion_url = f"https://notion.so/{page['id'].replace('-', '')}"
         job.status_notion = "done"
@@ -797,12 +1283,33 @@ def _do_step_notion(job: _Job) -> bool:
 # ─── Traitement complet d'un job ─────────────────────────────────────────────
 def _process_job(job: _Job):
     """Séquence : archive audio → transcription → sauvegarde txt → push Notion."""
+
+    # ── Cas transcript-only : pas d'audio à traiter, aller directement à Notion ──
+    if job.status_transcript == "done" and job.transcript and not job.wav_path:
+        txt_path = _save_transcript_local(job)
+        if txt_path:
+            job.transcript_path = txt_path
+        hist_mod.update(job)
+        if job.output_mode == "fichier":
+            job.status_notion = "skipped"
+            hist_mod.update(job)
+            if txt_path:
+                subprocess.Popen(f'explorer /select,"{txt_path}"')
+            _set_progress(100)
+            _set_status("✓ Fichier sauvegardé dans Documents/MeetNote/transcripts/")
+        else:
+            _do_step_notion(job)
+        _refresh_ui()
+        if _root:
+            _root.after(3000, lambda: _set_progress(0))
+        return
+
     wav_tmp = job.wav_path  # chemin WAV temporaire avant archivage
 
     try:
         # 1. Archive audio locale
         _set_status("Archivage audio…")
-        archived = _archive_audio(wav_tmp, job.start_time)
+        archived = _archive_audio(wav_tmp, job.start_time, job.meeting_name)
         if archived:
             job.wav_path = archived  # pointer vers l'archive définitive
         hist_mod.update(job)
@@ -844,7 +1351,7 @@ def _process_job(job: _Job):
 
 # ─── Worker ──────────────────────────────────────────────────────────────────
 def _worker_loop():
-    global _worker_busy
+    global _worker_busy, _current_job
     while True:
         _work_event.wait()
         _work_event.clear()
@@ -854,12 +1361,15 @@ def _worker_loop():
                     break
                 job = _job_queue.popleft()
             _worker_busy = True
+            _current_job = job
+            _worker_cancel_event.clear()
             _prevent_sleep()
             try:
                 _process_job(job)
             finally:
                 _allow_sleep()
                 _worker_busy = False
+                _current_job = None
         # Queue vide — forcer le retour à Idle
         _refresh_ui()
 
@@ -925,6 +1435,87 @@ def _delete_all_done():
     _refresh_history_panel()
 
 
+def _delete_all():
+    """Supprime des jobs de l'historique via un choix : Complets / Tous / Annuler."""
+    import tkinter as tk_dlg
+    with _all_jobs_lock:
+        total = len(_all_jobs)
+        done_count = sum(
+            1 for j in _all_jobs
+            if j.status_transcript == "done" and j.status_notion in ("done", "skipped")
+        )
+    if total == 0:
+        import tkinter.messagebox as mb
+        mb.showinfo("Supprimer tout", "L'historique est déjà vide.")
+        return
+
+    choice = [None]
+
+    parent = _history_win if (_history_win and _history_win.winfo_exists()) else None
+    dlg = tk_dlg.Toplevel(parent)
+    dlg.title("Supprimer l'historique")
+    dlg.resizable(False, False)
+    dlg.grab_set()
+    if parent:
+        dlg.transient(parent)
+    _BG = "#16213e"
+    _FG = "#e2e0fc"
+    dlg.configure(bg=_BG)
+
+    tk_dlg.Label(dlg, text="Que souhaitez-vous supprimer ?",
+                 font=("Segoe UI", 10, "bold"), bg=_BG, fg=_FG).pack(padx=20, pady=(14, 4))
+    tk_dlg.Label(dlg,
+                 text=f"{done_count} complet(s)  ·  {total - done_count} en cours  ·  {total} total",
+                 font=("Segoe UI", 8), bg=_BG, fg="#888888").pack(padx=20, pady=(0, 12))
+
+    def _pick(val):
+        choice[0] = val
+        dlg.destroy()
+
+    btn_frame = tk_dlg.Frame(dlg, bg=_BG)
+    btn_frame.pack(padx=16, pady=(0, 14), fill="x")
+
+    tk_dlg.Button(btn_frame, text=f"✓ Complets ({done_count})",
+                  font=("Segoe UI", 9), bg="#1a3a10", fg="#88ee88",
+                  activebackground="#225522", activeforeground="white",
+                  relief="flat", bd=0, cursor="hand2",
+                  command=lambda: _pick("done")).pack(fill="x", pady=2)
+    tk_dlg.Button(btn_frame, text=f"✕ Tout ({total})",
+                  font=("Segoe UI", 9), bg="#3a1010", fg="#ffb4ab",
+                  activebackground="#551515", activeforeground="white",
+                  relief="flat", bd=0, cursor="hand2",
+                  command=lambda: _pick("all")).pack(fill="x", pady=2)
+    tk_dlg.Button(btn_frame, text="Annuler",
+                  font=("Segoe UI", 9), bg="#2a2a3a", fg="#aaaaaa",
+                  activebackground="#333344", activeforeground="white",
+                  relief="flat", bd=0, cursor="hand2",
+                  command=lambda: _pick(None)).pack(fill="x", pady=2)
+
+    dlg.wait_window()
+
+    if choice[0] == "done":
+        _delete_all_done()
+    elif choice[0] == "all":
+        import tkinter.messagebox as mb
+        unfinished_count = total - done_count
+        if unfinished_count:
+            msg = (f"{unfinished_count} enregistrement(s) sur {total} ne sont pas encore\n"
+                   f"transcrits ou envoyés vers Notion.\n\n"
+                   f"Supprimer quand même TOUT l'historique ?")
+            if not mb.askyesno("Supprimer tout", msg, default="no", icon="warning"):
+                return
+        else:
+            if not mb.askyesno("Supprimer tout",
+                               f"Supprimer les {total} enregistrement(s) de l'historique ?\n\n"
+                               "(Les fichiers audio/transcript locaux ne sont pas supprimés.)",
+                               default="no"):
+                return
+        with _all_jobs_lock:
+            _all_jobs.clear()
+        hist_mod.save([])
+        _refresh_history_panel()
+
+
 def _bulk_transcribe_all():
     """Lance la transcription de tous les jobs en attente/erreur (AC uniquement)."""
     import tkinter.messagebox as mb
@@ -972,10 +1563,12 @@ _SOURCE_MAP = {
 
 def _do_start():
     global _recording, _audio_chunks, _stream_mic, _loop_thread, _rec_start_time
-    global _wav_stream, _wav_stream_path, _flush_frame_count
+    global _wav_stream, _wav_stream_path, _flush_frame_count, _end_warned_key
 
     if _recording:
         return
+
+    _end_warned_key = None
 
     source = _SOURCE_MAP.get(_source_var.get(), "micro")
     _recording       = True
@@ -989,13 +1582,24 @@ def _do_start():
     if teams_roster.is_teams_running():
         _teams_watcher.start(_rec_start_time)
 
-    # Pré-remplir le nom de la réunion depuis Outlook
-    if _meeting_name_var and not _meeting_name_var.get().strip():
-        def _fetch_outlook():
+    # Pré-remplir le nom de la réunion et définir l'heure de fin depuis Outlook
+    def _fetch_outlook():
+        global _current_meeting_end
+        try:
             mtg = outlook_cal.get_current_or_next_meeting(window_minutes=30)
-            if mtg and _meeting_name_var and _root:
-                _root.after(0, lambda: _meeting_name_var.set(mtg["subject"]))
-        threading.Thread(target=_fetch_outlook, daemon=True).start()
+            if mtg and _root:
+                def _apply(m=mtg):
+                    global _current_meeting_end
+                    if _meeting_name_var and not _meeting_name_var.get().strip():
+                        _meeting_name_var.set(m["subject"])
+                        _meeting_name_var._last_outlook = m["subject"]
+                    # Définir l'heure de fin seulement si pas déjà définie (auto-start l'a peut-être fixée)
+                    if _current_meeting_end is None and _recording:
+                        _current_meeting_end = m["end"]
+                _root.after(0, _apply)
+        except Exception:
+            pass
+    threading.Thread(target=_fetch_outlook, daemon=True).start()
 
     os.makedirs(config.TEMP_DIR, exist_ok=True)
     ts = _rec_start_time.strftime("%Y%m%d_%H%M%S")
@@ -1039,7 +1643,7 @@ def _do_start():
 
 
 def _do_stop_transcribe():
-    global _recording, _stream_mic
+    global _recording, _stream_mic, _current_meeting_end
 
     if not _recording:
         return
@@ -1047,6 +1651,7 @@ def _do_stop_transcribe():
     if not _warn_if_on_battery():
         return
 
+    _current_meeting_end = None
     _recording = False
     _stop_loop.set()
 
@@ -1109,11 +1714,12 @@ def _do_stop_transcribe():
 
 def _do_stop_archive_only():
     """Arrête l'enregistrement, archive l'audio, mais ne transcrit pas maintenant."""
-    global _recording, _stream_mic
+    global _recording, _stream_mic, _current_meeting_end
 
     if not _recording:
         return
 
+    _current_meeting_end = None
     _recording = False
     _stop_loop.set()
 
@@ -1146,6 +1752,8 @@ def _do_stop_archive_only():
     if _ts_str not in meeting_name:
         meeting_name = f"{meeting_name} {_ts_str}".strip() if meeting_name else _ts_str
 
+    # Créer et sauvegarder le job AVANT d'ouvrir le dialog : si l'app crashe
+    # pendant la fenêtre Teams, le fichier audio reste référencé dans l'historique.
     job = _Job(
         id=f"{stop_time.strftime('%Y%m%d_%H%M%S')}",
         wav_path=path,
@@ -1163,16 +1771,19 @@ def _do_stop_archive_only():
 
     with _all_jobs_lock:
         _all_jobs.insert(0, job)
+    hist_mod.add(job)
 
-    # Archiver l'audio en arrière-plan, sans mettre en file de transcription
+    # Archiver l'audio immédiatement, avant d'ouvrir le dialog.
+    # Si le dialog crashe ou est fermé brutalement, l'audio est déjà en cours
+    # d'archivage dans un thread daemon séparé.
     def _archive_only():
         _prevent_sleep()
         try:
             _set_status("Archivage audio…")
-            archived = _archive_audio(path, start_time)
+            archived = _archive_audio(path, start_time, job.meeting_name)
             if archived:
                 job.wav_path = archived
-            hist_mod.add(job)
+            hist_mod.update(job)
             _set_status("✓ Audio archivé. Transcription disponible depuis l'historique.")
         except Exception as e:
             _log_error(f"Archive : {e}")
@@ -1183,6 +1794,12 @@ def _do_stop_archive_only():
     threading.Thread(target=_archive_only, daemon=True).start()
     _set_status("Arrêt sans transcription…")
     _refresh_ui()
+
+    # ── Proposer de coller le transcript Teams (après démarrage archivage) ────
+    teams_txt = _open_teams_transcript_dialog()
+    if teams_txt:
+        job.teams_transcript = teams_txt
+        hist_mod.update(job)
 
 
 def _do_cancel():
@@ -1216,6 +1833,13 @@ def _do_cancel():
 
     _set_status("Annulé.")
     _refresh_ui()
+
+
+# ─── Outlook auto-start helpers ──────────────────────────────────────────────
+def _is_auto_start_excluded(subject: str) -> bool:
+    """Retourne True si l'intitulé contient un motif de la liste d'exclusion."""
+    s = subject.lower()
+    return any(excl in s for excl in _auto_start_exclusions)
 
 
 # ─── UI helpers ──────────────────────────────────────────────────────────────
@@ -1253,9 +1877,9 @@ def _update_window_state():
         if _btn_start:
             _btn_start.config(text="⏹  STOP RECORDING",
                               bg="#1a6b1a", activebackground="#2e7d32")
-        _source_combo.config(state="disabled")
+        if _source_combo: _source_combo.config(state="disabled")
         if _speaker_combo: _speaker_combo.config(state="disabled")
-        _status_var.set("Recording in progress…")
+        if _status_var: _status_var.set("Recording in progress…")
         if _status_dot:
             _status_dot.config(bg="#88d982")
         if _root and hasattr(_root, "_toggle_whisper"):
@@ -1264,7 +1888,7 @@ def _update_window_state():
         if _btn_start:
             _btn_start.config(text="⏺  START RECORDING",
                               bg="#b81c1c", activebackground="#dc3232")
-        _source_combo.config(state="readonly")
+        if _source_combo: _source_combo.config(state="readonly")
         if _speaker_combo: _speaker_combo.config(state="readonly")
         if _root and hasattr(_root, "_toggle_whisper"):
             _root._toggle_whisper(True)
@@ -1323,8 +1947,10 @@ def _build_menu():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Ouvrir",    lambda i, it: _show_window(), default=True),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("▶  Démarrer l'enregistrement", lambda i, it: _do_start(),             enabled=not _recording),
-        pystray.MenuItem("⏹  Arrêter l'enregistrement",  lambda i, it: _do_stop_archive_only(), enabled=_recording),
+        pystray.MenuItem("▶  Démarrer l'enregistrement", lambda i, it: _root.after(0, _do_start)             if _root else None, enabled=not _recording),
+        pystray.MenuItem("⏹  Arrêter l'enregistrement",  lambda i, it: _root.after(0, _do_stop_archive_only) if _root else None, enabled=_recording),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("📅  Agenda Notion (15 j)", lambda i, it: _root.after(0, _trigger_agenda_digest_manual) if _root else None),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quitter", _quit_app),
     )
@@ -1336,6 +1962,146 @@ def _open_audio_dir_tray():
 def _open_transcript_dir_tray():
     os.makedirs(config.TRANSCRIPT_DIR, exist_ok=True)
     subprocess.Popen(f'explorer "{config.TRANSCRIPT_DIR}"')
+
+def _open_version_window():
+    if not _root:
+        return
+    win = tk.Toplevel(_root)
+    win.title(f"MeetNote v{VERSION} — Release notes")
+    win.configure(bg="#111125")
+    win.resizable(True, True)
+    win.geometry("580x500")
+    win.attributes("-topmost", True)
+
+    tk.Label(win, text=f"MeetNote  v{VERSION}",
+             font=("Segoe UI", 13, "bold"), bg="#111125", fg="#e2e0fc").pack(
+        anchor="w", padx=20, pady=(16, 4))
+    tk.Frame(win, bg="#333348", height=1).pack(fill="x", padx=16)
+
+    frame = tk.Frame(win, bg="#1e1e32")
+    frame.pack(fill="both", expand=True, padx=16, pady=(8, 0))
+
+    sb = tk.Scrollbar(frame)
+    sb.pack(side="right", fill="y")
+    txt = tk.Text(frame, font=("Consolas", 9), bg="#1e1e32", fg="#e2e0fc",
+                  insertbackground="#e2e0fc", relief="flat", bd=0,
+                  yscrollcommand=sb.set, wrap="word")
+    txt.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+    sb.config(command=txt.yview)
+    txt.insert("1.0", RELEASE_NOTES)
+    txt.config(state="disabled")
+
+    tk.Button(win, text="Fermer", command=win.destroy,
+              bg="#28283d", fg="#e2e0fc", font=("Segoe UI", 9),
+              relief="flat", bd=0, pady=4, padx=16, cursor="hand2").pack(pady=10)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agenda digest quotidien
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DIGEST_HOUR = 10  # déclenchement à 10h00
+
+def _run_agenda_digest_bg(force: bool = False):
+    """Lance le digest en thread de fond, crée un Job visible dans l'historique."""
+    def _task():
+        # Vérification silencieuse avant de créer le job
+        if not force and calendar_digest.digest_already_run_today():
+            return
+
+        now = datetime.datetime.now()
+        job = _Job(
+            id=now.strftime("%Y%m%d%H%M%S") + "_agenda",
+            wav_path="",
+            start_time=now,
+            duration_min=0,
+            model_name="",
+            language="",
+            meeting_type="Agenda",
+            output_mode="notion",
+            meeting_name=f"Agenda 15 j — {now.strftime('%d/%m/%Y')}",
+            status_audio="done",
+            status_transcript="done",
+            status_notion="running",
+        )
+        with _all_jobs_lock:
+            _all_jobs.insert(0, job)
+        hist_mod.add(job)
+        if _root:
+            _root.after(0, _refresh_ui)
+
+        try:
+            url = calendar_digest.run_digest(days=15, force=force)
+            if url:
+                job.status_notion = "done"
+                job.notion_url    = url
+                _log_error("📅 Agenda 15 j envoyé dans Notion.")
+            else:
+                job.status_notion = "error"
+                job.error_msg     = "Aucun RDV ou erreur Notion (voir logs)"
+                _log_error("📅 Agenda : aucun RDV ou erreur Notion.")
+        except Exception as e:
+            job.status_notion = "error"
+            job.error_msg     = str(e)
+            _log_error(f"📅 Agenda digest erreur : {e}")
+
+        hist_mod.update(job)
+        if _root:
+            _root.after(0, _refresh_ui)
+            if _history_win and _history_win.winfo_exists():
+                _root.after(0, _refresh_history_panel)
+
+    threading.Thread(target=_task, daemon=True).start()
+
+
+def _trigger_agenda_digest_manual():
+    """Déclenchement manuel depuis le menu tray (force=True)."""
+    _log_error("📅 Génération de l'agenda en cours…")
+    _run_agenda_digest_bg(force=True)
+
+
+def _schedule_daily_digest():
+    """
+    Planifie le digest quotidien à _DIGEST_HOUR:00.
+    Logique de rattrapage :
+      - Si pas encore fait aujourd'hui ET heure >= _DIGEST_HOUR → exécution immédiate.
+      - Si pas encore fait aujourd'hui ET heure < _DIGEST_HOUR  → planifie pour _DIGEST_HOUR:00.
+      - Si déjà fait aujourd'hui                                → planifie pour demain _DIGEST_HOUR:00.
+    Se replanifie automatiquement après chaque exécution.
+    """
+    if not _root:
+        return
+
+    now   = datetime.datetime.now()
+    today = now.date()
+
+    if not calendar_digest.digest_already_run_today():
+        if now.hour >= _DIGEST_HOUR:
+            # Rattrapage : on est passé 10h sans avoir tourné
+            _run_agenda_digest_bg(force=False)
+            # Replanifier pour demain
+            _root.after(60_000, _schedule_daily_digest)
+            return
+        else:
+            # Planifier pour 10h aujourd'hui
+            target    = now.replace(hour=_DIGEST_HOUR, minute=0, second=0, microsecond=0)
+            delay_ms  = max(1000, int((target - now).total_seconds() * 1000))
+            _root.after(delay_ms, _fire_digest_then_reschedule)
+            return
+
+    # Déjà fait aujourd'hui → prochain : demain à _DIGEST_HOUR:00
+    tomorrow  = datetime.datetime.combine(today + datetime.timedelta(days=1),
+                                          datetime.time(_DIGEST_HOUR, 0))
+    delay_ms  = max(1000, int((tomorrow - now).total_seconds() * 1000))
+    _root.after(delay_ms, _fire_digest_then_reschedule)
+
+
+def _fire_digest_then_reschedule():
+    """Déclenche le digest puis replanifie pour le lendemain."""
+    _run_agenda_digest_bg(force=False)
+    # Replanifier via _schedule_daily_digest (qui calculera le prochain délai)
+    if _root:
+        _root.after(60_000, _schedule_daily_digest)  # 1 min après pour laisser le temps à _save_last_run_date
+
 
 def _quit_app(icon=None, item=None):
     if _recording:
@@ -1532,24 +2298,34 @@ def _refresh_history_panel():
                                lambda: _stop_audio() or _refresh_history_panel())
                 else:
                     _ghost_btn(btn_row, "▶ Play", "#a8d8a8",
-                               lambda _j=j: _play_audio(_j.id, _j.wav_path))
+                               lambda _j=j: (_play_audio(_j.id, _j.wav_path), _refresh_history_panel()))
 
-            # Transcription : combo modèle + bouton (dispo si fichier audio présent)
+            # Transcription : Stop si en cours, sinon combo modèle + bouton
             if can_transcribe:
-                model_var_h = tk.StringVar(value=j.model_name)
-                model_combo_h = ttk.Combobox(btn_row, textvariable=model_var_h,
-                                             state="readonly", width=9,
-                                             values=["tiny", "base", "small", "medium", "large-v3"],
-                                             font=("Segoe UI", 7))
-                model_combo_h.pack(side="left", padx=(0, 4))
+                is_transcribing = (
+                    j.status_transcript == "running"
+                    and _current_job is not None
+                    and _current_job.id == j.id
+                )
+                if is_transcribing:
+                    def _do_stop_transcription():
+                        _worker_cancel_event.set()
+                    _ghost_btn(btn_row, "⏹ Stop transcript", "#ffb4ab", _do_stop_transcription)
+                else:
+                    model_var_h = tk.StringVar(value=j.model_name)
+                    model_combo_h = ttk.Combobox(btn_row, textvariable=model_var_h,
+                                                 state="readonly", width=9,
+                                                 values=["tiny", "base", "small", "medium", "large-v3"],
+                                                 font=("Segoe UI", 7))
+                    model_combo_h.pack(side="left", padx=(0, 4))
 
-                def _do_retranscribe(_j=j, _mv=model_var_h):
-                    _j.model_name = _mv.get()
-                    _requeue_transcribe(_j)
-                    _refresh_history_panel()
+                    def _do_retranscribe(_j=j, _mv=model_var_h):
+                        _j.model_name = _mv.get()
+                        _requeue_transcribe(_j)
+                        _refresh_history_panel()
 
-                lbl = "📝 Transcribe" if j.status_transcript in ("queued", "error") else "🔄 Re-transcribe"
-                _ghost_btn(btn_row, lbl, "#ffb3ac", _do_retranscribe)
+                    lbl = "📝 Transcribe" if j.status_transcript in ("queued", "error") else "🔄 Re-transcribe"
+                    _ghost_btn(btn_row, lbl, "#ffb3ac", _do_retranscribe)
 
             # Notion : toujours proposer si transcript disponible
             if can_push_notion:
@@ -1571,6 +2347,27 @@ def _refresh_history_panel():
             if j.notion_url:
                 _ghost_btn(btn_row, "🌐 Open Notion", "#e4b5ff",
                            lambda u=j.notion_url: os.startfile(u))
+
+            # Bouton Teams transcript (toujours disponible si transcription faite)
+            def _do_add_teams(_j=j):
+                txt = _open_teams_transcript_dialog()
+                if not txt:
+                    return
+                _j.teams_transcript = txt
+                base = _j.whisper_transcript or _j.transcript
+                _j.transcript = _combine_transcripts(base, txt)
+                if not _j.whisper_transcript:
+                    _j.whisper_transcript = base
+                _save_transcript_local(_j)
+                hist_mod.update(_j)
+                if _j.notion_url:
+                    threading.Thread(
+                        target=_append_teams_to_notion, args=(_j,), daemon=True
+                    ).start()
+                _refresh_history_panel()
+            teams_lbl = "📋 Teams ✓" if j.teams_transcript else "📋 Teams"
+            teams_fg  = "#88d982" if j.teams_transcript else "#ffcc66"
+            _ghost_btn(btn_row, teams_lbl, teams_fg, _do_add_teams)
         else:
             tk.Frame(card, bg=S_CARD, height=2).pack()
 
@@ -1636,8 +2433,20 @@ def _toggle_history_window():
     _history_win.title("MeetNote — Recording History")
     _history_win.configure(bg=S_BASE)
     _history_win.resizable(True, True)
+    _history_win.transient(_root)   # lien parent-enfant : pas d'entrée séparée dans la barre des tâches
     # Fermer = cacher (pas détruire), synchronisé avec la fenêtre principale
     _history_win.protocol("WM_DELETE_WINDOW", _close_history_window)
+
+    # Réduction de history → iconifier la principale (les deux se réduisent ensemble)
+    def _on_history_unmap(e):
+        if e.widget is not _history_win:
+            return
+        def _check():
+            if _history_win.winfo_exists() and _history_win.state() == "iconic":
+                _history_win.withdraw()
+                _root.iconify()
+        _history_win.after(50, _check)
+    _history_win.bind("<Unmap>", _on_history_unmap)
 
     _root.update_idletasks()
     rx = _root.winfo_x() + _root.winfo_width() + 8
@@ -1654,23 +2463,39 @@ def _toggle_history_window():
     hdr2 = tk.Frame(_history_win, bg=S_MAIN)
     hdr2.pack(fill="x")
     tk.Label(hdr2, text="Recording History", font=("Segoe UI", 12, "bold"),
-             bg=S_MAIN, fg=FG).pack(side="left", padx=14, pady=(0, 10))
-    tk.Button(hdr2, text="↺ Refresh", font=("Segoe UI", 8),
-              bg=S_MAIN, fg=FG3, activebackground=S_CARD,
-              activeforeground=FG, relief="flat", bd=0, cursor="hand2",
-              command=_refresh_history_panel).pack(side="right", padx=(0, 14), pady=(0, 10))
-    tk.Button(hdr2, text="⊕ Import audio", font=("Segoe UI", 8),
-              bg=RED, fg="white", activebackground="#ff4444",
-              activeforeground="white", relief="flat", bd=0, cursor="hand2",
-              command=_import_audio_file).pack(side="right", padx=(0, 4), pady=(0, 10))
-    tk.Button(hdr2, text="📝 Transcrire tout", font=("Segoe UI", 8),
-              bg="#1a3a5c", fg="#88ccff", activebackground="#22456e",
-              activeforeground="white", relief="flat", bd=0, cursor="hand2",
-              command=_bulk_transcribe_all).pack(side="right", padx=(0, 4), pady=(0, 10))
-    tk.Button(hdr2, text="🗑 Supprimer", font=("Segoe UI", 8),
+             bg=S_MAIN, fg=FG).pack(side="left", padx=14, pady=(0, 4))
+
+    # ── Ligne 1 de boutons : actions import
+    btn_row1 = tk.Frame(_history_win, bg=S_MAIN)
+    btn_row1.pack(fill="x", padx=10, pady=(0, 2))
+    tk.Button(btn_row1, text="🗑 Supprimer tout", font=("Segoe UI", 8),
               bg="#3a1010", fg="#ffb4ab", activebackground="#551515",
               activeforeground="white", relief="flat", bd=0, cursor="hand2",
-              command=_delete_all_done).pack(side="right", padx=(0, 4), pady=(0, 10))
+              command=_delete_all).pack(side="left", padx=(0, 4))
+    tk.Button(btn_row1, text="📝 Transcrire tout", font=("Segoe UI", 8),
+              bg="#1a3a5c", fg="#88ccff", activebackground="#22456e",
+              activeforeground="white", relief="flat", bd=0, cursor="hand2",
+              command=_bulk_transcribe_all).pack(side="left", padx=(0, 4))
+    tk.Button(btn_row1, text="📋 Import transcript", font=("Segoe UI", 8),
+              bg="#1a4a1a", fg="#88ee88", activebackground="#225522",
+              activeforeground="white", relief="flat", bd=0, cursor="hand2",
+              command=_import_transcript).pack(side="left", padx=(0, 4))
+
+    # ── Ligne 2 de boutons : import fichiers + mails + refresh
+    btn_row2 = tk.Frame(_history_win, bg=S_MAIN)
+    btn_row2.pack(fill="x", padx=10, pady=(0, 8))
+    tk.Button(btn_row2, text="⊕ Import audio", font=("Segoe UI", 8),
+              bg=RED, fg="white", activebackground="#ff4444",
+              activeforeground="white", relief="flat", bd=0, cursor="hand2",
+              command=_import_audio_file).pack(side="left", padx=(0, 4))
+    tk.Button(btn_row2, text="📧 Import mails", font=("Segoe UI", 8),
+              bg="#1a3a5c", fg="#88ccff", activebackground="#22456e",
+              activeforeground="white", relief="flat", bd=0, cursor="hand2",
+              command=_import_outlook_mails).pack(side="left", padx=(0, 4))
+    tk.Button(btn_row2, text="↺ Refresh", font=("Segoe UI", 8),
+              bg=S_MAIN, fg=FG3, activebackground=S_CARD,
+              activeforeground=FG, relief="flat", bd=0, cursor="hand2",
+              command=_refresh_history_panel).pack(side="left", padx=(0, 4))
 
     # ── Zone scrollable
     canvas = tk.Canvas(_history_win, bg=S_BASE, highlightthickness=0)
@@ -1736,6 +2561,16 @@ def _build_window():
 
     _root.bind("<Unmap>", _on_root_unmap)
     _root.bind("<Map>",   _on_root_map)
+
+    # Déplacement solidaire : history suit la principale
+    def _on_root_configure(e):
+        if e.widget is not _root:
+            return
+        if _history_win and _history_win.winfo_exists() and _history_win.state() != "withdrawn":
+            new_x = _root.winfo_x() + _root.winfo_width() + 8
+            new_y = _root.winfo_y()
+            _history_win.geometry(f"+{new_x}+{new_y}")
+    _root.bind("<Configure>", _on_root_configure)
 
     _output_var       = tk.StringVar(value="notion")
     _meeting_name_var = tk.StringVar(value="")
@@ -1828,8 +2663,9 @@ def _build_window():
     _nav_item("Transcripts", "📄", _open_transcript_dir)
     _nav_item("History",     "📋", _toggle_history_window)
 
-    # Quit en bas
+    # Version + Quit en bas
     tk.Frame(nav_frame, bg=S_MAIN).pack(fill="both", expand=True)
+    _nav_item(f"v{VERSION}", "ℹ", _open_version_window)
     tk.Frame(nav_frame, bg=S_HIGH, height=1).pack(fill="x")
     quit_row = tk.Frame(nav_frame, bg=S_MAIN, cursor="hand2")
     quit_row.pack(fill="x")
@@ -1946,8 +2782,9 @@ def _build_window():
     rs = tk.Frame(_speaker_frame, bg=S_CARD)
     rs.pack(fill="x", padx=10, pady=(6, 0))
     _lbl(rs, "Speaker Output (Optional)")
-    speakers     = [s.name for s in sc.all_speakers()]
-    _speaker_var = tk.StringVar(value=sc.default_speaker().name)
+    _AUTO_SPEAKER = "— Sortie par défaut Windows —"
+    speakers     = [_AUTO_SPEAKER] + [s.name for s in sc.all_speakers()]
+    _speaker_var = tk.StringVar(value=_AUTO_SPEAKER)
     _speaker_combo = _combo(rs, _speaker_var, speakers)
     _speaker_frame.pack_forget()
 
@@ -1967,7 +2804,16 @@ def _build_window():
     sec_mtg = _section("🗓  MEETING")
 
     rm = _row(sec_mtg)
-    _lbl(rm, "Meeting name (auto-filled from Outlook calendar)")
+    mtg_hdr = tk.Frame(rm, bg=S_MAIN)
+    mtg_hdr.pack(fill="x")
+    _lbl(mtg_hdr, "Meeting name (auto-filled from Outlook calendar)")
+    def _force_poll():
+        if _outlook_poll_fn:
+            _outlook_poll_fn()
+    tk.Button(mtg_hdr, text="🔄", font=("Segoe UI", 9),
+              bg=S_MAIN, fg=FG3, activebackground=S_HIGH, activeforeground=FG,
+              relief="flat", bd=0, cursor="hand2",
+              command=_force_poll).pack(side="right", pady=(2, 0))
     mtg_entry = tk.Entry(rm, textvariable=_meeting_name_var,
                          font=("Segoe UI", 9), bg=S_HIGH, fg=FG,
                          insertbackground=FG, relief="flat", bd=0,
@@ -2242,34 +3088,247 @@ def _build_window():
     _log_with_tags("MeetNote Engine initialized.")
     _log_with_tags("Audio backend ready (WASAPI).")
 
-    # ── Polling Outlook : pré-remplir le champ réunion toutes les 60s
+    # ── Polling Outlook : pré-remplir, détecter conflits, auto-démarrer ─────────
+    _auto_started_keys: set = set()  # évite de relancer pour la même réunion
+    _resolved_conflict_key: list = [None]  # frozenset des sujets du dernier conflit résolu
+
     def _poll_outlook():
-        if not _recording and _meeting_name_var:
-            def _fetch():
-                try:
-                    mtg = outlook_cal.get_current_or_next_meeting(window_minutes=30)
-                except Exception as e:
-                    _log_with_tags(f"[Outlook] Erreur: {e}")
-                    return
-                if not mtg:
-                    _log_with_tags("[Outlook] Aucune réunion dans les 30 prochaines minutes.")
-                    return
-                if _meeting_name_var and _root:
-                    subject = mtg["subject"]
+        if _recording:
+            if _root:
+                _root.after(60_000, _poll_outlook)
+            return
+
+        def _fetch():
+            try:
+                meetings = outlook_cal.get_all_current_meetings(window_minutes=30)
+            except Exception as e:
+                _log_with_tags(f"[Outlook] Erreur: {e}")
+                return
+            if not meetings:
+                _log_with_tags("[Outlook] Aucune réunion dans les 30 prochaines minutes.")
+                return
+
+            now = datetime.datetime.now()
+
+            # ── Auto-start mixte si réunion imminente (dans 2 min ou déjà en cours) ──
+            for mtg in meetings:
+                if _is_auto_start_excluded(mtg["subject"]):
+                    _log_with_tags(f"[Outlook] Ignoré (exclusion) : {mtg['subject']}")
+                    continue
+                key = mtg["subject"] + mtg["start"].isoformat()[:16]
+                delta = (mtg["start"] - now).total_seconds()
+                if -60 <= delta <= 120 and key not in _auto_started_keys:
+                    _auto_started_keys.add(key)
+                    _log_with_tags(f"[Outlook] Auto-start mixte : {mtg['subject']}")
+                    def _do_auto(m=mtg):
+                        global _current_meeting_end, _end_warned_key
+                        if _recording or _modal_dialog_open:
+                            return
+                        if _source_var:
+                            _source_var.set("🎤🔊  Mixte (micro + PC)")
+                        if _meeting_name_var:
+                            _meeting_name_var.set(m["subject"])
+                            _meeting_name_var._last_outlook = m["subject"]
+                        _current_meeting_end = m["end"]
+                        _end_warned_key = None
+                        _do_start()
+                    _root.after(0, _do_auto)
+                    return  # un seul auto-start à la fois
+
+            # ── Pré-remplir le nom / popup si conflits ───────────────────────────
+            if _meeting_name_var and _root:
+                if len(meetings) == 1:
+                    subject = meetings[0]["subject"]
                     _log_with_tags(f"[Outlook] Réunion détectée : {subject}")
-                    def _set():
-                        # Ne pas écraser une valeur saisie manuellement
+                    def _set_single(s=subject):
                         current = _meeting_name_var.get().strip()
                         if not current or current == _meeting_name_var._last_outlook:
-                            _meeting_name_var.set(subject)
-                            _meeting_name_var._last_outlook = subject
-                    _root.after(0, _set)
-            threading.Thread(target=_fetch, daemon=True).start()
+                            _meeting_name_var.set(s)
+                            _meeting_name_var._last_outlook = s
+                    _root.after(0, _set_single)
+                else:
+                    subjects = [m["subject"] for m in meetings]
+                    conflict_key = frozenset(subjects)
+                    if conflict_key != _resolved_conflict_key[0]:
+                        _log_with_tags(f"[Outlook] Conflit de réunions : {subjects}")
+                    def _show_conflict(ms=meetings, ck=conflict_key):
+                        global _conflict_win
+                        # Ne pas rouvrir si ce conflit a déjà été résolu
+                        if _resolved_conflict_key[0] == ck:
+                            return
+                        # Ne pas rouvrir si un popup est déjà visible
+                        if _conflict_win is not None:
+                            try:
+                                if _conflict_win.winfo_exists():
+                                    return
+                            except Exception:
+                                pass
+                        win = tk.Toplevel(_root)
+                        _conflict_win = win
+                        win.title("Conflit de réunions")
+                        win.configure(bg="#111125")
+                        win.attributes("-topmost", True)
+                        win.resizable(False, False)
+                        tk.Label(win, text="Plusieurs réunions simultanées.\nLaquelle enregistrer ?",
+                                 bg="#111125", fg="#e2e0fc",
+                                 font=("Segoe UI", 10, "bold")).pack(padx=20, pady=(15, 8))
+                        chosen = tk.StringVar(value=ms[0]["subject"])
+                        for m in ms:
+                            lbl = f"{m['subject']}  ({m['start'].strftime('%H:%M')}–{m['end'].strftime('%H:%M')})"
+                            tk.Radiobutton(win, text=lbl, variable=chosen, value=m["subject"],
+                                           bg="#111125", fg="#e2e0fc", selectcolor="#2a2a4a",
+                                           activebackground="#111125", activeforeground="#e2e0fc",
+                                           font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=2)
+                        def _close():
+                            global _conflict_win
+                            _conflict_win = None
+                            win.destroy()
+                        def _confirm(ck=conflict_key):
+                            s = chosen.get()
+                            _meeting_name_var.set(s)
+                            _meeting_name_var._last_outlook = s
+                            _resolved_conflict_key[0] = ck  # ne plus poser la question pour ce conflit
+                            _close()
+                        win.protocol("WM_DELETE_WINDOW", _close)
+                        tk.Button(win, text="Confirmer", command=_confirm,
+                                  bg="#5b5be8", fg="white", font=("Segoe UI", 9, "bold"),
+                                  relief="flat", padx=12, pady=4).pack(pady=(10, 15))
+                        win.update_idletasks()
+                        x = _root.winfo_x() + (_root.winfo_width() - win.winfo_reqwidth()) // 2
+                        y = _root.winfo_y() + (_root.winfo_height() - win.winfo_reqheight()) // 2
+                        win.geometry(f"+{x}+{y}")
+                    _root.after(0, _show_conflict)
+
+        threading.Thread(target=_fetch, daemon=True).start()
         if _root:
             _root.after(60_000, _poll_outlook)
 
     _meeting_name_var._last_outlook = ""
+    global _outlook_poll_fn
+    _outlook_poll_fn = _poll_outlook
     _root.after(1_000, _poll_outlook)  # premier appel 1s après démarrage
+
+    # ── Polling fin de réunion : popup d'alerte 5 min avant la fin ───────────
+    def _show_end_warn_popup(minutes_left: float, next_mtg: dict | None):
+        global _end_warn_win
+        if _end_warn_win is not None:
+            try:
+                if _end_warn_win.winfo_exists():
+                    return
+            except Exception:
+                pass
+
+        win = tk.Toplevel(_root)
+        _end_warn_win = win
+        win.title("Fin de réunion imminente")
+        win.configure(bg="#111125")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+
+        mins = max(0, int(minutes_left))
+        if mins == 0:
+            time_txt = "La réunion se termine maintenant."
+        else:
+            time_txt = f"La réunion se termine dans {mins} min."
+
+        tk.Label(win, text=time_txt,
+                 bg="#111125", fg="#e2e0fc",
+                 font=("Segoe UI", 10, "bold")).pack(padx=24, pady=(18, 4))
+
+        if next_mtg:
+            next_label = f"{next_mtg['subject']}  ({next_mtg['start'].strftime('%H:%M')})"
+            tk.Label(win, text=f"Réunion suivante : {next_label}",
+                     bg="#111125", fg="#aaaacc",
+                     font=("Segoe UI", 9)).pack(padx=24, pady=(0, 12))
+        else:
+            tk.Label(win, text="Arrêter l'enregistrement ?",
+                     bg="#111125", fg="#aaaacc",
+                     font=("Segoe UI", 9)).pack(padx=24, pady=(0, 12))
+
+        def _close():
+            global _end_warn_win
+            _end_warn_win = None
+            win.destroy()
+
+        def _stop():
+            _close()
+            _do_stop_transcribe()
+
+        def _stop_and_restart(m=next_mtg):
+            global _current_meeting_end, _end_warned_key
+            _close()
+            _do_stop_transcribe()
+            if m and _root:
+                def _restart():
+                    global _current_meeting_end, _end_warned_key
+                    if _source_var:
+                        _source_var.set("🎤🔊  Mixte (micro + PC)")
+                    if _meeting_name_var:
+                        _meeting_name_var.set(m["subject"])
+                        _meeting_name_var._last_outlook = m["subject"]
+                    _current_meeting_end = m["end"]
+                    _end_warned_key = None
+                    _do_start()
+                _root.after(500, _restart)
+
+        btn_frame = tk.Frame(win, bg="#111125")
+        btn_frame.pack(pady=(0, 16), padx=16)
+
+        tk.Button(btn_frame, text="Arrêter", command=_stop,
+                  bg="#dc3232", fg="white", font=("Segoe UI", 9, "bold"),
+                  relief="flat", padx=12, pady=5).pack(side="left", padx=4)
+
+        if next_mtg:
+            tk.Button(btn_frame,
+                      text=f"Arrêter + Relancer → {next_mtg['subject'][:28]}",
+                      command=_stop_and_restart,
+                      bg="#5b5be8", fg="white", font=("Segoe UI", 9, "bold"),
+                      relief="flat", padx=12, pady=5).pack(side="left", padx=4)
+
+        tk.Button(btn_frame, text="Ignorer", command=_close,
+                  bg="#333355", fg="#aaaacc", font=("Segoe UI", 9),
+                  relief="flat", padx=12, pady=5).pack(side="left", padx=4)
+
+        win.protocol("WM_DELETE_WINDOW", _close)
+        win.update_idletasks()
+        x = _root.winfo_x() + (_root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = _root.winfo_y() + (_root.winfo_height() - win.winfo_reqheight()) // 2
+        win.geometry(f"+{x}+{y}")
+
+    def _poll_meeting_end():
+        global _end_warned_key
+
+        if not _root:
+            return
+
+        if _recording and _current_meeting_end is not None:
+            now = datetime.datetime.now()
+            minutes_left = (_current_meeting_end - now).total_seconds() / 60
+            warn_key = _current_meeting_end.isoformat()[:16]
+
+            if -2 <= minutes_left <= 5 and warn_key != _end_warned_key:
+                _end_warned_key = warn_key
+
+                def _fetch_next():
+                    try:
+                        # Cherche une réunion démarrant dans les 15 min après la fin actuelle
+                        all_mtgs = outlook_cal.get_all_current_meetings(window_minutes=20)
+                        next_mtg = None
+                        for m in all_mtgs:
+                            gap = (m["start"] - _current_meeting_end).total_seconds() / 60
+                            if 0 <= gap <= 15 and m["subject"] != (_meeting_name_var.get() if _meeting_name_var else ""):
+                                next_mtg = m
+                                break
+                    except Exception:
+                        next_mtg = None
+                    if _root:
+                        _root.after(0, lambda: _show_end_warn_popup(minutes_left, next_mtg))
+
+                threading.Thread(target=_fetch_next, daemon=True).start()
+
+        _root.after(30_000, _poll_meeting_end)
+
+    _root.after(30_000, _poll_meeting_end)  # démarre 30s après l'ouverture
 
     # ── Centrer la fenêtre
     _root.update_idletasks()
@@ -2328,6 +3387,445 @@ def _import_audio_file():
     if _history_win and _history_win.winfo_exists():
         _refresh_history_panel()
     _log_error(f"Import : {os.path.basename(path)} → transcription en cours…")
+
+
+def _import_outlook_mails():
+    """
+    Dialogue listant les mails Outlook catégorie "meetnote".
+    L'utilisateur sélectionne les mails à pousser vers Notion.
+    Après succès, chaque mail est déplacé dans le dossier "meetnote OK".
+    """
+    import tkinter.messagebox as mb
+    import outlook_mail
+
+    if not outlook_mail.is_available():
+        mb.showwarning("Non disponible",
+                       "win32com n'est pas installé — impossible de lire Outlook.",
+                       parent=_root)
+        return
+
+    # ── Récupération des mails (dans un thread pour ne pas bloquer l'UI)
+    dlg = tk.Toplevel(_root)
+    dlg.title("Importer des mails Outlook")
+    dlg.configure(bg="#1a1a2e")
+    dlg.resizable(True, True)
+    dlg.grab_set()
+
+    _root.update_idletasks()
+    x = _root.winfo_x() + (_root.winfo_width()  - 580) // 2
+    y = _root.winfo_y() + (_root.winfo_height() - 520) // 2
+    dlg.geometry(f"580x520+{x}+{y}")
+
+    DLG_BG   = "#1a1a2e"
+    DLG_BG2  = "#16213e"
+    DLG_BG3  = "#0f3460"
+    DLG_FG   = "#e0e0e0"
+    DLG_FG2  = "#888888"
+    DLG_ACC  = "#5599ff"
+
+    tk.Label(dlg, text="📧  Mails catégorie « meetnote »",
+             font=("Segoe UI", 11, "bold"), bg=DLG_BG, fg=DLG_FG).pack(pady=(14, 2))
+    tk.Label(dlg, text="Cochez les mails à envoyer dans Notion → ils seront déplacés vers « meetnote OK »",
+             font=("Segoe UI", 8), bg=DLG_BG, fg=DLG_FG2, wraplength=520).pack(pady=(0, 8))
+
+    # ── Zone scrollable pour la liste
+    list_frame_outer = tk.Frame(dlg, bg=DLG_BG2, bd=0)
+    list_frame_outer.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+    canvas = tk.Canvas(list_frame_outer, bg=DLG_BG2, highlightthickness=0)
+    scrollbar = tk.Scrollbar(list_frame_outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+
+    list_frame = tk.Frame(canvas, bg=DLG_BG2)
+    cw = canvas.create_window((0, 0), window=list_frame, anchor="nw")
+
+    def _on_frame_conf(e):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+    list_frame.bind("<Configure>", _on_frame_conf)
+
+    def _on_canvas_conf(e):
+        canvas.itemconfig(cw, width=e.width)
+    canvas.bind("<Configure>", _on_canvas_conf)
+
+    canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+    status_lbl = tk.Label(dlg, text="Chargement des mails…",
+                          font=("Segoe UI", 8, "italic"), bg=DLG_BG, fg=DLG_FG2)
+    status_lbl.pack(pady=(0, 4))
+
+    # ── Boutons bas
+    btn_frame = tk.Frame(dlg, bg=DLG_BG)
+    btn_frame.pack(fill="x", padx=14, pady=(0, 14))
+
+    check_vars: list[tuple[tk.BooleanVar, dict]] = []   # (var, mail_dict)
+
+    def _do_import():
+        selected = [(v, m) for v, m in check_vars if v.get()]
+        if not selected:
+            mb.showwarning("Aucun mail sélectionné",
+                           "Cochez au moins un mail.", parent=dlg)
+            return
+
+        output = _output_var.get() if _output_var else "notion"
+        imported = 0
+        for _, mail in selected:
+            now   = mail["date"]
+            mname = mail["subject"] or f"Mail {now.strftime('%Y-%m-%d %H:%M')}"
+            body  = mail["body"]
+            if not body.strip():
+                body = "(corps vide)"
+
+            job = _Job(
+                id=now.strftime("%Y%m%d_%H%M%S") + f"_mail{imported}",
+                wav_path="",
+                start_time=now,
+                duration_min=0,
+                model_name="",
+                language="",
+                meeting_type="Email",
+                output_mode=output,
+                meeting_name=mname,
+                teams_participants=[mail["sender"]] if mail["sender"] else [],
+                status_audio="done",
+                status_transcript="done",
+                status_notion="pending" if output == "notion" else "skipped",
+                transcript=f"De : {mail['sender']}\nObjet : {mail['subject']}\n"
+                           f"Date : {now.strftime('%d/%m/%Y %H:%M')}\n\n{body}",
+                attachments=mail.get("attachments", []),
+            )
+
+            with _all_jobs_lock:
+                _all_jobs.insert(0, job)
+            hist_mod.add(job)
+
+            if output == "notion":
+                with _queue_lock:
+                    _job_queue.appendleft(job)
+
+            # Changement de catégorie → "meetnote OK" en arrière-plan (non bloquant)
+            entry_id = mail["entry_id"]
+            threading.Thread(
+                target=outlook_mail.mark_as_meetnote_ok,
+                args=(entry_id,), daemon=True
+            ).start()
+
+            imported += 1
+
+        if imported:
+            _work_event.set()
+            _refresh_ui()
+            if _history_win and _history_win.winfo_exists():
+                _refresh_history_panel()
+            _log_error(f"{imported} mail(s) importé(s) → Notion en cours…")
+
+        dlg.destroy()
+
+    tk.Button(btn_frame, text="✓ Importer et envoyer vers Notion",
+              font=("Segoe UI", 9, "bold"), bg="#2e7d32", fg="white",
+              relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
+              command=_do_import).pack(side="left", fill="x", expand=True)
+    tk.Button(btn_frame, text="Annuler",
+              font=("Segoe UI", 9), bg="#333355", fg="#aaaacc",
+              relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
+              command=dlg.destroy).pack(side="left", padx=(8, 0))
+
+    # ── Chargement des mails en arrière-plan pour ne pas geler l'UI
+    def _load_mails():
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        mails = outlook_mail.get_meetnote_emails()
+
+        def _populate():
+            status_lbl.configure(text=f"{len(mails)} mail(s) trouvé(s) avec la catégorie « meetnote »")
+
+            if not mails:
+                tk.Label(list_frame, text="Aucun mail trouvé avec la catégorie « meetnote ».",
+                         font=("Segoe UI", 9, "italic"), bg=DLG_BG2, fg=DLG_FG2
+                         ).pack(padx=12, pady=20)
+                return
+
+            for mail in mails:
+                var = tk.BooleanVar(value=True)
+                check_vars.append((var, mail))
+
+                row = tk.Frame(list_frame, bg=DLG_BG3, bd=0)
+                row.pack(fill="x", padx=6, pady=3)
+
+                # ── Checkbox custom (tk.Checkbutton natif mal visible sur fond sombre)
+                chk_frame = tk.Frame(row, bg=DLG_BG3, cursor="hand2")
+                chk_frame.pack(side="left", padx=(8, 4), pady=6)
+                chk_box = tk.Label(chk_frame, text="✓", font=("Segoe UI", 10, "bold"),
+                                   bg="#2e7d32", fg="white", width=2,
+                                   relief="flat", cursor="hand2")
+                chk_box.pack()
+
+                def _toggle(v=var, lbl=chk_box):
+                    v.set(not v.get())
+                    lbl.configure(bg="#2e7d32" if v.get() else "#333355",
+                                  fg="white" if v.get() else "#666688",
+                                  text="✓" if v.get() else " ")
+
+                chk_box.bind("<Button-1>", lambda e, fn=_toggle: fn())
+
+                info = tk.Frame(row, bg=DLG_BG3, cursor="hand2")
+                info.pack(side="left", fill="x", expand=True, padx=(4, 8), pady=6)
+                info.bind("<Button-1>", lambda e, fn=_toggle: fn())
+
+                subject = mail["subject"] or "(sans objet)"
+                subj_lbl = tk.Label(info, text=subject, font=("Segoe UI", 9, "bold"),
+                                    bg=DLG_BG3, fg=DLG_FG, anchor="w",
+                                    wraplength=430, cursor="hand2")
+                subj_lbl.pack(fill="x")
+                subj_lbl.bind("<Button-1>", lambda e, fn=_toggle: fn())
+
+                meta = f"{mail['sender']}  ·  {mail['date'].strftime('%d/%m/%Y %H:%M')}"
+                meta_lbl = tk.Label(info, text=meta, font=("Segoe UI", 7),
+                                    bg=DLG_BG3, fg=DLG_FG2, anchor="w", cursor="hand2")
+                meta_lbl.pack(fill="x")
+                meta_lbl.bind("<Button-1>", lambda e, fn=_toggle: fn())
+
+                # Pièces jointes
+                atts = mail.get("attachments", [])
+                if atts:
+                    att_names = "  📎 " + "  ·  ".join(
+                        os.path.basename(p) for p in atts
+                    )
+                    tk.Label(info, text=att_names, font=("Segoe UI", 7),
+                             bg=DLG_BG3, fg="#ffcc66", anchor="w",
+                             wraplength=430).pack(fill="x")
+
+                preview = mail["body"][:120].replace("\n", " ").strip()
+                if len(mail["body"]) > 120:
+                    preview += "…"
+                if preview:
+                    tk.Label(info, text=preview, font=("Segoe UI", 7, "italic"),
+                             bg=DLG_BG3, fg=DLG_FG2, anchor="w",
+                             wraplength=430).pack(fill="x")
+
+        dlg.after(0, _populate)
+
+    threading.Thread(target=_load_mails, daemon=True).start()
+
+
+def _import_transcript():
+    """Dialogue pour importer un transcript : fichier texte ou copier-coller."""
+    import tkinter.messagebox as mb
+    from tkinter import filedialog
+
+    dlg = tk.Toplevel(_root)
+    dlg.title("Importer un transcript")
+    dlg.configure(bg="#1a1a2e")
+    dlg.resizable(False, False)
+    dlg.grab_set()
+
+    # ── Centrage sur la fenêtre principale
+    _root.update_idletasks()
+    x = _root.winfo_x() + (_root.winfo_width()  - 540) // 2
+    y = _root.winfo_y() + (_root.winfo_height() - 420) // 2
+    dlg.geometry(f"540x420+{x}+{y}")
+
+    DLG_BG   = "#1a1a2e"
+    DLG_BG2  = "#16213e"
+    DLG_BG3  = "#0f3460"
+    DLG_FG   = "#e0e0e0"
+    DLG_FG2  = "#888888"
+    DLG_GRN  = "#2e7d32"
+    DLG_LGRN = "#88ee88"
+
+    tk.Label(dlg, text="Importer un transcript", font=("Segoe UI", 11, "bold"),
+             bg=DLG_BG, fg=DLG_FG).pack(pady=(14, 2))
+    tk.Label(dlg, text="Choisissez la source du transcript",
+             font=("Segoe UI", 8), bg=DLG_BG, fg=DLG_FG2).pack(pady=(0, 10))
+
+    # ── Onglets
+    tab_frame = tk.Frame(dlg, bg=DLG_BG)
+    tab_frame.pack(fill="x", padx=14)
+
+    tab_var = tk.StringVar(value="fichier")
+
+    panel_fichier = tk.Frame(dlg, bg=DLG_BG2)
+    panel_coller  = tk.Frame(dlg, bg=DLG_BG2)
+
+    def _show_tab(name):
+        tab_var.set(name)
+        if name == "fichier":
+            panel_coller.pack_forget()
+            panel_fichier.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+            btn_tab_f.configure(bg="#2e5e8e", fg="white")
+            btn_tab_c.configure(bg=DLG_BG3, fg=DLG_FG2)
+        else:
+            panel_fichier.pack_forget()
+            panel_coller.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+            btn_tab_c.configure(bg="#2e5e8e", fg="white")
+            btn_tab_f.configure(bg=DLG_BG3, fg=DLG_FG2)
+
+    btn_tab_f = tk.Button(tab_frame, text="📄 Fichier", font=("Segoe UI", 9),
+                          bg="#2e5e8e", fg="white", relief="flat", bd=0,
+                          padx=12, pady=5, cursor="hand2",
+                          command=lambda: _show_tab("fichier"))
+    btn_tab_f.pack(side="left", padx=(0, 4))
+    btn_tab_c = tk.Button(tab_frame, text="📋 Copier-coller", font=("Segoe UI", 9),
+                          bg=DLG_BG3, fg=DLG_FG2, relief="flat", bd=0,
+                          padx=12, pady=5, cursor="hand2",
+                          command=lambda: _show_tab("coller"))
+    btn_tab_c.pack(side="left")
+
+    # ── Panneau Fichier
+    file_path_var = tk.StringVar()
+    file_lbl = tk.Label(panel_fichier, text="Aucun fichier sélectionné",
+                        font=("Segoe UI", 8), bg=DLG_BG2, fg=DLG_FG2,
+                        wraplength=460, anchor="w")
+    file_lbl.pack(fill="x", padx=10, pady=(10, 4))
+
+    def _choose_file():
+        p = filedialog.askopenfilename(
+            parent=dlg,
+            title="Choisir un fichier transcript",
+            filetypes=[
+                ("Fichiers texte", "*.txt *.md *.srt *.vtt"),
+                ("Tous les fichiers", "*.*"),
+            ],
+        )
+        if p:
+            file_path_var.set(p)
+            file_lbl.configure(text=f"✓ {os.path.basename(p)}", fg=DLG_LGRN)
+
+    tk.Button(panel_fichier, text="Choisir un fichier…", font=("Segoe UI", 9),
+              bg=DLG_BG3, fg=DLG_FG, relief="flat", bd=0, padx=10, pady=6,
+              cursor="hand2", command=_choose_file).pack(fill="x", padx=10, pady=(0, 10))
+
+    # ── Panneau Copier-coller
+    tk.Label(panel_coller, text="Collez votre transcript :",
+             font=("Segoe UI", 8), bg=DLG_BG2, fg=DLG_FG2,
+             anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+    paste_text = tk.Text(panel_coller, height=9, wrap="word",
+                         bg=DLG_BG3, fg=DLG_FG, insertbackground=DLG_FG,
+                         font=("Segoe UI", 9), relief="flat",
+                         padx=6, pady=4)
+    paste_text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+    _show_tab("fichier")
+
+    # ── Infos réunion
+    info_frame = tk.Frame(dlg, bg=DLG_BG)
+    info_frame.pack(fill="x", padx=14, pady=(0, 6))
+    tk.Label(info_frame, text="Nom de la réunion (optionnel) :",
+             font=("Segoe UI", 8), bg=DLG_BG, fg=DLG_FG2).pack(anchor="w")
+    name_var = tk.StringVar()
+    tk.Entry(info_frame, textvariable=name_var, bg=DLG_BG3, fg=DLG_FG,
+             insertbackground=DLG_FG, relief="flat", font=("Segoe UI", 9),
+             ).pack(fill="x", pady=(2, 0))
+
+    # ── Boutons bas
+    btn_frame = tk.Frame(dlg, bg=DLG_BG)
+    btn_frame.pack(fill="x", padx=14, pady=(0, 14))
+
+    def _do_import():
+        mode = tab_var.get()
+        if mode == "fichier":
+            p = file_path_var.get()
+            if not p or not os.path.isfile(p):
+                mb.showwarning("Fichier manquant", "Veuillez d'abord sélectionner un fichier.", parent=dlg)
+                return
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read().strip()
+            suggested_name = os.path.splitext(os.path.basename(p))[0]
+        else:
+            text = paste_text.get("1.0", "end").strip()
+            suggested_name = ""
+
+        if not text:
+            mb.showwarning("Transcript vide", "Le transcript est vide.", parent=dlg)
+            return
+
+        now   = datetime.datetime.now()
+        mname = name_var.get().strip() or suggested_name or f"Réunion {now.strftime('%Y-%m-%d %H:%M')}"
+        mtype = _type_var.get() if _type_var else ""
+        output = _output_var.get() if _output_var else "notion"
+
+        job = _Job(
+            id=now.strftime("%Y%m%d_%H%M%S") + "_txt",
+            wav_path="",
+            start_time=now,
+            duration_min=0,
+            model_name="",
+            language="",
+            meeting_type=mtype if mtype not in ("—",) else "",
+            output_mode=output,
+            meeting_name=mname,
+            status_audio="done",
+            status_transcript="done",
+            status_notion="pending" if output == "notion" else "skipped",
+            transcript=text,
+        )
+
+        with _all_jobs_lock:
+            _all_jobs.insert(0, job)
+        hist_mod.add(job)
+
+        if output == "notion":
+            with _queue_lock:
+                _job_queue.appendleft(job)
+            _work_event.set()
+
+        _refresh_ui()
+        if _history_win and _history_win.winfo_exists():
+            _refresh_history_panel()
+        wc = len(text.split())
+        _log_error(f"Transcript importé : {mname} ({wc} mots) → Notion en cours…")
+        dlg.destroy()
+
+    tk.Button(btn_frame, text="Importer et envoyer vers Notion",
+              font=("Segoe UI", 9, "bold"), bg=DLG_GRN, fg="white",
+              relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
+              command=_do_import).pack(side="left", fill="x", expand=True)
+    tk.Button(btn_frame, text="Annuler",
+              font=("Segoe UI", 9), bg="#333355", fg="#aaaacc",
+              relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
+              command=dlg.destroy).pack(side="left", padx=(8, 0))
+
+
+_STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_REG_NAME = "MeetNote"
+
+def _get_startup_cmd() -> str:
+    """Retourne la commande de démarrage Windows attendue pour MeetNote."""
+    import sys
+    exe = sys.executable
+    script = os.path.abspath(__file__)
+    # pythonw pour éviter la console ; --minimized pour démarrer en tray seul
+    pythonw = exe.replace("python.exe", "pythonw.exe")
+    if not os.path.isfile(pythonw):
+        pythonw = exe
+    return f'"{pythonw}" "{script}" --minimized'
+
+def _startup_is_enabled() -> bool:
+    """Retourne True si la clé de démarrage automatique est configurée."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY) as k:
+            val, _ = winreg.QueryValueEx(k, _STARTUP_REG_NAME)
+            return val == _get_startup_cmd()
+    except Exception:
+        return False
+
+def _set_startup_enabled(enabled: bool):
+    """Active ou désactive le démarrage automatique de MeetNote avec Windows."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
+                        0, winreg.KEY_SET_VALUE) as k:
+        if enabled:
+            winreg.SetValueEx(k, _STARTUP_REG_NAME, 0, winreg.REG_SZ, _get_startup_cmd())
+        else:
+            try:
+                winreg.DeleteValue(k, _STARTUP_REG_NAME)
+            except FileNotFoundError:
+                pass
 
 
 def _open_settings():
@@ -2535,20 +4033,24 @@ def _open_settings():
         def _run():
             try:
                 import ews_cal
-                result = ews_cal.get_current_or_next_meeting(
+                results = ews_cal.get_all_current_meetings(
                     email=ews_email_var.get().strip(),
                     username=ews_user_var.get().strip(),
                     password=ews_pass_var.get(),
                     ews_url=ews_url_var.get().strip(),
                     window_minutes=1440,
                 )
-                if result is not None:
-                    msg = f"✓ Connexion OK — prochain RDV : {result['subject']}"
+                if results is None:
+                    msg = "✗ Erreur lecture calendrier (voir logs)"
+                    color = ERR
+                elif results:
+                    msg = f"✓ Connexion OK — {len(results)} RDV dans les 24h : {results[0]['subject']}"
+                    color = "#00cc66"
                 else:
                     msg = "✓ Connexion OK — aucun RDV dans les 24h"
-                color = "#00cc66"
+                    color = "#00cc66"
             except Exception as e:
-                msg = f"Erreur : {e}"
+                msg = f"✗ Erreur : {e}"
                 color = ERR
             win.after(0, lambda: ews_status_lbl.config(text=msg, fg=color))
 
@@ -2560,20 +4062,50 @@ def _open_settings():
               relief="flat", bd=0, pady=5, cursor="hand2",
               command=_test_ews).pack(anchor="w", pady=(4, 0))
 
+    # ── Exclusions auto-start
+    tk.Frame(tab_o, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))
+    tk.Label(tab_o, text="Exclusions auto-start",
+             font=("Segoe UI", 10, "bold"), bg=S_CARD, fg=FG).pack(anchor="w", pady=(10, 2))
+    tk.Label(tab_o,
+             text="Ne pas démarrer automatiquement si l'intitulé contient\n"
+                  "un de ces motifs (un par ligne, insensible à la casse) :",
+             font=("Segoe UI", 8), bg=S_CARD, fg=FG3, justify="left").pack(anchor="w")
+
+    excl_frame = tk.Frame(tab_o, bg=S_HIGH)
+    excl_frame.pack(fill="x", pady=(4, 0))
+    excl_text = tk.Text(excl_frame, height=4,
+                        font=("Segoe UI", 9), bg=S_HIGH, fg=FG,
+                        insertbackground=FG, relief="flat", bd=0,
+                        highlightthickness=1, highlightbackground=S_TOP,
+                        highlightcolor=RED, wrap="none")
+    excl_sb = tk.Scrollbar(excl_frame, orient="vertical", command=excl_text.yview)
+    excl_text.configure(yscrollcommand=excl_sb.set)
+    excl_sb.pack(side="right", fill="y")
+    excl_text.pack(side="left", fill="both", expand=True, padx=6, pady=4)
+    _excl_init = user_config.get("auto_start_exclusions", "")
+    if _excl_init:
+        excl_text.insert("1.0", _excl_init)
+
     def _save_ews():
+        global _auto_start_exclusions
         new_email = ews_email_var.get().strip()
         new_user  = ews_user_var.get().strip()
         new_pw    = ews_pass_var.get()
         new_url   = ews_url_var.get().strip()
+        excl_raw  = excl_text.get("1.0", "end-1c").strip()
         try:
             import keyring as _kr
             if new_user and new_pw:
                 _kr.set_password("MeetNote_EWS", new_user, new_pw)
             user_config.save({
-                "ews_email":    new_email,
-                "ews_username": new_user,
-                "ews_url":      new_url,
+                "ews_email":             new_email,
+                "ews_username":          new_user,
+                "ews_url":               new_url,
+                "auto_start_exclusions": excl_raw,
             })
+            _auto_start_exclusions = [
+                s.strip().lower() for s in excl_raw.splitlines() if s.strip()
+            ]
             ews_status_lbl.config(text="✓ Configuration EWS sauvegardée.", fg="#00cc66")
         except Exception as e:
             ews_status_lbl.config(text=f"Erreur : {e}", fg=ERR)
@@ -2615,6 +4147,40 @@ def _open_settings():
              text="Note : le transcript est TOUJOURS sauvegardé en local,\nmême en mode Notion.",
              font=("Segoe UI", 8), bg=S_CARD, fg="#00cc66").pack(anchor="w", pady=(8, 0))
 
+    # ── Démarrage avec Windows
+    tk.Frame(tab_g, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))
+    tk.Label(tab_g, text="Démarrage avec Windows",
+             font=("Segoe UI", 10, "bold"), bg=S_CARD, fg=FG).pack(anchor="w", pady=(10, 4))
+
+    startup_frame = tk.Frame(tab_g, bg=S_HIGH)
+    startup_frame.pack(fill="x")
+
+    startup_var = tk.BooleanVar(value=_startup_is_enabled())
+    startup_status_lbl = tk.Label(tab_g, text="", font=("Segoe UI", 8),
+                                  bg=S_CARD, fg=FG3, wraplength=360)
+    startup_status_lbl.pack(anchor="w", pady=(4, 0))
+
+    def _toggle_startup():
+        try:
+            _set_startup_enabled(startup_var.get())
+            if startup_var.get():
+                startup_status_lbl.config(text="✓ MeetNote démarrera au démarrage de Windows (tray uniquement).", fg="#00cc66")
+            else:
+                startup_status_lbl.config(text="✓ Démarrage automatique désactivé.", fg=FG3)
+        except Exception as e:
+            startup_status_lbl.config(text=f"Erreur : {e}", fg=ERR)
+            startup_var.set(not startup_var.get())
+
+    tk.Checkbutton(
+        startup_frame,
+        text="  Lancer MeetNote au démarrage de Windows (tray, sans fenêtre principale)",
+        variable=startup_var,
+        font=("Segoe UI", 9), bg=S_HIGH, fg=FG, selectcolor=S_HIGH,
+        activebackground=S_HIGH, activeforeground=FG,
+        relief="flat", cursor="hand2",
+        command=_toggle_startup,
+    ).pack(anchor="w", padx=10, pady=8)
+
     # ── Footer boutons
     footer = tk.Frame(win, bg=S_MAIN)
     footer.pack(fill="x", side="bottom")
@@ -2641,6 +4207,71 @@ def _open_settings():
     wx = _root.winfo_x() + (_root.winfo_width()  - win.winfo_reqwidth())  // 2
     wy = _root.winfo_y() + (_root.winfo_height() - win.winfo_reqheight()) // 2
     win.geometry(f"+{wx}+{wy}")
+
+
+# ─── Surveillance changement de périphérique audio ──────────────────────────
+def _start_audio_device_monitor():
+    """Lance un thread qui détecte les changements de sortie audio Windows
+    et propose de redémarrer MeetNote pour une détection correcte."""
+    global _audio_device_monitor_started
+    if _audio_device_monitor_started:
+        return
+    _audio_device_monitor_started = True
+
+    def _get_default_speaker_name() -> str:
+        try:
+            import soundcard as _sc
+            spk = _sc.default_speaker()
+            return spk.name if spk else ""
+        except Exception:
+            return ""
+
+    _initial_name = _get_default_speaker_name()
+
+    _restart_prompt_shown = [False]  # évite les doublons
+
+    def _monitor():
+        import time
+        last_name = _initial_name
+        while True:
+            time.sleep(10)
+            current_name = _get_default_speaker_name()
+            if current_name and current_name != last_name and not _restart_prompt_shown[0]:
+                prev, last_name = last_name, current_name
+                _restart_prompt_shown[0] = True
+
+                def _ask(old=prev, new=current_name):
+                    import tkinter.messagebox as mb
+                    if _recording:
+                        # reporter après la fin d'enregistrement
+                        _restart_prompt_shown[0] = False
+                        return
+                    # Ne pas interrompre si un dialog modal est actif (ex: transcript Teams)
+                    if _modal_dialog_open:
+                        _restart_prompt_shown[0] = False
+                        return
+                    try:
+                        if _root and _root.grab_current():
+                            _restart_prompt_shown[0] = False
+                            return
+                    except Exception:
+                        pass
+                    msg = (f"La sortie audio par défaut a changé :\n"
+                           f"  {old or '(inconnu)'}  →  {new}\n\n"
+                           f"Redémarrer MeetNote pour une détection correcte ?")
+                    if mb.askyesno("Changement audio détecté", msg, default="yes"):
+                        import sys
+                        _release_single_instance()
+                        os.execl(sys.executable, sys.executable, *sys.argv)
+                    else:
+                        _restart_prompt_shown[0] = False  # permettre une prochaine alerte
+
+                if _root:
+                    _root.after(0, _ask)
+            elif current_name == last_name:
+                _restart_prompt_shown[0] = False  # device revenu à la normale
+
+    threading.Thread(target=_monitor, daemon=True).start()
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -2709,10 +4340,14 @@ def main():
                     transcript_path=e.get("transcript_path", ""),
                     notion_url=e.get("notion_url", ""),
                     error_msg=e.get("error_msg", ""),
+                    attachments=e.get("attachments", []),
                 )
                 _all_jobs.append(job)
             except Exception:
                 pass
+
+    import sys
+    tray_only = "--minimized" in sys.argv
 
     _icon = pystray.Icon(
         "meetnote", _make_icon(False), "MeetNote — Prêt", menu=_build_menu(),
@@ -2720,8 +4355,24 @@ def main():
     _icon.default_action = lambda i, it: _show_window()
     threading.Thread(target=_icon.run, daemon=True).start()
     threading.Thread(target=_worker_loop, daemon=True).start()
+    _start_audio_device_monitor()
+
+    # ── Démarrage automatique avec Windows (registre HKCU\Run) ──────────────
+    # Garantit que MeetNote redémarre à chaque ouverture de session.
+    try:
+        if not _startup_is_enabled():
+            _set_startup_enabled(True)
+    except Exception:
+        pass  # droit refusé ou environnement figé (PyInstaller frozen) → silencieux
 
     root = _build_window()
+    if tray_only:
+        root.withdraw()   # démarrage silencieux en tray uniquement
+
+    # ── Planification du digest quotidien ────────────────────────────────────
+    # Démarre 3 s après la fenêtre pour laisser tkinter s'initialiser
+    root.after(3_000, _schedule_daily_digest)
+
     root.mainloop()
     _release_single_instance()
     os._exit(0)
