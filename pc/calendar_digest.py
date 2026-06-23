@@ -216,6 +216,9 @@ def run_digest(days: int = 15, force: bool = False) -> str | None:
     today_str = now.strftime("%d/%m/%Y")
     title     = f"Agenda prévisionnel — {today_str}"
 
+    # Sauvegarde avant le push pour éviter les doublons si le push est lent (> 60s)
+    _save_last_run_date(now.date())
+
     try:
         page = push_to_notion(
             transcript=transcript,
@@ -225,10 +228,8 @@ def run_digest(days: int = 15, force: bool = False) -> str | None:
             title_override=title,
         )
         url = page.get("url", "")
-        _save_last_run_date(now.date())
         log.info("calendar_digest: page Notion créée → %s", url)
         return url
     except Exception as e:
         log.error("calendar_digest: échec push Notion (%s)", e)
-        _save_last_run_date(now.date())  # évite la boucle de retry toutes les 60s
         return None
