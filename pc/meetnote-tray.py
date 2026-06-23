@@ -213,6 +213,12 @@ _conflict_win:      tk.Toplevel | None = None
 _end_warn_win:      tk.Toplevel | None = None
 _history_list_frame: tk.Frame | None   = None
 
+# Notes manuelles en cours d'enregistrement (mini-fenêtre flottante)
+_notes_win:         tk.Toplevel | None = None
+_notes_text:        tk.Text | None     = None
+_notes_timer_lbl:   tk.Label | None    = None
+_notes_pinned:      bool               = True
+
 # Fin de réunion imminente
 _current_meeting_end:  datetime.datetime | None = None
 _end_warned_key:       str | None = None  # ISO[:16] de la fin déjà signalée
@@ -246,6 +252,7 @@ class _Job:
     transcript:         str = ""
     whisper_transcript: str = ""   # Transcription Whisper brute (avant concat Teams)
     teams_transcript:   str = ""   # Transcript Teams collé manuellement
+    notes:           str = ""   # Notes manuelles prises pendant l'enregistrement
     transcript_path: str = ""
     notion_url:      str = ""
     error_msg:       str = ""
@@ -906,6 +913,10 @@ def _save_transcript_local(job: _Job) -> str | None:
             if job.meeting_type:
                 f.write(f"Type     : {job.meeting_type}\n")
             f.write("-" * 60 + "\n\n")
+            if job.notes and job.notes.strip():
+                f.write("=== NOTES MANUELLES ===\n")
+                f.write(job.notes.strip() + "\n\n")
+                f.write("-" * 60 + "\n\n")
             f.write(job.transcript)
         return path
     except Exception as e:
@@ -1262,6 +1273,7 @@ def _do_step_notion(job: _Job) -> bool:
             audio_path=job.wav_path,
             title_override=title,
             attachments=job.attachments if job.attachments else None,
+            notes=job.notes,
         )
         job.notion_url = f"https://notion.so/{page['id'].replace('-', '')}"
         job.status_notion = "done"
@@ -1553,6 +1565,210 @@ def _bulk_transcribe_all():
         _refresh_history_panel()
 
 
+def _check_pending_at_startup():
+    """Au démarrage, si sur secteur et des transcriptions sont en attente, propose de les lancer."""
+    if _is_on_battery():
+        return
+    with _all_jobs_lock:
+        candidates = [
+            j for j in _all_jobs
+            if j.status_transcript in ("queued", "running", "error")
+            and j.meeting_type != "Agenda"
+            and os.path.isfile(j.wav_path)
+        ]
+    if not candidates:
+        return
+    import tkinter.messagebox as mb
+    n = len(candidates)
+    if mb.askyesno(
+        "Transcriptions en attente",
+        f"{n} enregistrement(s) n'ont pas encore été transcrits.\n\n"
+        f"Lancer la transcription maintenant ?",
+        default="yes",
+    ):
+        for job in candidates:
+            job.status_transcript = "queued"
+            job.transcript = ""
+            job.transcript_path = ""
+            if job.output_mode != "fichier":
+                job.status_notion = "pending"
+            hist_mod.update(job)
+            with _queue_lock:
+                _job_queue.append(job)
+        _work_event.set()
+        _refresh_ui()
+        if _history_win and _history_win.winfo_exists():
+            _refresh_history_panel()
+
+
+# ─── Notes manuelles (mini-fenêtre flottante) ─────────────────────────────────
+def _rec_elapsed_str() -> str:
+    """Temps écoulé depuis le début de l'enregistrement, format mm:ss."""
+    if not _rec_start_time:
+        return "00:00"
+    secs = max(0, int((datetime.datetime.now() - _rec_start_time).total_seconds()))
+    return f"{secs // 60:02d}:{secs % 60:02d}"
+
+
+def _collect_notes() -> str:
+    """Lit le contenu de la zone de notes (chaîne nettoyée)."""
+    if _notes_text is None:
+        return ""
+    try:
+        return _notes_text.get("1.0", "end").strip()
+    except Exception:
+        return ""
+
+
+def _notes_insert_timestamp():
+    """Insère [mm:ss] au curseur dans la zone de notes."""
+    if _notes_text is None:
+        return
+    _notes_text.insert("insert", f"[{_rec_elapsed_str()}] ")
+    _notes_text.focus_set()
+
+
+def _show_notes_window():
+    """Affiche (ou crée) la mini-fenêtre de prise de notes."""
+    global _notes_win, _notes_text, _notes_timer_lbl, _notes_pinned
+    if not _root:
+        return
+
+    if _notes_win is not None and _notes_win.winfo_exists():
+        _notes_win.deiconify()
+        _notes_win.lift()
+        return
+
+    S_BASE = "#111125"
+    S_CARD = "#1e1e32"
+    S_HIGH = "#28283d"
+    FG     = "#e2e0fc"
+    FG3    = "#ab8985"
+    RED    = "#dc3232"
+
+    _notes_pinned = True
+    win = tk.Toplevel(_root)
+    _notes_win = win
+    win.title("MeetNote — Notes")
+    win.configure(bg=S_BASE)
+    win.attributes("-topmost", True)
+    win.geometry("340x300")
+    # Coin bas-droit de l'écran
+    try:
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        win.geometry(f"340x300+{sw - 360}+{sh - 380}")
+    except Exception:
+        pass
+    win.protocol("WM_DELETE_WINDOW", lambda: win.withdraw())
+
+    # En-tête : titre + compteur REC
+    hdr = tk.Frame(win, bg=S_CARD)
+    hdr.pack(fill="x")
+    tk.Label(hdr, text="📝 Notes", font=("Segoe UI", 10, "bold"),
+             bg=S_CARD, fg=FG).pack(side="left", padx=8, pady=6)
+    _notes_timer_lbl = tk.Label(hdr, text=f"● REC {_rec_elapsed_str()}",
+                                font=("Segoe UI", 9), bg=S_CARD, fg=RED)
+    _notes_timer_lbl.pack(side="right", padx=8)
+
+    # Zone de saisie
+    txt_frame = tk.Frame(win, bg=S_BASE)
+    txt_frame.pack(fill="both", expand=True, padx=6, pady=6)
+    _notes_text = tk.Text(txt_frame, bg=S_HIGH, fg=FG, font=("Segoe UI", 10),
+                          relief="flat", bd=0, wrap="word", insertbackground=FG,
+                          undo=True)
+    sb = tk.Scrollbar(txt_frame, command=_notes_text.yview,
+                      bg=S_BASE, troughcolor=S_BASE)
+    _notes_text.config(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    _notes_text.pack(side="left", fill="both", expand=True)
+    _notes_text.focus_set()
+
+    # Horodatage auto en début de nouvelle ligne
+    def _on_return(event):
+        _notes_text.insert("insert", f"\n[{_rec_elapsed_str()}] ")
+        return "break"
+    _notes_text.bind("<Return>", _on_return)
+
+    # Barre de boutons
+    bar = tk.Frame(win, bg=S_CARD)
+    bar.pack(fill="x")
+    tk.Button(bar, text="⏱ Timestamp", font=("Segoe UI", 9),
+              bg=S_CARD, fg=FG3, activebackground=S_HIGH, activeforeground=FG,
+              relief="flat", bd=0, padx=8, pady=5, cursor="hand2",
+              command=_notes_insert_timestamp).pack(side="left", padx=4, pady=4)
+
+    pin_btn = tk.Button(bar, text="📌 Épinglé", font=("Segoe UI", 9),
+                        bg=S_CARD, fg=FG3, activebackground=S_HIGH,
+                        activeforeground=FG, relief="flat", bd=0, padx=8, pady=5,
+                        cursor="hand2")
+
+    def _toggle_pin():
+        global _notes_pinned
+        _notes_pinned = not _notes_pinned
+        win.attributes("-topmost", _notes_pinned)
+        pin_btn.config(text="📌 Épinglé" if _notes_pinned else "📌 Libre")
+    pin_btn.config(command=_toggle_pin)
+    pin_btn.pack(side="right", padx=4, pady=4)
+
+    # Préfixe la première ligne avec un timestamp pour amorcer
+    _notes_text.insert("1.0", f"[{_rec_elapsed_str()}] ")
+
+    _update_notes_timer()
+
+
+def _update_notes_timer():
+    """Rafraîchit le compteur REC de la fenêtre de notes chaque seconde."""
+    if (_notes_win is None or not _notes_win.winfo_exists()
+            or _notes_timer_lbl is None):
+        return
+    if _recording:
+        try:
+            _notes_timer_lbl.config(text=f"● REC {_rec_elapsed_str()}")
+        except Exception:
+            return
+        if _root:
+            _root.after(1000, _update_notes_timer)
+    else:
+        try:
+            _notes_timer_lbl.config(text="⏹ Terminé")
+        except Exception:
+            pass
+
+
+def _start_notes_session():
+    """Ouvre la fenêtre de notes pour un nouvel enregistrement (vide + timestamp)."""
+    if _notes_win is not None and _notes_win.winfo_exists():
+        _reset_notes_window()
+        try:
+            _notes_text.insert("1.0", f"[{_rec_elapsed_str()}] ")
+            _notes_win.deiconify()
+            _notes_win.lift()
+        except Exception:
+            pass
+        _update_notes_timer()
+    else:
+        _show_notes_window()
+
+
+def _hide_notes_window():
+    """Masque la fenêtre de notes (sans détruire, pour conserver le texte)."""
+    if _notes_win is not None and _notes_win.winfo_exists():
+        try:
+            _notes_win.withdraw()
+        except Exception:
+            pass
+
+
+def _reset_notes_window():
+    """Vide la zone de notes (nouvel enregistrement)."""
+    if _notes_text is not None and _notes_win is not None and _notes_win.winfo_exists():
+        try:
+            _notes_text.delete("1.0", "end")
+        except Exception:
+            pass
+
+
 # ─── Recording actions ────────────────────────────────────────────────────────
 _SOURCE_MAP = {
     "🎤  Microphone uniquement": "micro",
@@ -1639,6 +1855,7 @@ def _do_start():
         _refresh_ui()
         return
 
+    _start_notes_session()
     _refresh_ui()
 
 
@@ -1694,7 +1911,9 @@ def _do_stop_transcribe():
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
         teams_participants=teams_participants,
+        notes=_collect_notes(),
     )
+    _hide_notes_window()
 
     with _all_jobs_lock:
         _all_jobs.insert(0, job)
@@ -1765,9 +1984,11 @@ def _do_stop_archive_only():
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
         teams_participants=teams_participants,
+        notes=_collect_notes(),
         status_transcript="queued",
         status_notion="pending",
     )
+    _hide_notes_window()
 
     with _all_jobs_lock:
         _all_jobs.insert(0, job)
@@ -1794,12 +2015,6 @@ def _do_stop_archive_only():
     threading.Thread(target=_archive_only, daemon=True).start()
     _set_status("Arrêt sans transcription…")
     _refresh_ui()
-
-    # ── Proposer de coller le transcript Teams (après démarrage archivage) ────
-    teams_txt = _open_teams_transcript_dialog()
-    if teams_txt:
-        job.teams_transcript = teams_txt
-        hist_mod.update(job)
 
 
 def _do_cancel():
@@ -1831,6 +2046,7 @@ def _do_cancel():
     if _level_var and _root:
         _root.after(0, lambda: _level_var.set(0))
 
+    _hide_notes_window()
     _set_status("Annulé.")
     _refresh_ui()
 
@@ -1949,6 +2165,7 @@ def _build_menu():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("▶  Démarrer l'enregistrement", lambda i, it: _root.after(0, _do_start)             if _root else None, enabled=not _recording),
         pystray.MenuItem("⏹  Arrêter l'enregistrement",  lambda i, it: _root.after(0, _do_stop_archive_only) if _root else None, enabled=_recording),
+        pystray.MenuItem("📝  Notes de réunion",         lambda i, it: _root.after(0, _show_notes_window)     if _root else None, enabled=_recording),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("📅  Agenda Notion (15 j)", lambda i, it: _root.after(0, _trigger_agenda_digest_manual) if _root else None),
         pystray.Menu.SEPARATOR,
@@ -4372,6 +4589,7 @@ def main():
     # ── Planification du digest quotidien ────────────────────────────────────
     # Démarre 3 s après la fenêtre pour laisser tkinter s'initialiser
     root.after(3_000, _schedule_daily_digest)
+    root.after(5_000, _check_pending_at_startup)
 
     root.mainloop()
     _release_single_instance()

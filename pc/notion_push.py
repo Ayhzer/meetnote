@@ -38,11 +38,27 @@ def push_to_notion(
     audio_path: str = None,
     title_override: str = "",
     attachments: list = None,
+    notes: str = "",
 ) -> dict:
     now   = start_time or datetime.datetime.now()
     title = title_override.strip() if title_override and title_override.strip() else f"Réunion {now.strftime('%Y-%m-%d %H:%M')}"
 
     blocks = []
+
+    # ── Notes manuelles en tête de page (avant la transcription) ──────────────
+    if notes and notes.strip():
+        blocks.append(_callout_block("📝 Notes manuelles prises pendant la réunion"))
+        for para in notes.split("\n"):
+            para = para.strip()
+            if not para:
+                continue
+            while len(para) > 2000:
+                blocks.append(_paragraph_block(para[:2000]))
+                para = para[2000:]
+            if para:
+                blocks.append(_paragraph_block(para))
+        blocks.append(_divider_block())
+
     for para in transcript.split("\n"):
         para = para.strip()
         if not para:
@@ -386,3 +402,18 @@ def _paragraph_block(text: str) -> dict:
             "rich_text": [{"type": "text", "text": {"content": text}}]
         },
     }
+
+
+def _callout_block(text: str) -> dict:
+    return {
+        "object": "block",
+        "type": "callout",
+        "callout": {
+            "rich_text": [{"type": "text", "text": {"content": text}}],
+            "icon": {"type": "emoji", "emoji": "📝"},
+        },
+    }
+
+
+def _divider_block() -> dict:
+    return {"object": "block", "type": "divider", "divider": {}}

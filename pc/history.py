@@ -31,6 +31,7 @@ def _dict_to_job_dict(d: dict) -> dict:
         "transcript": "",
         "whisper_transcript": "",
         "teams_transcript": "",
+        "notes": "",
         "transcript_path": "",
         "notion_url": "",
         "error_msg": "",
