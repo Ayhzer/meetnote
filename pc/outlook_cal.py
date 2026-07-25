@@ -56,7 +56,9 @@ def get_current_or_next_meeting(window_minutes: int = 30) -> dict | None:
                 email=email, username=username, password=password,
                 ews_url=ews_url, window_minutes=window_minutes,
             )
-            return result
+            if result is not None:
+                return result
+            # None = EWS injoignable → on tente le fallback COM/MAPI ci-dessous
         except Exception as e:
             log.debug("outlook_cal: EWS échoué, fallback COM (%s)", e)
 
@@ -124,10 +126,13 @@ def get_all_current_meetings(window_minutes: int = 30) -> list:
         try:
             import ews_cal
             if hasattr(ews_cal, "get_all_current_meetings"):
-                return ews_cal.get_all_current_meetings(
+                result = ews_cal.get_all_current_meetings(
                     email=email, username=username, password=password,
                     ews_url=ews_url, window_minutes=window_minutes,
                 )
+                if result is not None:
+                    return result
+                # None = EWS injoignable → fallback COM/MAPI ci-dessous
         except Exception as e:
             log.debug("outlook_cal: EWS get_all échoué (%s)", e)
 

@@ -16,5 +16,5 @@ if "%PYTHON%"=="" (
 :: Installe les dépendances si pystray manque
 %PYTHON% -c "import pystray" >nul 2>&1 || %PYTHON% -m pip install -r ..\requirements.txt -q
 
-:: Lance l'application sans fenêtre console
-start /B %PYTHON% meetnote-tray.py
+:: Lance l'application via le watchdog (relance auto en cas de crash natif)
+start /B %PYTHON% watchdog.py

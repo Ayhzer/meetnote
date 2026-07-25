@@ -35,6 +35,69 @@ import calendar_digest
 from notion_push import push_to_notion
 import teams_roster
 
+# ─── Logging de crash persistant ──────────────────────────────────────────────
+# L'app ne loguait rien dans un fichier : un plantage (exception non catchée,
+# crash natif audio/whisper) ne laissait aucune trace. On capture désormais :
+#   - les exceptions Python du thread principal (sys.excepthook)
+#   - les exceptions des threads (threading.excepthook, Python 3.8+)
+#   - les crashs natifs (faulthandler : segfault, access violation…)
+# Tout est écrit dans %APPDATA%/MeetNote/crash.log
+import logging
+import faulthandler
+import traceback
+
+_LOG_DIR  = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "MeetNote")
+_LOG_PATH = os.path.join(_LOG_DIR, "crash.log")
+
+try:
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    # Root en WARNING pour ne pas polluer avec les logs INFO des libs
+    # (exchangelib autodiscover, urllib3…) ; notre logger reste en INFO.
+    logging.basicConfig(
+        filename=_LOG_PATH,
+        level=logging.WARNING,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        encoding="utf-8",
+    )
+    _logger = logging.getLogger("meetnote")
+    _logger.setLevel(logging.INFO)
+    _logger.info("=" * 60)
+    _logger.info("Démarrage MeetNote")
+
+    # faulthandler : capture les crashs natifs (dumpe la stack C/Python).
+    # On garde le fichier ouvert pour toute la durée du process.
+    _fault_fp = open(_LOG_PATH, "a", encoding="utf-8")
+    faulthandler.enable(file=_fault_fp)
+except Exception:
+    _logger = logging.getLogger("meetnote")
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    """Loggue toute exception non catchée du thread principal avant de sortir."""
+    _logger.critical(
+        "Exception non catchée :\n%s",
+        "".join(traceback.format_exception(exc_type, exc_value, exc_tb)),
+    )
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _thread_excepthook(args):
+    """Loggue les exceptions non catchées des threads (worker, audio, watchers)."""
+    _logger.critical(
+        "Exception non catchée dans le thread %s :\n%s",
+        getattr(args.thread, "name", "?"),
+        "".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback)),
+    )
+
+
+sys.excepthook = _excepthook
+try:
+    threading.excepthook = _thread_excepthook  # Python 3.8+
+except Exception:
+    pass
+
 VERSION = "3.1"
 
 RELEASE_NOTES = """\
@@ -182,6 +245,11 @@ _lock            = threading.Lock()
 _stream_mic      = None
 _loop_thread     = None
 _stop_loop       = threading.Event()
+# Armé par le moniteur audio quand la sortie Windows change PENDANT un enregistrement.
+# Le reader loopback cesse alors de lire l'endpoint WASAPI invalidé — sinon PortAudio
+# déréférence la mémoire morte dans AUDIOSES.DLL → access violation (0xC0000005) qui
+# tue tout le process (crash natif non rattrapable en Python).
+_audio_device_changed = threading.Event()
 _icon            = None
 _root            = None
 _level_var       = None
@@ -524,9 +592,39 @@ def _find_wasapi_output_device(spk_name: str | None) -> tuple[int, int] | None:
 
 
 def _loopback_thread_fn(mic_also: bool):
+    """Capture loopback (+ micro en mode mixte), avec réouverture automatique.
+
+    La capture est enveloppée dans une boucle : si le périphérique audio par
+    défaut change PENDANT l'enregistrement (casque branché/débranché, écran
+    HDMI, Teams qui bascule la sortie…), la session en cours se termine
+    proprement, puis on rouvre des flux WASAPI NEUFS sur le nouveau
+    périphérique. On reconstruit entièrement l'instance PyAudio à chaque
+    réouverture car PortAudio fige la liste des périphériques (et le device
+    par défaut) à sa création : sans ça on continuerait à lire un endpoint
+    mort → access violation fatale dans AUDIOSES.DLL, et surtout on
+    n'enregistrait plus que du silence jusqu'à la fin de la réunion.
+    """
     global _loopback_active
     _loopback_active = True
     ctypes.windll.ole32.CoInitialize(None)
+    try:
+        import time as _time
+        while not _stop_loop.is_set():
+            reopen_needed = _loopback_session(mic_also)
+            if not reopen_needed or _stop_loop.is_set():
+                break
+            _logger.info("Périphérique audio changé pendant l'enregistrement — "
+                         "réouverture des flux de capture (micro + PC).")
+            _time.sleep(0.4)   # laisser Windows stabiliser le nouveau périphérique par défaut
+    finally:
+        _loopback_active = False
+
+
+def _loopback_session(mic_also: bool) -> bool:
+    """Une session de capture WASAPI. Retourne True si elle s'est terminée à
+    cause d'un changement de périphérique (⇒ il faut rouvrir), False si arrêt
+    normal (_stop_loop) ou échec définitif (fallback soundcard déjà tenté)."""
+    _audio_device_changed.clear()   # repartir propre pour cette session
     spk_name = _speaker_var.get() if _speaker_var else None
 
     try:
@@ -596,11 +694,20 @@ def _loopback_thread_fn(mic_also: bool):
             lb_q:       queue.Queue = queue.Queue()
             stop_readers = threading.Event()
             mic_stream   = None
+            mic_reader   = None
             mic_rate     = loop_rate
 
             # ── Thread loopback reader ─────────────────────────────────────────
             def _lb_reader():
                 while not stop_readers.is_set():
+                    # Le périphérique audio par défaut a changé : l'endpoint de CE
+                    # flux est invalidé. On arrête de lire AVANT que PortAudio ne
+                    # touche la mémoire morte (AUDIOSES.DLL → access violation
+                    # fatale). La session sera rouverte sur le nouveau périphérique.
+                    if _audio_device_changed.is_set():
+                        print("[audio] périphérique changé — arrêt du reader loopback "
+                              "(réouverture imminente)", file=sys.stderr)
+                        break
                     try:
                         data = loop_stream.read(loop_frames, exception_on_overflow=False)
                         arr  = np.frombuffer(data, dtype=np.float32).copy()
@@ -626,6 +733,15 @@ def _loopback_thread_fn(mic_also: bool):
                     print(f"[audio] mic stream (mixte): '{mic_info['name']}' {mic_rate}Hz", file=sys.stderr, flush=True)
                     def _mic_reader():
                         while not stop_readers.is_set():
+                            # Périphérique par défaut changé (mic et sortie sont
+                            # souvent le même device combiné : casque BT/USB). On
+                            # arrête AVANT que PortAudio ne touche la mémoire morte
+                            # (access violation fatale). La session sera rouverte sur
+                            # le nouveau micro par défaut → capture reprise en <1 s.
+                            if _audio_device_changed.is_set():
+                                print("[audio] périphérique changé — arrêt du reader mic "
+                                      "(réouverture imminente)", file=sys.stderr)
+                                break
                             try:
                                 raw = mic_stream.read(mic_block, exception_on_overflow=False)
                                 arr = np.frombuffer(raw, dtype=np.float32).copy()
@@ -634,7 +750,8 @@ def _loopback_thread_fn(mic_also: bool):
                                     _push_level(arr)
                             except Exception:
                                 break
-                    threading.Thread(target=_mic_reader, daemon=True).start()
+                    mic_reader = threading.Thread(target=_mic_reader, daemon=True)
+                    mic_reader.start()
                 except Exception as e:
                     print(f"[audio] mic setup error: {e}", file=sys.stderr, flush=True)
                     mic_stream = None
@@ -643,7 +760,7 @@ def _loopback_thread_fn(mic_also: bool):
             MIX_S   = 0.1          # période de mixage
             mix_len = int(config.SAMPLE_RATE * MIX_S)
             try:
-                while not _stop_loop.is_set():
+                while not _stop_loop.is_set() and not _audio_device_changed.is_set():
                     import time as _time
                     _time.sleep(MIX_S)
 
@@ -683,7 +800,16 @@ def _loopback_thread_fn(mic_also: bool):
                 try:  loop_stream.stop_stream()
                 except Exception: pass
                 if mic_stream:
-                    try:  mic_stream.stop_stream(); mic_stream.close()
+                    try:  mic_stream.stop_stream()
+                    except Exception: pass
+                # Attendre la fin des threads reader avant de fermer les flux :
+                # fermer un stream WASAPI pendant qu'un thread le lit encore
+                # provoque une access violation Windows fatale (non rattrapable).
+                lb_reader.join(timeout=2)
+                if mic_reader:
+                    mic_reader.join(timeout=2)
+                if mic_stream:
+                    try:  mic_stream.close()
                     except Exception: pass
 
             loop_stream.close()
@@ -693,8 +819,11 @@ def _loopback_thread_fn(mic_also: bool):
     except Exception as e:
         print(f"[audio] erreur pyaudiowpatch: {e} — fallback soundcard", file=sys.stderr)
         _loopback_thread_fn_soundcard(mic_also)
-    finally:
-        _loopback_active = False
+        return False   # le fallback soundcard a géré la session : ne pas rouvrir
+
+    # Session terminée normalement : rouvrir uniquement si un changement de
+    # périphérique en est la cause (et qu'on ne s'arrête pas).
+    return _audio_device_changed.is_set() and not _stop_loop.is_set()
 
 
 class _NullCtx:
@@ -1566,7 +1695,8 @@ def _bulk_transcribe_all():
 
 
 def _check_pending_at_startup():
-    """Au démarrage, si sur secteur et des transcriptions sont en attente, propose de les lancer."""
+    """Au démarrage, relance automatiquement et silencieusement les transcriptions
+    laissées en attente ou interrompues (ex: PC éteint en pleine transcription)."""
     if _is_on_battery():
         return
     with _all_jobs_lock:
@@ -1578,27 +1708,19 @@ def _check_pending_at_startup():
         ]
     if not candidates:
         return
-    import tkinter.messagebox as mb
-    n = len(candidates)
-    if mb.askyesno(
-        "Transcriptions en attente",
-        f"{n} enregistrement(s) n'ont pas encore été transcrits.\n\n"
-        f"Lancer la transcription maintenant ?",
-        default="yes",
-    ):
-        for job in candidates:
-            job.status_transcript = "queued"
-            job.transcript = ""
-            job.transcript_path = ""
-            if job.output_mode != "fichier":
-                job.status_notion = "pending"
-            hist_mod.update(job)
-            with _queue_lock:
-                _job_queue.append(job)
-        _work_event.set()
-        _refresh_ui()
-        if _history_win and _history_win.winfo_exists():
-            _refresh_history_panel()
+    for job in candidates:
+        job.status_transcript = "queued"
+        job.transcript = ""
+        job.transcript_path = ""
+        if job.output_mode != "fichier":
+            job.status_notion = "pending"
+        hist_mod.update(job)
+        with _queue_lock:
+            _job_queue.append(job)
+    _work_event.set()
+    _refresh_ui()
+    if _history_win and _history_win.winfo_exists():
+        _refresh_history_panel()
 
 
 # ─── Notes manuelles (mini-fenêtre flottante) ─────────────────────────────────
@@ -2070,6 +2192,10 @@ def _set_progress(val: float):
 def _log_error(msg: str):
     ts   = datetime.datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}\n"
+    try:
+        _logger.info(msg)
+    except Exception:
+        pass
     if _root and _log_text:
         def _insert():
             _log_text.config(state="normal")
@@ -2320,11 +2446,21 @@ def _fire_digest_then_reschedule():
         _root.after(60_000, _schedule_daily_digest)  # 1 min après pour laisser le temps à _save_last_run_date
 
 
-def _quit_app(icon=None, item=None):
+def _shutdown_app(quit_for_good: bool):
+    """Arrête proprement l'appli. Si quit_for_good, dépose un marqueur pour que
+    le watchdog externe (watchdog.py) ne relance pas MeetNote après coup —
+    sinon (ex: redémarrage suite à changement de périphérique audio) le
+    process se termine normalement et le watchdog le relance tout seul."""
     if _recording:
         _do_cancel()
     else:
         _stop_loop.set()
+    if quit_for_good:
+        try:
+            os.makedirs(os.path.dirname(_STOP_FLAG), exist_ok=True)
+            open(_STOP_FLAG, "w").close()
+        except Exception:
+            pass
     def _shutdown():
         if _root:
             _root.destroy()
@@ -2334,6 +2470,10 @@ def _quit_app(icon=None, item=None):
         if _icon:
             _icon.stop()
     threading.Thread(target=_stop_icon, daemon=True).start()
+
+
+def _quit_app(icon=None, item=None):
+    _shutdown_app(quit_for_good=True)
 
 
 # ─── Fenêtre historique (Toplevel indépendante) ───────────────────────────────
@@ -2748,6 +2888,22 @@ def _build_window():
     global _meeting_name_var, _history_list_frame, _status_dot
 
     _root = tk.Tk()
+
+    # Capture les exceptions levées dans les callbacks Tkinter (clics de boutons,
+    # .after(), etc.). Par défaut Tkinter les imprime sur stderr — donc invisibles
+    # quand l'app est lancée sans console. On les loggue et on les affiche.
+    def _tk_report_exception(exc, val, tb):
+        msg = "".join(traceback.format_exception(exc, val, tb))
+        try:
+            _logger.critical("Exception dans un callback Tkinter :\n%s", msg)
+        except Exception:
+            pass
+        try:
+            _log_error(f"⚠ Erreur interne : {val}")
+        except Exception:
+            pass
+    _root.report_callback_exception = _tk_report_exception
+
     _root.title("MeetNote")
     _root.resizable(True, True)
     _root.minsize(720, 560)
@@ -4014,12 +4170,17 @@ def _get_startup_cmd() -> str:
     """Retourne la commande de démarrage Windows attendue pour MeetNote."""
     import sys
     exe = sys.executable
-    script = os.path.abspath(__file__)
     # pythonw pour éviter la console ; --minimized pour démarrer en tray seul
     pythonw = exe.replace("python.exe", "pythonw.exe")
     if not os.path.isfile(pythonw):
         pythonw = exe
-    return f'"{pythonw}" "{script}" --minimized'
+    if getattr(sys, "frozen", False):
+        script = os.path.abspath(__file__)
+        return f'"{pythonw}" "{script}" --minimized'
+    # En mode source : passer par le watchdog pour survivre à un crash natif
+    # (access violation WASAPI) que Python ne peut pas rattraper lui-même.
+    watchdog = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog.py")
+    return f'"{pythonw}" "{watchdog}" --minimized'
 
 def _startup_is_enabled() -> bool:
     """Retourne True si la clé de démarrage automatique est configurée."""
@@ -4443,24 +4604,59 @@ def _start_audio_device_monitor():
         except Exception:
             return ""
 
+    def _get_default_mic_name() -> str:
+        try:
+            import soundcard as _sc
+            mic = _sc.default_microphone()
+            return mic.name if mic else ""
+        except Exception:
+            return ""
+
     _initial_name = _get_default_speaker_name()
+    _initial_mic  = _get_default_mic_name()
 
     _restart_prompt_shown = [False]  # évite les doublons
 
     def _monitor():
         import time
         last_name = _initial_name
+        last_mic  = _initial_mic
         while True:
-            time.sleep(10)
+            time.sleep(0.5)   # fenêtre courte : réagir vite au changement de périphérique
             current_name = _get_default_speaker_name()
-            if current_name and current_name != last_name and not _restart_prompt_shown[0]:
+            current_mic  = _get_default_mic_name()
+            spk_changed = bool(current_name) and current_name != last_name
+            mic_changed = bool(current_mic)  and current_mic  != last_mic
+
+            # ── Pendant un enregistrement ────────────────────────────────────
+            # Changement de sortie OU de micro (souvent liés : casque combiné
+            # Bluetooth/USB) → armer la réouverture des flux de capture. Aucun
+            # popup. _loopback_thread_fn ferme proprement la session en cours et
+            # rouvre micro + loopback sur le nouveau périphérique par défaut.
+            if _recording:
+                if spk_changed or mic_changed:
+                    prev_spk = last_name
+                    if spk_changed: last_name = current_name
+                    if mic_changed: last_mic  = current_mic
+                    _audio_device_changed.set()
+                    _logger.warning(
+                        "Périphérique audio changé pendant l'enregistrement "
+                        "(sortie: %s → %s | micro: %s → %s) : réouverture des flux de capture.",
+                        prev_spk or "(inconnu)", current_name or "(inconnu)",
+                        "≠" if mic_changed else "=", current_mic or "(inconnu)")
+                continue
+
+            # ── Hors enregistrement : proposer un redémarrage si la SORTIE change ─
+            if mic_changed:
+                last_mic = current_mic   # suivre le micro sans popup
+            if spk_changed and not _restart_prompt_shown[0]:
                 prev, last_name = last_name, current_name
                 _restart_prompt_shown[0] = True
 
                 def _ask(old=prev, new=current_name):
                     import tkinter.messagebox as mb
                     if _recording:
-                        # reporter après la fin d'enregistrement
+                        # reporter la proposition de redémarrage après la fin d'enregistrement
                         _restart_prompt_shown[0] = False
                         return
                     # Ne pas interrompre si un dialog modal est actif (ex: transcript Teams)
@@ -4477,16 +4673,16 @@ def _start_audio_device_monitor():
                            f"  {old or '(inconnu)'}  →  {new}\n\n"
                            f"Redémarrer MeetNote pour une détection correcte ?")
                     if mb.askyesno("Changement audio détecté", msg, default="yes"):
-                        import sys
-                        _release_single_instance()
-                        os.execl(sys.executable, sys.executable, *sys.argv)
+                        # Pas de flag "quit_for_good" : le watchdog externe
+                        # relance MeetNote automatiquement après la sortie.
+                        _shutdown_app(quit_for_good=False)
                     else:
                         _restart_prompt_shown[0] = False  # permettre une prochaine alerte
 
                 if _root:
                     _root.after(0, _ask)
-            elif current_name == last_name:
-                _restart_prompt_shown[0] = False  # device revenu à la normale
+            elif not spk_changed:
+                _restart_prompt_shown[0] = False  # sortie stable
 
     threading.Thread(target=_monitor, daemon=True).start()
 
@@ -4494,6 +4690,11 @@ def _start_audio_device_monitor():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 _LOCK_FILE = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
                           "MeetNote", "meetnote.pid")
+# Déposé juste avant une sortie volontaire (Quitter / stop.bat) pour indiquer
+# au watchdog externe (watchdog.py) qu'il ne doit PAS relancer MeetNote.
+# Absence de ce fichier après la sortie du process == crash → relance auto.
+_STOP_FLAG = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
+                          "MeetNote", "clean_exit.flag")
 
 def _acquire_single_instance():
     """Tue toute instance précédente et écrit notre PID. Retourne True si OK."""

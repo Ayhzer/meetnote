@@ -151,6 +151,7 @@ def get_all_current_meetings(
 
     except Exception as e:
         log.debug("ews_cal: unavailable (%s)", e)
+        return None   # None = connexion EWS impossible → le caller tente COM/MAPI
 
     return []
 
@@ -228,7 +229,7 @@ def get_events_range(
 
     except Exception as e:
         log.debug("ews_cal: get_events_range unavailable (%s)", e)
-    return []
+    return None   # None = connexion EWS impossible → le caller tente COM/MAPI
 
 
 def is_available() -> bool:
