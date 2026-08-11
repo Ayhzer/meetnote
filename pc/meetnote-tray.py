@@ -4190,15 +4190,20 @@ def _get_startup_cmd() -> str:
     watchdog = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog.py")
     return f'"{pythonw}" "{watchdog}" --minimized'
 
-def _startup_is_enabled() -> bool:
-    """Retourne True si la clé de démarrage automatique est configurée."""
+def _startup_value() -> str | None:
+    """Retourne la commande de démarrage auto enregistrée, ou None si absente."""
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY) as k:
             val, _ = winreg.QueryValueEx(k, _STARTUP_REG_NAME)
-            return val == _get_startup_cmd()
+            return val
     except Exception:
-        return False
+        return None
+
+
+def _startup_is_enabled() -> bool:
+    """Retourne True si la clé de démarrage automatique est configurée."""
+    return _startup_value() == _get_startup_cmd()
 
 def _set_startup_enabled(enabled: bool):
     """Active ou désactive le démarrage automatique de MeetNote avec Windows."""
@@ -4806,11 +4811,17 @@ def main():
 
     # ── Démarrage automatique avec Windows (registre HKCU\Run) ──────────────
     # Garantit que MeetNote redémarre à chaque ouverture de session.
+    # L'EXE figé n'écrase JAMAIS une clé existante : elle pointe peut-être sur
+    # watchdog.py, seul filet de relance après une access violation WASAPI, que
+    # le bundle n'embarque pas. Lancer l'EXE une fois suffirait sinon à
+    # supprimer la relance automatique sans que personne ne le voie.
     try:
-        if not _startup_is_enabled():
+        enregistree = _startup_value()
+        if enregistree != _get_startup_cmd() and not (
+                getattr(sys, "frozen", False) and enregistree):
             _set_startup_enabled(True)
     except Exception:
-        pass  # droit refusé ou environnement figé (PyInstaller frozen) → silencieux
+        pass  # droit refusé ou registre verrouillé → silencieux
 
     root = _build_window()
     if tray_only:
