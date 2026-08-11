@@ -900,6 +900,14 @@ def _archive_audio(wav_path: str, start_time: datetime.datetime,
             basename = f"meetnote_{ts}_{safe}"
         else:
             basename = f"meetnote_{ts}"
+        # Déjà archivé (relance depuis l'historique, reprise après crash) : la
+        # source EST la destination. ffmpeg refuse d'éditer un fichier en place,
+        # et le repli recopierait l'opus sous une extension .wav trompeuse.
+        deja = os.path.abspath(wav_path)
+        for ext in (".opus", ".wav"):
+            if deja == os.path.abspath(os.path.join(config.AUDIO_ARCHIVE_DIR,
+                                                    basename + ext)):
+                return wav_path
         ffmpeg = _find_ffmpeg()
         if ffmpeg:
             dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"{basename}.opus")
@@ -4763,6 +4771,27 @@ def main():
                 _all_jobs.append(job)
             except Exception:
                 pass
+
+    # ── Reprise des jobs laissés en plan ────────────────────────────────────
+    # La file de travail vit en mémoire : un job « queued » ou « running » au
+    # moment d'un crash natif (access violation WASAPI) n'y est plus au
+    # redémarrage, alors que son audio est intact sur le disque. Sans cette
+    # reprise il faudrait le relancer à la main depuis l'historique.
+    with _all_jobs_lock:
+        orphelins = [j for j in _all_jobs
+                     if j.status_transcript in ("queued", "running")
+                     and j.wav_path and os.path.isfile(j.wav_path)]
+    if orphelins:
+        for job in orphelins:
+            job.status_transcript = "queued"
+            hist_mod.update(job)
+        with _queue_lock:
+            # L'historique est du plus récent au plus ancien : on remet dans
+            # l'ordre chronologique pour traiter le plus ancien d'abord.
+            _job_queue.extend(reversed(orphelins))
+        _work_event.set()
+        _logger.info("Reprise de %d job(s) interrompu(s) : %s", len(orphelins),
+                     ", ".join(j.id for j in orphelins))
 
     import sys
     tray_only = "--minimized" in sys.argv
