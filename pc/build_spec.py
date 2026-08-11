@@ -8,8 +8,10 @@ Discovers:
 """
 
 import os
-import sys
+import shutil
 import subprocess
+import sys
+import time
 
 # ─── Signature numérique ─────────────────────────────────────────────────────
 # Certificat auto-signé MeetNote, installé dans CurrentUser\My + TrustedPublisher.
@@ -29,15 +31,18 @@ if (-not $cert) {{
     Write-Error 'Certificat MeetNote introuvable dans CurrentUser\\My'
     exit 1
 }}
-$r = Set-AuthenticodeSignature -FilePath '{exe_path}' -Certificate $cert -HashAlgorithm SHA256 -TimestampServer '{_TIMESTAMP_SERVER}'
+$ts = '{_TIMESTAMP_SERVER}'
+$r = Set-AuthenticodeSignature -FilePath '{exe_path}' -Certificate $cert `
+        -HashAlgorithm SHA256 -TimestampServer $ts
 if ($r.Status -ne 'Valid') {{
     Write-Error ("Signature echouee: " + $r.StatusMessage)
     exit 1
 }}
 Write-Host ("[build_spec] EXE signe: " + $r.Status + " — " + $cert.Thumbprint)
 """
-    r = subprocess.run(
-        ["powershell", "-NonInteractive", "-Command", ps],
+    # Commande construite ici, sans entrée externe : S603/S607 non pertinents.
+    r = subprocess.run(  # noqa: S603
+        ["powershell", "-NonInteractive", "-Command", ps],  # noqa: S607
         capture_output=True, text=True, timeout=30,
     )
     print(r.stdout.strip())
@@ -53,7 +58,8 @@ VENV        = _PY312
 SITE_PKG    = os.path.join(_PY312, "Lib", "site-packages")
 
 # ─── Discover faster-whisper model snapshots ─────────────────────────────────
-MODEL_NAMES = ["tiny", "base", "small", "medium"]   # large-v3 is 3 GB — excluded by default
+# large-v3 (3 Go) exclu par défaut
+MODEL_NAMES = ["tiny", "base", "small", "medium"]
 
 def find_model_snapshot(name: str):
     """Return the snapshot dir for a given model name if it exists."""
@@ -96,12 +102,14 @@ for src, dst in model_datas:
 # 2. faster_whisper assets (silero_vad_v6.onnx)
 fw_assets = os.path.join(SITE_PKG, "faster_whisper", "assets")
 if os.path.isdir(fw_assets):
-    datas_lines.append(f"    (r'{fw_assets.replace(chr(92), '/')}', 'faster_whisper/assets'),")
+    _fw = fw_assets.replace(chr(92), '/')
+    datas_lines.append(f"    (r'{_fw}', 'faster_whisper/assets'),")
 
 # 3. sounddevice portaudio DLLs
 sd_data = os.path.join(SITE_PKG, "_sounddevice_data")
 if os.path.isdir(sd_data):
-    datas_lines.append(f"    (r'{sd_data.replace(chr(92), '/')}', '_sounddevice_data'),")
+    _sd = sd_data.replace(chr(92), '/')
+    datas_lines.append(f"    (r'{_sd}', '_sounddevice_data'),")
 
 # 4. ctranslate2 package (DLLs live in its directory)
 ct2_dir = os.path.join(SITE_PKG, "ctranslate2")
@@ -119,14 +127,14 @@ if os.path.isdir(sc_dir):
     datas_lines.append(f"    (r'{sc_dir.replace(chr(92), '/')}', 'soundcard'),")
 
 # ─── Embed ffmpeg + ffprobe si disponibles (avant écriture du spec) ───────────
-import shutil as _shutil
 for _bin in ("ffmpeg.exe", "ffprobe.exe"):
-    _found = _shutil.which(_bin.replace(".exe", "")) or _shutil.which(_bin)
+    _found = shutil.which(_bin.replace(".exe", "")) or shutil.which(_bin)
     if _found:
         datas_lines.append(f"    (r'{_found.replace(chr(92), '/')}', r'.'),")
         print(f"[build_spec] Bundling {_bin}: {_found}")
     else:
-        print(f"[build_spec] {_bin} not found in PATH — audio compression requires ffmpeg at runtime")
+        print(f"[build_spec] {_bin} not found in PATH — "
+              "audio compression requires ffmpeg at runtime")
 
 datas_block = "\n".join(datas_lines)
 
@@ -210,7 +218,9 @@ hidden_imports = [
     "keyring.backends",
     "keyring.backends.Windows",
     "sspilib",
-    "pyspnego",
+    # Nom de module, pas le nom de distribution PyPI (« pyspnego ») : sinon
+    # PyInstaller sort un ERROR « Hidden import not found » à chaque build.
+    "spnego",
     "lxml",
     "lxml.etree",
     "defusedxml",
@@ -307,7 +317,7 @@ pyinstaller_exe = os.path.join(VENV, "Scripts", "pyinstaller.exe")
 if not os.path.exists(pyinstaller_exe):
     pyinstaller_exe = "pyinstaller"   # fallback to PATH
 
-result = subprocess.run(
+result = subprocess.run(  # noqa: S603
     [pyinstaller_exe, "--clean", "--noconfirm",
      "--workpath", WORK_DIR,
      "--distpath", DIST_DIR_TMP,
@@ -321,9 +331,9 @@ if result.returncode == 0:
     dist_dir_final = os.path.join(SCRIPT_DIR, "dist", "MeetNote")
 
     # Arrêter MeetNote s'il tourne (sinon MeetNote.exe est verrouillé)
-    subprocess.run(["taskkill", "/F", "/IM", "MeetNote.exe"],
+    subprocess.run(["taskkill", "/F", "/IM", "MeetNote.exe"],  # noqa: S607
                    capture_output=True)
-    import time as _time; _time.sleep(1)
+    time.sleep(1)
 
     print(f"[build_spec] Copying output to {dist_dir_final} ...")
     _shutil_final.copytree(os.path.join(DIST_DIR_TMP, "MeetNote"), dist_dir_final,
@@ -348,12 +358,13 @@ if result.returncode == 0:
             else:
                 print(f"[build_spec] Model '{mname}' already present — skipping copy.")
         else:
-            print(f"[build_spec] Model '{mname}' not in HF cache — will be downloaded on first use.")
+            print(f"[build_spec] Model '{mname}' not in HF cache — "
+                  "will be downloaded on first use.")
 
     # Report size
     total = 0
     count = 0
-    for root, dirs, files in os.walk(dist_dir):
+    for root, _dirs, files in os.walk(dist_dir):
         for f in files:
             total += os.path.getsize(os.path.join(root, f))
             count += 1
