@@ -12,6 +12,7 @@ dist/
 build/
 
 # Audio temp files
+/tmp/
 pc/tmp/
 pwa/tmp/
 
