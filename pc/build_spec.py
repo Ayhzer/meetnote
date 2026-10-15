@@ -177,6 +177,7 @@ hidden_imports = [
     "notion_push",
     "config",
     "user_config",
+    "perf_profile",
     "history",
     "outlook_cal",
     "outlook_mail",

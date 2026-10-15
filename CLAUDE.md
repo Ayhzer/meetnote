@@ -40,6 +40,7 @@ Two independent frontends share a Notion database as the backend:
 - `teams_roster.py` — Reads Teams log files to extract participant names. `TeamsRosterWatcher` polls every 15s during recording.
 - `outlook_mail.py` — Outlook mail reading (for attachments feature).
 - `whisper_local.py` — Standalone Whisper helper (used outside the tray context).
+- `perf_profile.py` — Decides how much of the machine transcription may use: `(streams, threads)` from cores, free RAM, AC/battery, CPU load, recording in progress. Unit tests in `test_perf_profile.py`; `test_transcription_parallele.py` is the slow integration test proving parallel output matches serial.
 
 **PWA (`pwa/`)** — Installable web app (no build step):
 - `app.js` — Main application logic
@@ -57,7 +58,7 @@ Jobs flow through these states: `queued → running → done / error` for each o
 
 Pipeline steps in order:
 1. Archive audio: WAV → Opus 24 kbps via ffmpeg (fallback: copy as WAV) → `Documents/MeetNote/audio/`
-2. Transcribe: faster-whisper (CPU, int8). Splits audio at 10-min segments. Applies MFCC+DBSCAN diarization (no external deps) with H/F gender detection via pitch F0.
+2. Transcribe: faster-whisper (CPU, int8). Splits audio at 10-min segments, transcribed **in parallel** when the machine allows — `perf_profile.py` decides `(streams, threads)` from physical cores, free RAM, AC/battery, CPU load and whether a recording is running. Measured on 8 cores: 2 streams × 4 threads = 26 % faster than serial; raising `cpu_threads` alone gains nothing (Whisper decoding is autoregressive). User setting in Settings → Général. Applies MFCC+DBSCAN diarization (no external deps) with H/F gender detection via pitch F0.
 3. Save transcript: `Documents/MeetNote/transcripts/transcript_YYYYMMDD_HHMMSS.txt`
 4. Push to Notion (or save to file if output_mode = "fichier")
 
@@ -94,3 +95,6 @@ EWS credentials (password) are stored in the Windows Credential Manager via `key
 ## Notion database schema
 
 The target database needs these exact property names: `Titre` (title), `Date` (date), `Participants` (select), `Source` (select: PC/Mobile/Agenda), `Statut` (select: À traiter/Traité), `Type` (select), `Durée (min)` (number), `Modèle Whisper` (select).
+
+# Regles de developpement (kit unique)
+@.claude/regles/regles-dev.md

@@ -9,6 +9,8 @@ import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config
+import perf_profile
+import user_config
 
 _model = None
 
@@ -96,10 +98,16 @@ def _get_model():
 
     from faster_whisper import WhisperModel
 
+    # Même calibrage que la tray : le nombre de threads d'un flux isolé ne fait
+    # quasiment rien, mais un poste bridé à 4 threads par défaut reste sous-employé.
+    profil = perf_profile.choisir(user_config.get("perf_profile", "auto"))
+    opts = {"device": "cpu", "compute_type": "int8",
+            "cpu_threads": profil.threads, "num_workers": profil.fils}
+
     # 1. Modèle bundlé (build complet)
     local = _model_path(config.WHISPER_MODEL)
     if local:
-        _model = WhisperModel(local, device="cpu", compute_type="int8")
+        _model = WhisperModel(local, **opts)
         return _model
 
     # 2. Cache HuggingFace déjà présent ?
@@ -108,12 +116,12 @@ def _get_model():
         f"models--Systran--faster-whisper-{config.WHISPER_MODEL}",
     )
     if os.path.isdir(hf_cache):
-        _model = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
+        _model = WhisperModel(config.WHISPER_MODEL, **opts)
         return _model
 
     # 3. Téléchargement avec fenêtre progress
     _download_with_progress(config.WHISPER_MODEL)
-    _model = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
+    _model = WhisperModel(config.WHISPER_MODEL, **opts)
     return _model
 
 

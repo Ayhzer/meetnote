@@ -67,7 +67,7 @@ hidden_imports = [
     "tkinter", "tkinter.ttk",
     "huggingface_hub", "huggingface_hub.file_download",
     "numpy", "av", "onnxruntime", "onnxruntime.capi", "cffi",
-    "notion_push", "config", "user_config", "history", "outlook_cal",
+    "notion_push", "config", "user_config", "perf_profile", "history", "outlook_cal",
     "teams_roster", "soundfile", "_soundfile",
     "wave", "glob", "json", "collections", "dataclasses", "shutil",
     "scipy", "scipy.signal", "noisereduce",

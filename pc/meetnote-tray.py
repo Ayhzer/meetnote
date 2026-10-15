@@ -29,6 +29,7 @@ import dataclasses
 sys.path.insert(0, os.path.dirname(__file__))
 import config
 import user_config
+import perf_profile
 import history as hist_mod
 import outlook_cal
 import calendar_digest
@@ -1244,7 +1245,18 @@ def _do_step_transcribe(job: _Job) -> bool:
 
         language = None if job.language == "auto" else job.language
 
-        if _whisper_model is None or _whisper_model_name != job.model_name:
+        # Calibrage sur les capacités du poste : le gain vient du nombre de segments
+        # traités de front, pas du nombre de threads d'un segment isolé (cf. perf_profile).
+        profil = perf_profile.choisir(
+            user_config.get("perf_profile", "auto"),
+            enregistrement_en_cours=_recording,
+            sur_batterie=_is_on_battery(),
+        )
+
+        # Le profil fait partie de la clé de cache : un modèle chargé en mode économe
+        # resterait bridé pour tous les jobs suivants s'il était réutilisé tel quel.
+        cle_modele = (job.model_name, profil.fils, profil.threads)
+        if _whisper_model is None or _whisper_model_name != cle_modele:
             _set_progress(5)
             _set_status(f"Chargement modèle {job.model_name}…")
             if getattr(sys, "frozen", False):
@@ -1263,13 +1275,21 @@ def _do_step_transcribe(job: _Job) -> bool:
                     model_path = job.model_name   # nom symbolique → DL auto
             else:
                 model_path = job.model_name
-            _whisper_model      = WhisperModel(model_path, device="cpu", compute_type="int8")
-            _whisper_model_name = job.model_name
+            _whisper_model      = WhisperModel(
+                model_path, device="cpu", compute_type="int8",
+                cpu_threads=profil.threads, num_workers=profil.fils,
+            )
+            _whisper_model_name = cle_modele
+            _log_error(f"[{job.id}] Transcription calibrée : {profil.resume}")
+
+        # Référence figée : un changement de réglage pendant la transcription remet
+        # _whisper_model à None, les fils en vol ne doivent pas le voir disparaitre.
+        modele = _whisper_model
 
         _set_progress(20)
 
         if language is None:
-            _, detect_info = _whisper_model.transcribe(path, language=None, beam_size=1,
+            _, detect_info = modele.transcribe(path, language=None, beam_size=1,
                                                         vad_filter=True, temperature=0,
                                                         max_new_tokens=1)
             detected = detect_info.language
@@ -1289,22 +1309,20 @@ def _do_step_transcribe(job: _Job) -> bool:
         raw_segments = []   # list of (start_abs, end_abs, text)
         all_lines    = []
 
-        for i, seg_path in enumerate(seg_paths):
-            if _worker_cancel_event.is_set():
-                for remaining in seg_paths[i:]:
-                    if remaining != path:
-                        try: os.remove(remaining)
-                        except OSError: pass
-                job.status_transcript = "queued"
-                job.error_msg = ""
-                hist_mod.update(job)
-                _set_status("Transcription annulée.")
-                _set_progress(0)
-                return False
-            if n_segs > 1:
-                _set_status(f"Transcription segment {i+1}/{n_segs} [{lang_label}]…")
-            seg_segments, seg_info = _whisper_model.transcribe(
-                seg_path,
+        # Les segments sont transcrits de front quand le profil l'autorise, mais leurs
+        # résultats sont réassemblés dans l'ordre du fichier : les timestamps absolus
+        # et la diarisation qui suit en dépendent.
+        n_fils      = max(1, min(profil.fils, n_segs))
+        par_segment = [[] for _ in seg_paths]   # résultats indexés, jamais concaténés
+        avancement  = [0.0] * n_segs            # fraction traitée de chaque segment
+        a_traiter   = collections.deque(range(n_segs))
+        verrou      = threading.Lock()
+        echecs      = []
+
+        def _transcrire_segment(i: int):
+            """Transcrit le segment i et range son résultat à l'indice i."""
+            seg_segments, seg_info = modele.transcribe(
+                seg_paths[i],
                 language=detected,
                 task=task,
                 beam_size=5,
@@ -1316,16 +1334,70 @@ def _do_step_transcribe(job: _Job) -> bool:
             )
             seg_total   = max(seg_info.duration, 1)
             time_offset = i * config.TRANSCRIPTION_SEGMENT_MIN * 60
+            trouves     = []
             for seg in seg_segments:
+                if _worker_cancel_event.is_set():
+                    return
                 text = seg.text.strip()
                 if not text:
                     continue
-                raw_segments.append((seg.start + time_offset, seg.end + time_offset, text))
-                frac = seg.end / seg_total / n_segs
-                _set_progress(min(20 + int((i / n_segs + frac) * 55), 75))
-            if seg_path != path:
-                try: os.remove(seg_path)
+                trouves.append((seg.start + time_offset, seg.end + time_offset, text))
+                with verrou:
+                    avancement[i] = min(seg.end / seg_total, 1.0)
+                    total = sum(avancement) / n_segs
+                _set_progress(min(20 + int(total * 55), 75))
+            par_segment[i] = trouves
+            with verrou:
+                avancement[i] = 1.0
+                finis = sum(1 for a in avancement if a >= 1.0)
+            if n_segs > 1:
+                _set_status(f"Transcription segment {finis}/{n_segs} [{lang_label}]…")
+
+        def _ouvrier():
+            """Prend les segments restants un à un jusqu'à épuisement ou annulation."""
+            while not _worker_cancel_event.is_set():
+                with verrou:
+                    if not a_traiter:
+                        return
+                    i = a_traiter.popleft()
+                try:
+                    _transcrire_segment(i)
+                except Exception as exc:      # remontée au fil principal après jonction
+                    with verrou:
+                        echecs.append(exc)
+                    return
+                if seg_paths[i] != path:
+                    try: os.remove(seg_paths[i])
+                    except OSError: pass
+
+        if n_segs > 1:
+            _set_status(f"Transcription de {n_segs} segments [{lang_label}]…")
+        fils = [threading.Thread(target=_ouvrier, daemon=True) for _ in range(n_fils)]
+        for f in fils:
+            f.start()
+        for f in fils:
+            f.join()
+
+        # Tous les fils sont joints : ce qui subsiste est un segment jamais traité
+        # (annulation) ou abandonné en vol (échec d'un fil).
+        for remaining in seg_paths:
+            if remaining != path and os.path.isfile(remaining):
+                try: os.remove(remaining)
                 except OSError: pass
+
+        if echecs:
+            raise echecs[0]
+
+        if _worker_cancel_event.is_set():
+            job.status_transcript = "queued"
+            job.error_msg = ""
+            hist_mod.update(job)
+            _set_status("Transcription annulée.")
+            _set_progress(0)
+            return False
+
+        for trouves in par_segment:
+            raw_segments.extend(trouves)
 
         # ── Diarisation (resemblyzer + DBSCAN) ────────────────────────────────
         speaker_map = _diarize(path, raw_segments)  # {idx: "SPKR_X (H/F)"} ou {}
@@ -4537,6 +4609,43 @@ def _open_settings():
     tk.Label(tab_g,
              text="Note : le transcript est TOUJOURS sauvegardé en local,\nmême en mode Notion.",
              font=("Segoe UI", 8), bg=S_CARD, fg="#00cc66").pack(anchor="w", pady=(8, 0))
+
+    # ── Puissance allouée à la transcription
+    tk.Frame(tab_g, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))
+    tk.Label(tab_g, text="Puissance de transcription",
+             font=("Segoe UI", 10, "bold"), bg=S_CARD, fg=FG).pack(anchor="w", pady=(10, 4))
+
+    perf_frame = tk.Frame(tab_g, bg=S_HIGH)
+    perf_frame.pack(fill="x")
+
+    perf_var = tk.StringVar(value=user_config.get("perf_profile", "auto"))
+
+    def _sauver_perf():
+        """Enregistre le profil ; il sera pris au chargement du prochain modèle."""
+        global _whisper_model, _whisper_model_name
+        user_config.save({"perf_profile": perf_var.get()})
+        # Le modèle en cache porte les threads de l'ancien profil : le relâcher force
+        # un rechargement calibré au prochain job, sans quoi le réglage resterait lettre morte.
+        _whisper_model      = None
+        _whisper_model_name = None
+        perf_status_lbl.config(
+            text=f"✓ {perf_profile.choisir(perf_var.get()).resume}", fg="#00cc66")
+
+    for nom in perf_profile.PROFILS:
+        tk.Radiobutton(
+            perf_frame, text=f"  {perf_profile.LIBELLES[nom]}",
+            variable=perf_var, value=nom, command=_sauver_perf,
+            font=("Segoe UI", 9), bg=S_HIGH, fg=FG, selectcolor=S_HIGH,
+            activebackground=S_HIGH, activeforeground=FG, relief="flat", cursor="hand2",
+        ).pack(anchor="w", padx=10, pady=(6, 0))
+    tk.Frame(perf_frame, bg=S_HIGH, height=6).pack(fill="x")
+
+    tk.Label(tab_g, text=perf_profile.description_poste(),
+             font=("Segoe UI", 8), bg=S_CARD, fg=FG2, wraplength=360,
+             justify="left").pack(anchor="w", pady=(4, 0))
+    perf_status_lbl = tk.Label(tab_g, text="", font=("Segoe UI", 8),
+                               bg=S_CARD, fg=FG3, wraplength=360)
+    perf_status_lbl.pack(anchor="w")
 
     # ── Démarrage avec Windows
     tk.Frame(tab_g, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))

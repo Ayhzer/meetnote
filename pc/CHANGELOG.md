@@ -1,5 +1,24 @@
 # MeetNote PC — Changelog
 
+## [Non publié]
+
+### Performance
+- **Transcription calibrée sur le poste** : les segments de 10 min sont désormais transcrits
+  en parallèle quand la machine peut le tenir, au lieu d'être traités un par un. Mesuré sur
+  un Core Ultra 7 268V (8 cœurs), modèle `medium`, 18 min d'audio : **669 s contre 899 s,
+  soit 26 % de temps en moins**. Le nombre de flux et de threads vient de `perf_profile.py`.
+- Ce n'est **pas** le nombre de threads qui débride la transcription : le décodage Whisper
+  est autorégressif et ne se parallélise quasiment pas au sein d'un segment (4, 6 et 8
+  threads tiennent en 12 % l'un de l'autre, 8 étant même moins bon que 6 sur un CPU à cœurs
+  asymétriques). Le gain vient de traiter plusieurs segments de front.
+- **Réglage Settings → Général → Puissance de transcription** : Auto (défaut, s'adapte à la
+  charge), Rapide, Économe. L'automatique retombe à un seul flux pendant un enregistrement,
+  sur batterie, ou quand le poste est déjà sollicité.
+- Un poste de 4 cœurs ou disposant de moins de 1 Go libre par flux garde le comportement
+  précédent — un seul flux.
+
+---
+
 ## [3.2] — 2026-05-18
 
 ### Nouvelles fonctionnalités
