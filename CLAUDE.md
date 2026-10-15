@@ -22,7 +22,7 @@ cd pc
 py -3.12 build_spec.py    # Generates meetnote.spec, runs PyInstaller, signs EXE
 ```
 
-Output lands in `pc\dist\MeetNote\`. The build script also copies Whisper models from the HF cache (`~/.cache/huggingface/hub/`) into the bundle. The `build_spec_slim.py` variant omits some models for a smaller build.
+Output lands in `pc\dist\MeetNote-<VERSION>\` (version from `pc/version.py`, also embedded in the exe's Properties → Details via `build_version.py`). The build script also copies Whisper models from the HF cache (`~/.cache/huggingface/hub/`) into the bundle. The `build_spec_slim.py` variant omits some models for a smaller build.
 
 ## Architecture
 

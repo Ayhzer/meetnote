@@ -26,3 +26,9 @@ def resolve_site_packages(python_home: str | None = None) -> str:
     """Retourne le dossier site-packages de la racine Python donnée (ou résolue)."""
     home = python_home if python_home is not None else resolve_python_home()
     return os.path.join(home, "Lib", "site-packages")
+
+
+def dist_dir_name(version: str, slim: bool = False) -> str:
+    """Nom du dossier livré : `MeetNote-<version>` (ou `MeetNote-slim-<version>`)."""
+    base = "MeetNote-slim" if slim else "MeetNote"
+    return f"{base}-{version.strip()}"
