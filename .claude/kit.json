@@ -1,0 +1,30 @@
+{
+  "kit": {
+    "version": "4.2.0",
+    "empreinte": "sha256:f4a4dc146318e93e",
+    "source": "C:\\DEV\\claude-kit\\devsecops-pipeline",
+    "installe_le": "2026-08-30"
+  },
+  "projet": {
+    "nom": "meetnote",
+    "stacks": [
+      "python"
+    ]
+  },
+  "perimetre": {
+    "niveau": "P0",
+    "declare_le": "2026-08-01",
+    "justification": "",
+    "cible": "P0",
+    "cible_prevue_le": null
+  },
+  "donnees": {
+    "sante": null,
+    "personnelles": null,
+    "categorie_particuliere": null
+  },
+  "portes": {
+    "lint": "ruff check .",
+    "test": "python -m unittest discover -s pc -p \"test_*.py\""
+  }
+}

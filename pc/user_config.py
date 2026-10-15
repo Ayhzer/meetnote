@@ -2,8 +2,8 @@
 user_config.py - Persistance des parametres utilisateur dans %APPDATA%/MeetNote/settings.json
 Fonctionne aussi bien en mode developpement qu'en bundle PyInstaller (sys._MEIPASS read-only).
 """
-import os
 import json
+import os
 
 _APPDATA  = os.environ.get("APPDATA", os.path.expanduser("~"))
 _DIR      = os.path.join(_APPDATA, "MeetNote")

@@ -2,10 +2,10 @@
 Persistance JSON de l'historique des jobs MeetNote.
 Stocké dans %APPDATA%/MeetNote/history.json (100 entrées max).
 """
-import os
-import json
-import datetime
 import dataclasses
+import datetime
+import json
+import os
 
 HISTORY_PATH = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
                              "MeetNote", "history.json")

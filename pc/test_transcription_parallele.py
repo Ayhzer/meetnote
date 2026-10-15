@@ -17,12 +17,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 import wave
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 DUREE_EXTRAIT_S = 180
 DECOUPE_MIN = 1          # segments d'une minute : 3 segments sur l'extrait
+VARIABLE_TEST_LENT = "MEETNOTE_TEST_LENT"
 
 
 def _charger_tray():
@@ -95,8 +97,8 @@ def _transcrire(tray, wav: str, fils: int) -> str:
         tray.hist_mod.update = maj_origine
 
 
-def main() -> int:
-    source = sys.argv[1] if len(sys.argv) > 1 else None
+def main(source: str | None = None) -> int:
+    """Rejoue le test ; `source` : fichier audio, sinon le dernier enregistrement."""
     if source is None:
         dossier = os.path.join(os.path.expanduser("~"), "Documents",
                                "MeetNote", "audio")
@@ -147,5 +149,13 @@ def main() -> int:
     return 0
 
 
+@unittest.skipUnless(
+    os.environ.get(VARIABLE_TEST_LENT) == "1",
+    f"test d'integration lent (modele Whisper + ffmpeg) : definir {VARIABLE_TEST_LENT}=1")
+class TestTranscriptionParallele(unittest.TestCase):
+    def test_parallele_identique_a_serie(self):
+        self.assertEqual(main(), 0)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else None))

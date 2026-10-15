@@ -13,6 +13,8 @@ import subprocess
 import sys
 import time
 
+from build_paths import resolve_python_home, resolve_site_packages
+
 # ─── Signature numérique ─────────────────────────────────────────────────────
 # Certificat auto-signé MeetNote, installé dans CurrentUser\My + TrustedPublisher.
 # Créé une seule fois via New-SelfSignedCertificate (voir setup_codesign.ps1).
@@ -41,8 +43,8 @@ if ($r.Status -ne 'Valid') {{
 Write-Host ("[build_spec] EXE signe: " + $r.Status + " — " + $cert.Thumbprint)
 """
     # Commande construite ici, sans entrée externe : S603/S607 non pertinents.
-    r = subprocess.run(  # noqa: S603
-        ["powershell", "-NonInteractive", "-Command", ps],  # noqa: S607
+    r = subprocess.run(
+        ["powershell", "-NonInteractive", "-Command", ps],
         capture_output=True, text=True, timeout=30,
     )
     print(r.stdout.strip())
@@ -53,9 +55,8 @@ Write-Host ("[build_spec] EXE signe: " + $r.Status + " — " + $cert.Thumbprint)
 # ─── Paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 HF_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
-_PY312      = r"C:\Users\apottier\AppData\Local\Programs\Python\Python312"
-VENV        = _PY312
-SITE_PKG    = os.path.join(_PY312, "Lib", "site-packages")
+VENV        = resolve_python_home()
+SITE_PKG    = resolve_site_packages(VENV)
 
 # ─── Discover faster-whisper model snapshots ─────────────────────────────────
 # large-v3 (3 Go) exclu par défaut
@@ -178,6 +179,7 @@ hidden_imports = [
     "config",
     "user_config",
     "perf_profile",
+    "version",
     "history",
     "outlook_cal",
     "outlook_mail",
@@ -318,7 +320,7 @@ pyinstaller_exe = os.path.join(VENV, "Scripts", "pyinstaller.exe")
 if not os.path.exists(pyinstaller_exe):
     pyinstaller_exe = "pyinstaller"   # fallback to PATH
 
-result = subprocess.run(  # noqa: S603
+result = subprocess.run(
     [pyinstaller_exe, "--clean", "--noconfirm",
      "--workpath", WORK_DIR,
      "--distpath", DIST_DIR_TMP,
@@ -332,7 +334,7 @@ if result.returncode == 0:
     dist_dir_final = os.path.join(SCRIPT_DIR, "dist", "MeetNote")
 
     # Arrêter MeetNote s'il tourne (sinon MeetNote.exe est verrouillé)
-    subprocess.run(["taskkill", "/F", "/IM", "MeetNote.exe"],  # noqa: S607
+    subprocess.run(["taskkill", "/F", "/IM", "MeetNote.exe"],
                    capture_output=True)
     time.sleep(1)
 

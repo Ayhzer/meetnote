@@ -8,14 +8,11 @@ Aucune dépendance externe, aucune API Graph nécessaire.
 Fonctionne avec Microsoft Teams Classic et Teams New (MSAL-based).
 """
 
+import datetime
+import glob
 import os
 import re
-import glob
-import json
-import datetime
 import threading
-import time
-
 
 # ─── Chemins connus des logs Teams ────────────────────────────────────────────
 _TEAMS_LOG_PATTERNS = [
@@ -69,7 +66,6 @@ def _extract_names_from_log(log_path: str, since: datetime.datetime) -> list[str
     trouvés dans les lignes liées aux événements participants.
     """
     names: set[str] = set()
-    since_ts = since.timestamp()
 
     try:
         # Lire les dernières lignes (log peut être volumineux)

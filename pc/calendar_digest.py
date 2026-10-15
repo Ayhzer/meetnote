@@ -7,14 +7,13 @@ Fonctions publiques :
   run_digest(days=15)  → construit le transcript, le pousse vers Notion, retourne l'URL.
   build_transcript(events, days)  → retourne uniquement le texte formaté (pour tests/debug).
 """
-import sys
-import os
 import datetime
 import json
 import logging
+import os
+import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-import config
 import outlook_cal
 from notion_push import push_to_notion
 

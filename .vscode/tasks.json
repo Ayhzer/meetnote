@@ -1,0 +1,209 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Kit : portes de qualite",
+      "detail": "lint + test + build. Une porte non jouee n'est PAS une porte verte.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/kit.py",
+        "portes",
+        "--jouer"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": [
+        "$eslint-stylish"
+      ]
+    },
+    {
+      "label": "Kit : diagnostic",
+      "detail": "Ce qui a derive : version du kit, hooks, permissions, perimetre, backlog.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/kit.py",
+        "doctor"
+      ],
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : sante de tous les projets",
+      "detail": "Balayage de C:\\DEV : derive du kit, hooks, permissions, perimetre, backlogs. Remplace la routine Cowork hebdomadaire, desarmee le 2026-07-31.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/kit.py",
+        "doctor",
+        "--tous",
+        "--racine",
+        "C:\\DEV"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : tests du kit",
+      "detail": "La suite du kit lui-meme. A jouer apres toute modification de claude-kit.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests"
+      ],
+      "options": {
+        "cwd": "C:\\DEV\\claude-kit"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : mesurer les couts",
+      "detail": "Une seule ligne a lire : « contexte relu par appel ». Sous 60 k bon, au-dela de 120 k les agents relisent tout.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/scripts/mesurer-couts.py",
+        "--projet",
+        "${workspaceFolderBasename}"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : point de restauration",
+      "detail": "AVANT toute modification non triviale. Ces projets ne sont pas des depots git.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/kit.py",
+        "point",
+        "${input:libellePoint}"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : perimetre",
+      "detail": "Niveau declare, niveau que le code impose, et les preuves.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/kit.py",
+        "perimetre"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : tableau de bord",
+      "detail": "Qui ecrit reellement. S'ouvre deja seul a chaque /avancer.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/scripts/tableau-bord.py",
+        "--detache"
+      ],
+      "presentation": {
+        "reveal": "never",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : arreter la boucle",
+      "detail": "Arrete le superviseur PUIS les boucles — l'ordre inverse ne sert a rien.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/scripts/arreter-boucle.py",
+        "--projet",
+        "${workspaceFolder}"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : installer / mettre a jour",
+      "detail": "Idempotent. Repare hooks, permissions et fichiers derives.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/kit.py",
+        "installer"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kit : installer les outils",
+      "detail": "eslint / vitest / ruff / pytest, aux versions du verrou.",
+      "type": "shell",
+      "command": "python",
+      "args": [
+        ".claude/kit.py",
+        "outils",
+        "--installer"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "libellePoint",
+      "type": "promptString",
+      "description": "A quoi sert ce point de restauration (trois mots) ?",
+      "default": "debut de seance"
+    }
+  ]
+}

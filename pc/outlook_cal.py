@@ -27,8 +27,8 @@ def _to_naive_local(dt) -> datetime.datetime:
 def _get_ews_credentials():
     """Retourne (email, username, password, ews_url) depuis user_config + keyring, ou (None,…)."""
     try:
-        import user_config
         import keyring
+        import user_config
         email    = user_config.get("ews_email", "")
         username = user_config.get("ews_username", "")
         ews_url  = user_config.get("ews_url", "")

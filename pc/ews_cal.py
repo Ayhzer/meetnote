@@ -10,7 +10,11 @@ log = logging.getLogger(__name__)
 
 try:
     from exchangelib import (
-        Credentials, Account, Configuration, DELEGATE, NTLM,
+        DELEGATE,
+        NTLM,
+        Account,
+        Configuration,
+        Credentials,
         EWSDateTime,
     )
     _AVAILABLE = True

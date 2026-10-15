@@ -1,0 +1,8 @@
+{
+  "//": "Recommandations, pas des exigences : VS Code les propose a l'ouverture. Volontairement courte — une liste longue se fait ignorer en bloc.",
+  "recommendations": [
+    "dbaeumer.vscode-eslint",
+    "charliermarsh.ruff",
+    "tamasfe.even-better-toml"
+  ]
+}

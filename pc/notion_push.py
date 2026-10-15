@@ -2,11 +2,12 @@
 Pousse le transcript + l'enregistrement audio dans Notion.
 Upload audio : wav -> opus (via ffmpeg) -> POST /v1/file_uploads -> attach a la page.
 """
-import sys
-import os
 import datetime
+import os
 import subprocess
+import sys
 import tempfile
+
 import requests
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -226,8 +227,8 @@ def _split_audio_for_upload(opus_path: str, segment_min: int = 10) -> list:
     Retourne la liste des chemins de segments.
     Si le fichier est assez court, retourne [opus_path] sans modification.
     """
-    import json as _json
     import glob as _glob
+    import json as _json
 
     ffmpeg  = _find_ffmpeg()
     ffprobe = _find_ffprobe()

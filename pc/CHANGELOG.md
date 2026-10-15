@@ -1,6 +1,10 @@
 # MeetNote PC — Changelog
 
-## [Non publié]
+## [3.3.0] — 2026-10-15
+
+### Interface
+- Numéro de version affiché dans la fenêtre « À propos », tiré d'une source unique
+  (`version.py`, aussi lue par `build_spec.py`).
 
 ### Performance
 - **Transcription calibrée sur le poste** : les segments de 10 min sont désormais transcrits

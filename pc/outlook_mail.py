@@ -21,7 +21,9 @@ try:
 except ImportError:
     _COM_AVAILABLE = False
 
-import os as _os, datetime as _dt
+import datetime as _dt
+import os as _os
+
 
 def _dbg(msg: str):
     """Log de debug dans un fichier temporaire."""
@@ -95,7 +97,8 @@ def _save_attachments(item) -> list[str]:
     Retourne la liste des chemins sauvegardés.
     Ignore les images inline (Content-ID présent, taille < 50 ko).
     """
-    import tempfile, os
+    import os
+    import tempfile
     saved = []
     try:
         atts = item.Attachments
@@ -161,16 +164,16 @@ def _scan_folder(folder, results: list, max_results: int, depth: int = 0):
                 _dbg(f"  item: class={cls} cats='{cats}' subj='{subj[:40]}'")
                 # Filtrer sur la classe (43 = MailItem)
                 if item.Class != 43:
-                    _dbg(f"  → ignoré (class != 43)")
+                    _dbg("  → ignoré (class != 43)")
                     continue
 
                 if CATEGORY_NAME.lower() not in cats.lower():
                     _dbg(f"  → ignoré (catégorie '{cats}' ne contient pas '{CATEGORY_NAME}')")
                     continue
 
-                _dbg(f"  → save_attachments...")
+                _dbg("  → save_attachments...")
                 attachments = _save_attachments(item)
-                _dbg(f"  → append result...")
+                _dbg("  → append result...")
                 results.append({
                     "entry_id":    str(item.EntryID),
                     "subject":     str(item.Subject or "").strip(),
@@ -179,7 +182,7 @@ def _scan_folder(folder, results: list, max_results: int, depth: int = 0):
                     "body":        str(item.Body or "").strip(),
                     "attachments": attachments,
                 })
-                _dbg(f"  → ajouté OK")
+                _dbg("  → ajouté OK")
             except Exception as e:
                 _dbg(f"  → EXCEPTION item skip: {e}")
                 log.debug("outlook_mail: item skip (%s)", e)

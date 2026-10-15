@@ -5,9 +5,9 @@ Output : dist/MeetNote-slim  (~300-400 MB au lieu de 3.2 GB)
 """
 
 import os
-import sys
-import subprocess
 import shutil as _shutil
+import subprocess
+import sys
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -67,7 +67,7 @@ hidden_imports = [
     "tkinter", "tkinter.ttk",
     "huggingface_hub", "huggingface_hub.file_download",
     "numpy", "av", "onnxruntime", "onnxruntime.capi", "cffi",
-    "notion_push", "config", "user_config", "perf_profile", "history", "outlook_cal",
+    "notion_push", "config", "user_config", "perf_profile", "version", "history", "outlook_cal",
     "teams_roster", "soundfile", "_soundfile",
     "wave", "glob", "json", "collections", "dataclasses", "shutil",
     "scipy", "scipy.signal", "noisereduce",
@@ -181,6 +181,7 @@ print(f"[build_slim] {count} files, {total / 1024 / 1024:.1f} MB")
 zip_path = os.path.join(SCRIPT_DIR, "dist", "MeetNote-slim")
 print(f"[build_slim] Creating zip {zip_path}.zip ...")
 import shutil as _shutil2
+
 _shutil2.make_archive(zip_path, "zip", os.path.join(SCRIPT_DIR, "dist"), DIST_NAME)
 zip_size = os.path.getsize(zip_path + ".zip") / 1024 / 1024
 print(f"[build_slim] Zip ready: {zip_path}.zip ({zip_size:.1f} MB)")

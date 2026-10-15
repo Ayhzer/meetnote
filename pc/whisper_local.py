@@ -3,8 +3,8 @@ Transcription locale avec faster-whisper.
 Si le modèle n'est pas présent localement, il est téléchargé automatiquement
 depuis HuggingFace avec une fenêtre de progression Tkinter.
 """
-import sys
 import os
+import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -128,7 +128,7 @@ def _get_model():
 def transcribe_file(audio_path: str) -> str:
     """Transcrit un fichier WAV et retourne le texte complet."""
     model = _get_model()
-    segments, info = model.transcribe(
+    segments, _ = model.transcribe(
         audio_path,
         language=config.WHISPER_LANGUAGE,
         beam_size=5,

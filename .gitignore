@@ -29,3 +29,14 @@ Thumbs.db
 
 # VSCode
 .vscode/settings.json
+
+# Kit Claude Code : seule la configuration du projet est versionnée,
+# le reste (scripts réinstallables, points de restauration, journaux) reste local
+.claude/*
+!.claude/kit.json
+!.claude/settings.json
+_archive-kit-*/
+.ruff_cache/
+
+# Généré par build_spec.py (contient des chemins propres au poste de build)
+pc/meetnote.spec

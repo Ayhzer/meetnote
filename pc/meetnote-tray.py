@@ -5,36 +5,33 @@ MeetNote Tray — icône systray Windows + fenêtre tkinter
 - Étapes séparées et relançables : audio → transcription → notion
 - Intégration Outlook via win32com (lecture du calendrier)
 """
-import sys
-import os
-import threading
+import atexit
 import collections
-import queue
 import ctypes
+import dataclasses
+import datetime
+import os
+import queue
+import shutil
+import struct
 import subprocess
+import sys
+import threading
 import tkinter as tk
+import wave
 from tkinter import ttk
+
+# Ordre d'import volontaire : sounddevice avant soundcard (initialisation PortAudio/COM), ne pas trier.
+# isort: off
 import pystray
 from PIL import Image, ImageDraw
 import sounddevice as sd
 import soundcard as sc
 import numpy as np
-import wave
-import struct
-import atexit
-import datetime
-import shutil
-import dataclasses
+# isort: on
 
 sys.path.insert(0, os.path.dirname(__file__))
-import config
-import user_config
-import perf_profile
-import history as hist_mod
-import outlook_cal
-import calendar_digest
-from notion_push import push_to_notion
-import teams_roster
+import faulthandler
 
 # ─── Logging de crash persistant ──────────────────────────────────────────────
 # L'app ne loguait rien dans un fichier : un plantage (exception non catchée,
@@ -44,10 +41,19 @@ import teams_roster
 #   - les crashs natifs (faulthandler : segfault, access violation…)
 # Tout est écrit dans %APPDATA%/MeetNote/crash.log
 import logging
-import faulthandler
 import traceback
 
-_LOG_DIR  = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "MeetNote")
+import calendar_digest
+import config
+import history as hist_mod
+import outlook_cal
+import perf_profile
+import teams_roster
+import user_config
+from notion_push import push_to_notion
+from version import VERSION
+
+_LOG_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "MeetNote")
 _LOG_PATH = os.path.join(_LOG_DIR, "crash.log")
 
 try:
@@ -98,8 +104,6 @@ try:
     threading.excepthook = _thread_excepthook  # Python 3.8+
 except Exception:
     pass
-
-VERSION = "3.1"
 
 RELEASE_NOTES = """\
 ## [3.1] — 2026-05-04
@@ -192,6 +196,7 @@ _auto_start_exclusions = [
 # Synchronise les HEADERS de notion_push avec le token effectif (user_config
 # est chargé APRÈS l'import de notion_push, donc HEADERS aurait l'ancienne valeur)
 import notion_push as _np_mod
+
 _np_mod.HEADERS["Authorization"] = f"Bearer {config.NOTION_TOKEN}"
 
 # ─── Win32 sleep prevention ──────────────────────────────────────────────────
@@ -359,7 +364,7 @@ def _play_audio(job_id: str, wav_path: str):
             chunk = 1024
             idx = 0
             with sd_pb.OutputStream(samplerate=samplerate,
-                                    channels=data.ndim if data.ndim > 1 else 1) as stream:
+                                    channels=max(1, data.ndim)) as stream:
                 while idx < len(data) and not _playback_stop_event.is_set():
                     block = data[idx: idx + chunk]
                     stream.write(block)
@@ -444,8 +449,9 @@ def _resample(data: np.ndarray, src: int, dst: int) -> np.ndarray:
     if src == dst:
         return data
     try:
-        from scipy.signal import resample_poly
         from math import gcd
+
+        from scipy.signal import resample_poly
         g = gcd(src, dst)
         return resample_poly(data, dst // g, src // g).astype(np.float32)
     except Exception:
@@ -892,6 +898,7 @@ def _save_audio_to_tempfile() -> str | None:
 def _archive_audio(wav_path: str, start_time: datetime.datetime,
                    meeting_name: str = "") -> str | None:
     import re
+
     from notion_push import _find_ffmpeg
     try:
         os.makedirs(config.AUDIO_ARCHIVE_DIR, exist_ok=True)
@@ -1075,13 +1082,14 @@ def _diarize(audio_path: str, segments: list) -> dict:
     try:
         import warnings
         warnings.filterwarnings("ignore")
+        from math import gcd
+
         import numpy as np_d
         import soundfile as sf
-        from scipy.signal import resample_poly
         from scipy.fft import dct
+        from scipy.signal import resample_poly
         from sklearn.cluster import DBSCAN
         from sklearn.preprocessing import normalize
-        from math import gcd
 
         SR = 16000
 
@@ -1111,7 +1119,6 @@ def _diarize(audio_path: str, segments: list) -> dict:
             frames = frames * win
             # Spectre de puissance
             mag   = np_d.abs(np_d.fft.rfft(frames, n=n_fft)) ** 2
-            freqs = np_d.fft.rfftfreq(n_fft, d=1.0 / SR)
             # Banc de filtres mel
             f_min, f_max = 80.0, 7600.0
             mel_min  = 2595 * np_d.log10(1 + f_min / 700)
@@ -2390,7 +2397,7 @@ def _open_version_window():
     if not _root:
         return
     win = tk.Toplevel(_root)
-    win.title(f"MeetNote v{VERSION} — Release notes")
+    win.title(f"MeetNote v{VERSION} — À propos")
     win.configure(bg="#111125")
     win.resizable(True, True)
     win.geometry("580x500")
@@ -2589,8 +2596,6 @@ def _refresh_history_panel():
     FG      = "#e2e0fc"
     FG2     = "#e4beba"
     FG3     = "#ab8985"
-    GRN     = "#2e7d32"
-    DIM     = "#333355"
 
     # Badge couleurs (pilules)
     BADGE_OK    = ("#003909", "#88d982")   # (bg, fg)
@@ -2647,7 +2652,6 @@ def _refresh_history_panel():
         top_row.pack(fill="x", padx=10, pady=(8, 4))
 
         dt_str = job.start_time.strftime("%Y.%b.%d | %H:%M").upper()
-        title  = job.meeting_name or f"Meeting {job.start_time.strftime('%Y-%m-%d %H:%M')}"
         dur    = f"{job.duration_min:.0f} min"
 
         tk.Label(top_row, text=dt_str, font=("Consolas", 7),
@@ -2679,7 +2683,7 @@ def _refresh_history_panel():
                 hist_mod.update(_j)
 
         name_entry.bind("<FocusOut>", lambda e, _j=job, _v=name_var: _save_name(_j, _v))
-        name_entry.bind("<Return>",   lambda e, _j=job, _v=name_var: (_save_name(_j, _v), name_entry.master.focus_set()))
+        name_entry.bind("<Return>",   lambda e, _j=job, _v=name_var, _entry=name_entry: (_save_name(_j, _v), _entry.master.focus_set()))
 
         # ── Ligne badges statuts
         badges_row = tk.Frame(card, bg=S_CARD)
@@ -3039,12 +3043,6 @@ def _build_window():
     FG3     = "#ab8985"   # hints / labels
     RED     = "#dc3232"   # action critique
     RED_DIM = "#b81c1c"   # rouge foncé (bouton start)
-    GRN     = "#2e7d32"
-    PURPLE  = "#5533aa"
-    ERR     = "#ff4444"
-    BG2     = S_CARD      # alias pour compatibilité _open_settings
-    DIM     = "#333355"
-    P       = 12
 
     # ════════════════════════════════════════════════════════════
     # LAYOUT RACINE : nav gauche | contenu (header + body 2-col)
@@ -3534,7 +3532,6 @@ def _build_window():
             print(f"[{ts}] {msg}", file=sys.stderr)
 
     # Monkey-patch _log_error pour cette session
-    import builtins
     _root._log_fn = _log_with_tags
 
     # Message d'initialisation
@@ -3849,6 +3846,7 @@ def _import_outlook_mails():
     Après succès, chaque mail est déplacé dans le dossier "meetnote OK".
     """
     import tkinter.messagebox as mb
+
     import outlook_mail
 
     if not outlook_mail.is_available():
@@ -3874,7 +3872,6 @@ def _import_outlook_mails():
     DLG_BG3  = "#0f3460"
     DLG_FG   = "#e0e0e0"
     DLG_FG2  = "#888888"
-    DLG_ACC  = "#5599ff"
 
     tk.Label(dlg, text="📧  Mails catégorie « meetnote »",
              font=("Segoe UI", 11, "bold"), bg=DLG_BG, fg=DLG_FG).pack(pady=(14, 2))
@@ -4360,8 +4357,8 @@ def _open_settings():
         return _activate
 
     act_notion  = _make_tab("notion",  "  Notion  ")
-    act_general = _make_tab("general", "  Général  ")
-    act_outlook = _make_tab("outlook", "  Outlook  ")
+    _make_tab("general", "  Général  ")
+    _make_tab("outlook", "  Outlook  ")
     tk.Frame(win, bg=S_HIGH, height=1).pack(fill="x")
 
     # ── Tab : Notion
