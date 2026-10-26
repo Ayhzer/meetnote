@@ -107,6 +107,7 @@ hidden_imports = [
     "teams_roster",
     "watchdog",
     "demarrage_windows",
+    "recuperation_enregistrements",
     "soundfile",
     "_soundfile",
     "wave",

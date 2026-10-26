@@ -61,6 +61,7 @@ import history as hist_mod
 import journal_app
 import modeles
 import perf_profile
+import recuperation_enregistrements as recup_mod
 import source_agenda
 import teams_roster
 import user_config
@@ -5263,28 +5264,63 @@ _LOCK_FILE = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
 _STOP_FLAG = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
                           "MeetNote", "clean_exit.flag")
 
+def _terminer_ancienne_instance(psutil, old_pid):
+    """Termine le process `old_pid` seulement s'il est bien MeetNote.
+
+    Un PID recyclé par Windows pour un autre programme (autre python.exe,
+    boucle du kit…) n'est jamais touché ; en cas de doute (accès refusé,
+    process disparu), on ne tue rien.
+    """
+    try:
+        proc = psutil.Process(old_pid)
+        nom, ligne = proc.name(), proc.cmdline()
+        if not _watchdog.est_meetnote(nom, ligne):
+            _logger.info("PID %s (%s) n'est pas MeetNote : conservé", old_pid, nom)
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except psutil.TimeoutExpired:
+            proc.kill()
+    except psutil.NoSuchProcess:
+        pass  # déjà terminé : rien à faire
+    except psutil.AccessDenied:
+        _logger.warning("Accès refusé au PID %s : ancienne instance non arrêtée", old_pid)
+    except psutil.Error as exc:
+        _logger.warning("Arrêt de l'ancienne instance (PID %s) impossible : %s", old_pid, exc)
+
+
+# Un second lancement de l'EXE (menu Démarrer) ne tue pas l'instance en cours :
+# il dépose afficher.flag, que l'on consomme ici pour montrer la fenêtre.
+_AFFICHAGE_SONDAGE_MS = 1_000
+
+
+def _sonder_demande_affichage():
+    """Montre la fenêtre si un second lancement l'a demandé, puis se reprogramme."""
+    if _watchdog.consommer_demande_affichage():
+        _show_window()
+    if _root:
+        _root.after(_AFFICHAGE_SONDAGE_MS, _sonder_demande_affichage)
+
+
 def _acquire_single_instance():
-    """Tue toute instance précédente et écrit notre PID. Retourne True si OK."""
+    """Tue l'instance MeetNote précédente et écrit notre PID. Retourne True si OK."""
     import psutil
     os.makedirs(os.path.dirname(_LOCK_FILE), exist_ok=True)
     if os.path.isfile(_LOCK_FILE):
         try:
-            old_pid = int(open(_LOCK_FILE).read().strip())
+            with open(_LOCK_FILE) as f:
+                old_pid = int(f.read().strip())
+        except (OSError, ValueError) as exc:
+            _logger.warning("Fichier PID illisible (%s) : ignoré", exc)
+        else:
             # Jamais notre propre superviseur (EXE figé) : le tuer priverait
             # l'enfant de sa relance, et il porte lui aussi le nom MeetNote.exe.
-            if old_pid != os.getppid() and psutil.pid_exists(old_pid):
-                proc = psutil.Process(old_pid)
-                # Vérifier que c'est bien meetnote
-                if "python" in proc.name().lower() or "meetnote" in proc.name().lower():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except psutil.TimeoutExpired:
-                        proc.kill()
-        except Exception:
-            pass
+            if old_pid != os.getppid() and old_pid != os.getpid():
+                _terminer_ancienne_instance(psutil, old_pid)
     with open(_LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
+    return True
 
 
 def _release_single_instance():
@@ -5293,6 +5329,54 @@ def _release_single_instance():
             os.remove(_LOCK_FILE)
     except Exception:
         pass
+
+
+def _recuperer_enregistrements_interrompus():
+    """Remet en file les `rec_*.wav` de tmp laissés par un arrêt brutal.
+
+    Un plantage natif ou le `taskkill` de l'installeur interrompt l'enregistrement
+    avant la création du job : l'audio (en-tête recalé toutes les 5 s) reste dans
+    tmp, invisible de l'historique. Chaque fichier récupéré devient un job
+    ordinaire, donc archivé puis transcrit comme après un arrêt normal (le worker
+    retire le WAV de tmp une fois archivé). Un fichier écarté reste en place.
+    """
+    with _all_jobs_lock:
+        chemins = [j.wav_path for j in _all_jobs]
+        debuts = [j.start_time for j in _all_jobs]
+    if _wav_stream_path:
+        chemins.append(_wav_stream_path)  # enregistrement en cours : jamais repris
+    try:
+        archives = os.listdir(config.AUDIO_ARCHIVE_DIR)
+    except OSError:
+        archives = []
+    candidats, ecartes = recup_mod.chercher(config.TEMP_DIR, chemins, debuts, archives)
+    for ecarte in ecartes:
+        _logger.warning("Enregistrement non récupéré, laissé en place : %s (%s)",
+                        os.path.basename(ecarte.chemin), ecarte.raison)
+    jobs = []
+    for cand in candidats:
+        job = _Job(
+            id=f"{cand.debut.strftime(recup_mod.FORMAT_HORODATAGE)}_recup",
+            wav_path=cand.chemin,
+            start_time=cand.debut,
+            duration_min=cand.duree_s / 60,
+            model_name=modeles.modele_affiche(
+                user_config.get(modeles.CLE_MODELE_CHOISI, ""), config.WHISPER_MODEL),
+            language=config.WHISPER_LANGUAGE,
+            meeting_type="A classifier",
+            output_mode="notion",
+            meeting_name=recup_mod.titre_recupere(cand.debut),
+        )
+        with _all_jobs_lock:
+            _all_jobs.insert(0, job)
+        hist_mod.add(job)
+        jobs.append(job)
+        _logger.info("Enregistrement récupéré : %s (%.1f min)",
+                     os.path.basename(cand.chemin), job.duration_min)
+    if jobs:
+        with _queue_lock:
+            _job_queue.extend(jobs)  # du plus ancien au plus récent
+        _work_event.set()
 
 
 def main():
@@ -5332,6 +5416,8 @@ def main():
         _work_event.set()
         _logger.info("Reprise de %d job(s) interrompu(s) : %s", len(orphelins),
                      ", ".join(j.id for j in orphelins))
+
+    _recuperer_enregistrements_interrompus()
 
     import sys
     tray_only = "--minimized" in sys.argv
@@ -5375,6 +5461,7 @@ def main():
     # Démarre 3 s après la fenêtre pour laisser tkinter s'initialiser
     root.after(3_000, _schedule_daily_digest)
     root.after(5_000, _check_pending_at_startup)
+    root.after(_AFFICHAGE_SONDAGE_MS, _sonder_demande_affichage)
 
     root.mainloop()
     _release_single_instance()

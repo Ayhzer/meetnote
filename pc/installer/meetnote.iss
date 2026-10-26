@@ -31,6 +31,13 @@ AppVersion={#AppVersion}
 AppVerName=MeetNote {#AppVersion}
 PrivilegesRequired=lowest
 DefaultDirName={localappdata}\Programs\MeetNote
+; Dossier d'installation FIXE : sans page de choix, pas de "Parcourir" vers Documents
+; (ou %APPDATA%, %LOCALAPPDATA%), ou le dossier du programme se confondrait avec celui
+; des donnees de l'utilisateur (Documents\MeetNote : audio et transcriptions).
+DisableDirPage=yes
+; Sans cela Inno reprendrait le dossier d'une installation anterieure, meme avec la
+; page masquee : l'installation reste toujours sous {localappdata}\Programs.
+UsePreviousAppDir=no
 DefaultGroupName=MeetNote
 DisableProgramGroupPage=yes
 UsedUserAreasWarning=no
@@ -68,10 +75,11 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; Sans --minimized : l'utilisateur doit voir l'application (et l'assistant de premier lancement).
 Filename: "{app}\MeetNote.exe"; Description: "Lancer MeetNote"; Flags: nowait postinstall skipifsilent
 
-[UninstallDelete]
-; Uniquement les fichiers laisses dans le dossier du programme. Jamais les donnees
-; (%APPDATA%\MeetNote, %LOCALAPPDATA%\MeetNote, Documents\MeetNote).
-Type: filesandordirs; Name: "{app}"
+; Pas de [UninstallDelete] : Inno retire lui-meme tout ce qu'il a installe ([Files],
+; _internal\ compris). L'application n'ecrit rien dans son dossier (donnees sous
+; %APPDATA%\MeetNote, %LOCALAPPDATA%\MeetNote et Documents\MeetNote ; models\ a cote de
+; l'exe n'est lu qu'en lecture seule). Une suppression recursive de {app} (filesandordirs)
+; effacerait les donnees si le dossier de programme et celui des donnees se confondaient.
 
 [Code]
 const

@@ -107,97 +107,89 @@ class DecisionTest(unittest.TestCase):
         self.assertFalse(watchdog.est_processus_meetnote("pythonw.exe"))
         self.assertFalse(watchdog.est_processus_meetnote(""))
 
+    def test_est_meetnote_mode_fige(self):
+        self.assertTrue(watchdog.est_meetnote("MeetNote.exe", []))
+        self.assertTrue(watchdog.est_meetnote("meetnote-1.2.exe"))
 
-class FauxProcessus:
-    """Process factice qui journalise l'ordre des arrêts dans `journal`."""
+    def test_est_meetnote_mode_source(self):
+        cmd = [r"C:\Python312\pythonw.exe", r"C:\DEV\meetnote\pc\MeetNote-Tray.py",
+               "--minimized"]
+        self.assertTrue(watchdog.est_meetnote("pythonw.exe", cmd))
+        self.assertTrue(watchdog.est_meetnote("python.exe", ["python", "meetnote-tray.py"]))
 
-    def __init__(self, nom, journal, descendants=()):
-        self._nom = nom
-        self._journal = journal
-        self._descendants = list(descendants)
+    def test_est_meetnote_refuse_les_autres_python(self):
+        self.assertFalse(watchdog.est_meetnote("python.exe", ["python", "boucle-dev.py"]))
+        self.assertFalse(watchdog.est_meetnote("pythonw.exe", ["pythonw", "watchdog.py"]))
+        self.assertFalse(watchdog.est_meetnote("python.exe", ["python", "x/meetnote-tray.py.bak"]))
+        self.assertFalse(watchdog.est_meetnote("python.exe", []))
+        self.assertFalse(watchdog.est_meetnote("python.exe", None))
 
-    def nom(self):
-        return self._nom
+    def test_est_meetnote_refuse_les_autres_programmes(self):
+        self.assertFalse(watchdog.est_meetnote("notepad.exe", ["meetnote-tray.py"]))
+        self.assertFalse(watchdog.est_meetnote("", ["meetnote-tray.py"]))
+        self.assertFalse(watchdog.est_meetnote(None, None))
 
-    def descendants(self):
-        return self._descendants
-
-    def terminer(self):
-        self._journal.append(("terminer", self._nom))
-
-    def attendre_fin(self, timeout):
-        self._journal.append(("attendre", self._nom, timeout))
+    def test_watchdog_pid_en_mode_source_n_est_pas_tue(self):
+        # `est_processus_meetnote` (watchdog.pid) ignore toujours python.
+        self.assertFalse(watchdog.est_processus_meetnote("pythonw.exe"))
 
 
-class RemplacerInstanceTest(unittest.TestCase):
+class AfficherInstanceExistanteTest(unittest.TestCase):
+    """Second lancement : l'instance en cours n'est jamais tuée, on lui demande l'affichage."""
+
     def setUp(self):
         self.dossier = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dossier, ignore_errors=True)
-        self.flag = os.path.join(self.dossier, "clean_exit.flag")
+        self.flag = os.path.join(self.dossier, "afficher.flag")
+        self.stop = os.path.join(self.dossier, "clean_exit.flag")
         self.pid = os.path.join(self.dossier, "watchdog.pid")
-        self.journal = []
 
     def _ecrire_pid(self, contenu):
         with open(self.pid, "w") as f:
             f.write(contenu)
 
-    def _remplacer(self, ouvrir, pid_courant=1):
-        return watchdog.remplacer_instance(
-            pid_file=self.pid, stop_flag=self.flag, pid_courant=pid_courant,
-            ouvrir=ouvrir, timeout=2)
+    def _afficher(self, nom_processus, pid_courant=1):
+        return watchdog.afficher_instance_existante(
+            pid_file=self.pid, afficher_flag=self.flag, pid_courant=pid_courant,
+            nom_processus=nom_processus)
 
-    def test_arrete_superviseur_et_enfant_apres_depot_du_drapeau(self):
+    def test_instance_vivante_recoit_la_demande_sans_etre_arretee(self):
         self._ecrire_pid("4242")
-        enfant = FauxProcessus("MeetNote.exe", self.journal)
-        superviseur = FauxProcessus("MeetNote.exe", self.journal, [enfant])
-        ouverts = []
+        interroges = []
 
-        def ouvrir(pid):
-            ouverts.append(pid)
-            return superviseur
+        def nom(pid):
+            interroges.append(pid)
+            return "MeetNote.exe"
 
-        # Le drapeau doit exister avant le premier arrêt.
-        superviseur.terminer = lambda: self.journal.append(
-            ("terminer-superviseur", os.path.isfile(self.flag)))
-        self.assertTrue(self._remplacer(ouvrir))
-        self.assertEqual(ouverts, [4242])
+        self.assertTrue(self._afficher(nom))
+        self.assertEqual(interroges, [4242])
         self.assertTrue(os.path.isfile(self.flag))
-        self.assertEqual(self.journal[0], ("terminer-superviseur", True))
-        self.assertIn(("terminer", "MeetNote.exe"), self.journal[1:2])  # l'enfant
-        self.assertEqual(len([e for e in self.journal if e[0] == "attendre"]), 2)
+        self.assertFalse(os.path.exists(self.stop))  # aucun arrêt demandé
 
-    def test_process_qui_n_est_pas_meetnote_est_laisse_intact(self):
+    def test_process_qui_n_est_pas_meetnote_n_est_pas_une_instance(self):
         self._ecrire_pid("4242")
-        autre = FauxProcessus("pythonw.exe", self.journal)
-        self.assertFalse(self._remplacer(lambda pid: autre))
-        self.assertEqual(self.journal, [])
-        self.assertFalse(os.path.exists(self.flag))  # aucun drapeau déposé
-
-    def test_aucun_fichier_pid_rien_a_remplacer(self):
-        self.assertFalse(self._remplacer(lambda pid: self.fail("ne doit pas ouvrir")))
+        self.assertFalse(self._afficher(lambda pid: "pythonw.exe"))
         self.assertFalse(os.path.exists(self.flag))
 
-    def test_pid_illisible_ou_process_disparu(self):
+    def test_pid_perime_process_disparu(self):
+        self._ecrire_pid("4242")
+        self.assertFalse(self._afficher(lambda pid: ""))
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_aucun_fichier_pid(self):
+        self.assertFalse(self._afficher(lambda pid: self.fail("ne doit pas interroger")))
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_pid_illisible(self):
         self._ecrire_pid("pas-un-nombre")
-        self.assertFalse(self._remplacer(lambda pid: self.fail("ne doit pas ouvrir")))
-        self._ecrire_pid("4242")
-        self.assertFalse(self._remplacer(lambda pid: None))
-        self.assertFalse(os.path.exists(self.flag))
+        self.assertFalse(self._afficher(lambda pid: self.fail("ne doit pas interroger")))
 
-    def test_ne_s_arrete_jamais_soi_meme(self):
+    def test_ne_se_reconnait_jamais_soi_meme(self):
         self._ecrire_pid("7")
-        self.assertFalse(self._remplacer(
-            lambda pid: self.fail("ne doit pas ouvrir"), pid_courant=7))
+        self.assertFalse(self._afficher(
+            lambda pid: self.fail("ne doit pas interroger"), pid_courant=7))
 
-    def test_superviser_exe_remplace_puis_supervise_l_enfant(self):
-        appels = []
-        watchdog.superviser_exe(
-            ["--minimized"], executable="M.exe",
-            remplacer=lambda: appels.append("remplacer"),
-            superviseur=lambda commande: appels.append(commande))
-        self.assertEqual(appels, ["remplacer", ["M.exe", "--enfant", "--minimized"]])
-
-    def test_import_psutil_manquant_n_arrete_rien(self):
+    def test_psutil_manquant_revient_a_superviser(self):
         self._ecrire_pid("4242")
         import builtins
         reel = builtins.__import__
@@ -209,11 +201,61 @@ class RemplacerInstanceTest(unittest.TestCase):
 
         builtins.__import__ = sans_psutil
         try:
-            self.assertFalse(watchdog.remplacer_instance(
-                pid_file=self.pid, stop_flag=self.flag, pid_courant=1))
+            self.assertFalse(watchdog.afficher_instance_existante(
+                pid_file=self.pid, afficher_flag=self.flag, pid_courant=1))
         finally:
             builtins.__import__ = reel
         self.assertFalse(os.path.exists(self.flag))
+
+
+class DemandeAffichageTest(unittest.TestCase):
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dossier, ignore_errors=True)
+        self.flag = os.path.join(self.dossier, "sous", "afficher.flag")
+
+    def test_consommation_idempotente(self):
+        self.assertFalse(watchdog.consommer_demande_affichage(self.flag))  # rien déposé
+        self.assertTrue(watchdog.demander_affichage(self.flag))  # crée le dossier
+        self.assertTrue(watchdog.consommer_demande_affichage(self.flag))
+        self.assertFalse(watchdog.consommer_demande_affichage(self.flag))
+
+    def test_deux_demandes_valent_une_consommation(self):
+        watchdog.demander_affichage(self.flag)
+        watchdog.demander_affichage(self.flag)
+        self.assertTrue(watchdog.consommer_demande_affichage(self.flag))
+        self.assertFalse(watchdog.consommer_demande_affichage(self.flag))
+
+
+class SuperviserExeTest(unittest.TestCase):
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dossier, ignore_errors=True)
+        self.flag = os.path.join(self.dossier, "afficher.flag")
+        self.appels = []
+
+    def _lancer(self, existante):
+        watchdog.superviser_exe(
+            ["--minimized"], executable="M.exe", existante=existante,
+            superviseur=self.appels.append, afficher_flag=self.flag)
+
+    def test_instance_existante_pas_de_supervision(self):
+        self._lancer(lambda: True)
+        self.assertEqual(self.appels, [])  # ni enfant, ni watchdog.pid réécrit
+
+    def test_aucune_instance_supervise_l_enfant(self):
+        self._lancer(lambda: False)
+        self.assertEqual(self.appels, [["M.exe", "--enfant", "--minimized"]])
+
+    def test_demande_perimee_effacee_avant_de_superviser(self):
+        watchdog.demander_affichage(self.flag)
+        self._lancer(lambda: False)
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_demande_conservee_quand_une_instance_existe(self):
+        watchdog.demander_affichage(self.flag)
+        self._lancer(lambda: True)
+        self.assertTrue(os.path.isfile(self.flag))  # l'instance la consommera
 
 
 if __name__ == "__main__":

@@ -13,6 +13,10 @@ Sortie sans le flag == crash → relance après un court délai.
 
 Mode figé : MeetNote.exe lancé sans `--enfant` se supervise lui-même
 (`superviser_exe`) et relance `MeetNote.exe --enfant`, sur le même protocole.
+Si une instance tourne déjà (menu Démarrer pendant une réunion), le second
+lancement ne la tue jamais : il dépose `afficher.flag` et se termine ; l'instance
+en cours le consomme et montre sa fenêtre. Seul l'installeur force l'arrêt
+(`clean_exit.flag` puis `taskkill`).
 """
 import os
 import subprocess
@@ -25,6 +29,8 @@ SCRIPT = os.path.join(HERE, "meetnote-tray.py")
 APPDATA_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "MeetNote")
 STOP_FLAG = os.path.join(APPDATA_DIR, "clean_exit.flag")
 WATCHDOG_PID_FILE = os.path.join(APPDATA_DIR, "watchdog.pid")
+# Demande d'affichage : déposée par un second lancement, consommée par l'instance en cours.
+AFFICHER_FLAG = os.path.join(APPDATA_DIR, "afficher.flag")
 
 RESTART_DELAY_S = 3
 
@@ -76,7 +82,8 @@ def superviser(commande, *, stop_flag: str = STOP_FLAG,
 
 ARG_ENFANT = "--enfant"
 NOM_PROCESSUS_MEETNOTE = "meetnote"
-ARRET_INSTANCE_TIMEOUT_S = 5
+NOM_PROCESSUS_PYTHON = "python"
+SCRIPT_TRAY = "meetnote-tray.py"
 
 
 def doit_superviser(fige: bool, args) -> bool:
@@ -94,63 +101,48 @@ def commande_enfant(executable: str, args) -> list:
     return [executable, ARG_ENFANT, *args]
 
 
+def est_meetnote(nom: str, ligne_de_commande=()) -> bool:
+    """Vrai si le process est MeetNote (fonction pure, insensible à la casse).
+
+    - mode figé : nom `meetnote*` ;
+    - mode source : nom `python*` ET un élément de la ligne de commande est
+      `meetnote-tray.py`. Un autre python (boucle du kit, superviseur) ou un
+      pid recyclé n'est jamais reconnu.
+    """
+    nom = (nom or "").lower()
+    if nom.startswith(NOM_PROCESSUS_MEETNOTE):
+        return True
+    if not nom.startswith(NOM_PROCESSUS_PYTHON):
+        return False
+    for element in ligne_de_commande or ():
+        fichier = str(element).lower().replace("\\", "/").rsplit("/", 1)[-1]
+        if fichier == SCRIPT_TRAY:
+            return True
+    return False
+
+
 def est_processus_meetnote(nom: str) -> bool:
-    """Vrai si le nom de process est celui de MeetNote.exe (jamais python, ni autre)."""
-    return (nom or "").lower().startswith(NOM_PROCESSUS_MEETNOTE)
+    """Vrai si le nom est celui de MeetNote.exe, sans ligne de commande : jamais python.
+
+    Sert au remplacement d'instance via `watchdog.pid`, où le mode source
+    (`pythonw watchdog.py`) ne doit pas être reconnu.
+    """
+    return est_meetnote(nom)
 
 
-class _ProcessusPsutil:
-    """Adaptateur minimal sur psutil.Process : les erreurs psutil n'en sortent pas."""
-
-    def __init__(self, psutil_mod, proc):
-        self._psutil = psutil_mod
-        self._proc = proc
-
-    def nom(self) -> str:
-        try:
-            return self._proc.name()
-        except self._psutil.Error:
-            return ""
-
-    def descendants(self) -> list:
-        try:
-            enfants = self._proc.children(recursive=True)
-        except self._psutil.Error:
-            return []
-        return [_ProcessusPsutil(self._psutil, e) for e in enfants]
-
-    def terminer(self) -> None:
-        try:
-            self._proc.terminate()
-        except self._psutil.Error:
-            pass  # déjà terminé ou accès refusé : rien de plus à faire
-
-    def attendre_fin(self, timeout: float) -> None:
-        """Attend la fin du process ; au-delà du délai, le tue."""
-        try:
-            self._proc.wait(timeout=timeout)
-        except self._psutil.TimeoutExpired:
-            try:
-                self._proc.kill()
-            except self._psutil.Error:
-                pass
-        except self._psutil.Error:
-            pass
-
-
-def _ouvrir_processus_psutil(pid: int):
-    """Process de `pid` (adaptateur), ou None s'il n'existe pas ou si psutil manque.
+def _nom_processus_psutil(pid: int) -> str:
+    """Nom du process `pid`, ou "" s'il n'existe pas, est inaccessible ou si psutil manque.
 
     psutil est importé ici seulement : watchdog.py reste importable en stdlib seule.
     """
     try:
         import psutil
     except ImportError:
-        return None
+        return ""
     try:
-        return _ProcessusPsutil(psutil, psutil.Process(pid))
+        return psutil.Process(pid).name()
     except psutil.Error:
-        return None
+        return ""
 
 
 def _lire_pid(chemin: str):
@@ -161,45 +153,57 @@ def _lire_pid(chemin: str):
         return None
 
 
-def remplacer_instance(*, pid_file: str = WATCHDOG_PID_FILE,
-                       stop_flag: str = STOP_FLAG, pid_courant=None,
-                       ouvrir=_ouvrir_processus_psutil,
-                       timeout: float = ARRET_INSTANCE_TIMEOUT_S) -> bool:
-    """Arrête le superviseur MeetNote déjà en place, avec son enfant.
+def demander_affichage(afficher_flag: str = AFFICHER_FLAG) -> bool:
+    """Dépose la demande d'affichage. Retourne False si le dépôt est impossible."""
+    try:
+        os.makedirs(os.path.dirname(afficher_flag), exist_ok=True)
+        open(afficher_flag, "w").close()
+    except OSError:
+        return False
+    return True
 
-    Appelé par un second lancement de l'EXE. Le drapeau de sortie propre est
-    déposé d'abord : si le superviseur survit un instant à son enfant, il ne le
-    relance pas (pas de ping-pong). Rien n'est touché si `watchdog.pid` désigne
-    un process qui n'est pas MeetNote (pid recyclé, watchdog.py du mode source).
-    Le drapeau déposé est consommé par le nouveau `superviser` avant son 1er
-    lancement. Retourne True si une instance a été arrêtée.
+
+def consommer_demande_affichage(afficher_flag: str = AFFICHER_FLAG) -> bool:
+    """Retire la demande d'affichage ; True une seule fois par demande déposée."""
+    try:
+        os.remove(afficher_flag)
+    except OSError:
+        return False
+    return True
+
+
+def afficher_instance_existante(*, pid_file: str = WATCHDOG_PID_FILE,
+                                afficher_flag: str = AFFICHER_FLAG, pid_courant=None,
+                                nom_processus=_nom_processus_psutil) -> bool:
+    """Si un superviseur MeetNote vivant existe, lui demande d'afficher sa fenêtre.
+
+    Ne tue rien : couper l'instance en cours interromprait un enregistrement.
+    Retourne True si une instance vit (la demande est déposée) ; False si le
+    fichier PID est absent, périmé, illisible, ou désigne un autre programme
+    (pid recyclé, watchdog.py du mode source) — l'appelant doit alors superviser.
     """
     pid = _lire_pid(pid_file)
     if pid is None or pid == (pid_courant or os.getpid()):
         return False
-    superviseur = ouvrir(pid)
-    if superviseur is None or not est_processus_meetnote(superviseur.nom()):
+    if not est_processus_meetnote(nom_processus(pid)):
         return False
-
-    try:
-        os.makedirs(os.path.dirname(stop_flag), exist_ok=True)
-        open(stop_flag, "w").close()
-    except OSError:
-        return False  # sans drapeau, tuer l'enfant provoquerait une relance
-    descendants = superviseur.descendants()  # à relever avant la mort du père
-    superviseur.terminer()  # le superviseur d'abord : plus de relance possible
-    for descendant in descendants:
-        descendant.terminer()
-    for victime in (superviseur, *descendants):
-        victime.attendre_fin(timeout)
+    demander_affichage(afficher_flag)
     return True
 
 
-def superviser_exe(args, *, executable: str | None = None, remplacer=remplacer_instance,
-                   superviseur=superviser) -> None:
-    """Point d'entrée de l'EXE figé lancé sans `--enfant` : remplace l'instance
-    en cours puis supervise `MeetNote.exe --enfant <args>`."""
-    remplacer()
+def superviser_exe(args, *, executable: str | None = None,
+                   existante=afficher_instance_existante, superviseur=superviser,
+                   afficher_flag: str = AFFICHER_FLAG) -> None:
+    """Point d'entrée de l'EXE figé lancé sans `--enfant`.
+
+    Une instance déjà en cours reçoit une demande d'affichage et ce lancement
+    se termine ; sinon il supervise `MeetNote.exe --enfant <args>`.
+    """
+    if existante():
+        return
+    # Aucune instance : une demande d'affichage restée là est périmée, elle ne
+    # doit pas faire surgir la fenêtre d'un démarrage voulu silencieux.
+    consommer_demande_affichage(afficher_flag)
     superviseur(commande_enfant(executable or sys.executable, args))
 
 

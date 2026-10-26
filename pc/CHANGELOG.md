@@ -1,5 +1,38 @@
 # MeetNote PC — Changelog
 
+## [3.4.0] — 2026-10-26
+
+### Installation
+- **Installeur par utilisateur** : `MeetNote-<version>-installation.exe` installe MeetNote
+  dans `%LOCALAPPDATA%\Programs\MeetNote`, **sans mot de passe administrateur**. Il crée un
+  raccourci dans le menu Démarrer (icône Bureau en option). La case « Démarrer avec Windows »
+  est cochée par défaut et la case « Lancer MeetNote » est proposée en fin d'installation.
+- Le build produit cet installeur **à côté du zip portable** (`MeetNote-slim-<version>-installation.exe`
+  pour la variante slim). Il est signé comme l'EXE quand le certificat est présent. Sans
+  Inno Setup (6.3 ou plus), le build le signale au bilan sans échouer.
+- **Désinstallation** : elle arrête MeetNote, retire le programme et la clé de démarrage, et
+  **conserve vos données** en les nommant à l'écran : `%APPDATA%\MeetNote` (réglages,
+  historique), `%LOCALAPPDATA%\MeetNote` (modèles Whisper) et `Documents\MeetNote` (audio,
+  transcriptions).
+
+### Démarrage avec Windows
+- **La clé de démarrage lance désormais `"…\MeetNote.exe" --minimized`**, en version installée
+  comme en version portable. L'ancienne valeur était fausse dans le paquet : elle pointait sur
+  un script interne au bundle.
+- L'application **ne recrée plus la clé d'elle-même** : c'est l'installeur ou la case des
+  paramètres qui décide. Une clé qui pointe sur un ancien emplacement de `MeetNote.exe`
+  (dossier déplacé, ancienne version) est recalée sur l'emplacement courant.
+
+### Fiabilité
+- **Relance après plantage dans le paquet installé** : `MeetNote.exe` se supervise lui-même.
+  Un plantage natif (violation d'accès WASAPI) relance l'application en quelques secondes ;
+  « Quitter » ne la relance pas. Jusqu'ici, seul le mode source (`watchdog.py`) avait ce filet.
+- Un second lancement de MeetNote (raccourci du menu Démarrer) **ne coupe plus l'instance en
+  cours** : il lui demande d'afficher sa fenêtre puis se termine. Un enregistrement en cours
+  n'est donc plus interrompu. L'installeur reste seul à pouvoir forcer l'arrêt.
+
+---
+
 ## [3.3.0] — 2026-10-15
 
 ### Interface

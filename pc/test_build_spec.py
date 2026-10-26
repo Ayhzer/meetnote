@@ -629,6 +629,13 @@ class ScriptsDeBuildSansModeleTest(unittest.TestCase):
             with self.subTest(script=nom):
                 self.assertIn("demarrage_windows", self._hidden_imports(nom))
 
+    def test_recuperation_enregistrements_embarque_comme_module(self):
+        # Le tray l'importe au démarrage pour reprendre un enregistrement interrompu.
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("recuperation_enregistrements",
+                              self._hidden_imports(nom))
+
     def _liste_litterale(self, nom, variable):
         for noeud in ast.walk(ast.parse(self._source(nom))):
             if not isinstance(noeud, ast.Assign):

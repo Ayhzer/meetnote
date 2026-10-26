@@ -162,8 +162,25 @@ class InstalleurTest(unittest.TestCase):
             contenu = "\n".join(self.sections.get(section, []))
             for interdit in ("{userappdata}", r"{localappdata}\MeetNote", "{userdocs}"):
                 self.assertNotIn(interdit, contenu, f"[{section}] touche {interdit}")
-        for ligne in self.sections["UninstallDelete"]:
-            self.assertIn('Name: "{app}"', ligne)
+
+    def test_dossier_d_installation_fixe(self):
+        # Sans page de choix, impossible d'installer dans Documents\MeetNote (dossier
+        # des audios) : une désinstallation ne peut alors pas atteindre les données.
+        self.assertEqual(self._setup("DisableDirPage"), "yes")
+        self.assertEqual(self._setup("UsePreviousAppDir"), "no")
+        self.assertEqual(
+            self._setup("DefaultDirName"), r"{localappdata}\Programs\MeetNote"
+        )
+        self.assertNotIn("AppendDefaultDirName", self.utile)
+
+    def test_aucune_suppression_recursive_du_dossier_programme_ou_des_donnees(self):
+        # Inno retire déjà ce qu'il a installé : aucune entrée filesandordirs sur {app}
+        # ni sur un dossier de données.
+        for ligne in self.sections.get("UninstallDelete", []):
+            self.assertNotIn("filesandordirs", ligne)
+            self.assertNotIn('Name: "{app}"', ligne)
+            for donnees in ("{userappdata}", "{localappdata}", "{userdocs}"):
+                self.assertNotIn(donnees, ligne)
 
 
 if __name__ == "__main__":
