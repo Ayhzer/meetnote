@@ -5,12 +5,17 @@ Output : dist/MeetNote-slim-<version>  (~300-400 MB au lieu de 3.2 GB)
 """
 
 import os
-import shutil as _shutil
 import subprocess
 import sys
 import tempfile
 
-from build_paths import dist_dir_name
+from build_paths import (
+    collecter_datas,
+    composer_bilan,
+    dist_dir_name,
+    formater_datas,
+    produire_archive,
+)
 from build_version import build_version_resource
 from version import VERSION
 
@@ -20,43 +25,12 @@ VENV        = os.path.join(os.path.dirname(os.path.dirname(SCRIPT_DIR)), ".venv"
 SITE_PKG    = os.path.join(VENV, "Lib", "site-packages")
 
 # ─── Datas : pas de modèles, uniquement les assets runtime ───────────────────
-datas_lines = []
-
-# faster_whisper assets (silero_vad_v6.onnx)
-fw_assets = os.path.join(SITE_PKG, "faster_whisper", "assets")
-if os.path.isdir(fw_assets):
-    datas_lines.append(f"    (r'{fw_assets.replace(chr(92), '/')}', 'faster_whisper/assets'),")
-
-# sounddevice portaudio DLLs
-sd_data = os.path.join(SITE_PKG, "_sounddevice_data")
-if os.path.isdir(sd_data):
-    datas_lines.append(f"    (r'{sd_data.replace(chr(92), '/')}', '_sounddevice_data'),")
-
-# ctranslate2
-ct2_dir = os.path.join(SITE_PKG, "ctranslate2")
-if os.path.isdir(ct2_dir):
-    datas_lines.append(f"    (r'{ct2_dir.replace(chr(92), '/')}', 'ctranslate2'),")
-
-# tokenizers
-tk_dir = os.path.join(SITE_PKG, "tokenizers")
-if os.path.isdir(tk_dir):
-    datas_lines.append(f"    (r'{tk_dir.replace(chr(92), '/')}', 'tokenizers'),")
-
-# soundcard
-sc_dir = os.path.join(SITE_PKG, "soundcard")
-if os.path.isdir(sc_dir):
-    datas_lines.append(f"    (r'{sc_dir.replace(chr(92), '/')}', 'soundcard'),")
-
-# ffmpeg + ffprobe
-for _bin in ("ffmpeg.exe", "ffprobe.exe"):
-    _found = _shutil.which(_bin.replace(".exe", "")) or _shutil.which(_bin)
-    if _found:
-        datas_lines.append(f"    (r'{_found.replace(chr(92), '/')}', r'.'),")
-        print(f"[build_slim] Bundling {_bin}: {_found}")
-    else:
-        print(f"[build_slim] {_bin} not found — audio conversion requires ffmpeg at runtime")
-
-datas_block = "\n".join(datas_lines)
+ALERTES = []  # reprises dans le bilan final, après le journal PyInstaller
+datas_block = formater_datas(
+    collecter_datas(SITE_PKG, journal=lambda m: print(f"[build_slim] {m}"),
+                    alertes=ALERTES,
+                    etape=os.path.join(tempfile.gettempdir(), "meetnote-slim-ffmpeg"))
+)
 
 # ─── Hidden imports (identiques au build complet) ────────────────────────────
 hidden_imports = [
@@ -72,14 +46,19 @@ hidden_imports = [
     "tkinter", "tkinter.ttk",
     "huggingface_hub", "huggingface_hub.file_download",
     "numpy", "av", "onnxruntime", "onnxruntime.capi", "cffi",
-    "notion_push", "config", "user_config", "perf_profile", "version", "history", "outlook_cal",
-    "teams_roster", "soundfile", "_soundfile",
+    "notion_push", "notion_api", "assistant_agenda", "assistant_audio",
+    "assistant_fenetre", "assistant_notion", "config", "user_config", "fichier_json", "perf_profile", "modeles", "version", "history", "journal_app", "outlook_cal",
+    "source_agenda", "teams_roster", "soundfile", "_soundfile",
     "wave", "glob", "json", "collections", "dataclasses", "shutil",
-    "scipy", "scipy.signal", "noisereduce",
+    "scipy", "scipy.signal", "noisereduce", "debruitage",
     "pycaw", "pycaw.pycaw", "comtypes", "psutil",
     "win32com", "win32com.client", "pywintypes",
 ]
 hidden_imports_str = ",\n    ".join(f"'{h}'" for h in hidden_imports)
+
+# Modules volontairement absents du paquet (voir build_spec.py et PLAN.md, T029).
+excludes = ['pandas', 'jupyter', 'IPython', 'PyQt5', 'wx', 'torch', 'numba', 'llvmlite']
+excludes_str = ", ".join(f"'{e}'" for e in excludes)
 
 # ─── Spec ────────────────────────────────────────────────────────────────────
 ENTRY_POINT = os.path.join(SCRIPT_DIR, "meetnote-tray.py").replace("\\", "/")
@@ -116,7 +95,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
-    excludes=['pandas', 'jupyter', 'IPython', 'PyQt5', 'wx'],
+    excludes=[{excludes_str}],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -191,10 +170,9 @@ print(f"\n[build_slim] SUCCESS — {dist_dir}")
 print(f"[build_slim] {count} files, {total / 1024 / 1024:.1f} MB")
 
 # ─── Zip pour GitHub Release ─────────────────────────────────────────────────
-zip_path = os.path.join(SCRIPT_DIR, "dist", DIST_NAME)
-print(f"[build_slim] Creating zip {zip_path}.zip ...")
-import shutil as _shutil2
-
-_shutil2.make_archive(zip_path, "zip", os.path.join(SCRIPT_DIR, "dist"), DIST_NAME)
-zip_size = os.path.getsize(zip_path + ".zip") / 1024 / 1024
-print(f"[build_slim] Zip ready: {zip_path}.zip ({zip_size:.1f} MB)")
+# COLLECT vide pc\dist\<DIST_NAME> avant d'y écrire (PyInstaller, --noconfirm) :
+# ce dossier est déjà la sortie fraîche, il n'a pas de restes à comparer.
+produire_archive(dist_dir, VERSION, os.path.dirname(dist_dir), slim=True,
+                 journal=lambda m: print(f"[build_slim] {m}"), alertes=ALERTES)
+for ligne in composer_bilan(ALERTES):
+    print(f"[build_slim] {ligne}")

@@ -8,19 +8,38 @@ Fonctions publiques :
   build_transcript(events, days)  → retourne uniquement le texte formaté (pour tests/debug).
 """
 import datetime
-import json
 import logging
 import os
 import sys
+from collections.abc import Callable, Sequence
 
 sys.path.insert(0, os.path.dirname(__file__))
-import outlook_cal
-from notion_push import push_to_notion
+import fichier_json
+import source_agenda
 
 log = logging.getLogger(__name__)
 
+# Journal de la chaîne de sources, partagé avec le cache d'agenda (lignes « [Agenda] … »).
+log_agenda = logging.getLogger("meetnote.agenda")
+
 # Fichier d'état pour le mécanisme anti-doublon quotidien
 _STATE_FILE = os.path.join(os.path.expanduser("~"), "Documents", "MeetNote", "agenda_digest_state.json")
+_CLE_DATE = "last_run_date"      # date du dernier succès
+_CLE_ECHEC = "dernier_echec"     # heure du dernier échec « sources indisponibles »
+
+# Délai avant de relire les sources après un échec (évite une lecture + un job par minute)
+DELAI_NOUVEL_ESSAI = datetime.timedelta(minutes=30)
+
+
+class SourcesIndisponibles(Exception):
+    """Aucune source d'agenda n'a répondu ; `prochain_essai` = heure du prochain essai automatique."""
+
+    def __init__(self, prochain_essai: datetime.datetime):
+        super().__init__(f"Agenda injoignable, nouvel essai à {prochain_essai:%H:%M}")
+        self.prochain_essai = prochain_essai
+
+# Objet affiché à la place de celui d'une réunion marquée privée dans Outlook
+_OBJET_PRIVE = "Privé"
 
 _JOURS_FR   = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 _MOIS_FR    = ["", "janvier", "février", "mars", "avril", "mai", "juin",
@@ -31,25 +50,58 @@ _MOIS_FR    = ["", "janvier", "février", "mars", "avril", "mai", "juin",
 # État (last-run date)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _lire_etat() -> dict:
+    """Contenu du fichier d'état ({} s'il est absent ou illisible, ce dernier étant mis de côté)."""
+    return fichier_json.lire_ou_ecarter(_STATE_FILE, dict) or {}
+
+
 def get_last_run_date() -> datetime.date | None:
     """Retourne la date de la dernière exécution, ou None si jamais exécuté."""
     try:
-        with open(_STATE_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return datetime.date.fromisoformat(data.get("last_run_date", ""))
-    except Exception:
+        return datetime.date.fromisoformat(_lire_etat().get("last_run_date", ""))
+    except (TypeError, ValueError):
         return None
 
 
 def _save_last_run_date(d: datetime.date):
-    os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
-    with open(_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"last_run_date": d.isoformat()}, f)
+    """Enregistre la date de succès ; efface au passage l'échec « sources indisponibles »."""
+    fichier_json.ecrire_atomique(_STATE_FILE, {_CLE_DATE: d.isoformat()})
 
 
-def digest_already_run_today() -> bool:
-    last = get_last_run_date()
-    return last == datetime.date.today()
+def _memoriser_echec_sources(maintenant: datetime.datetime) -> None:
+    """Mémorise l'heure d'un échec « sources indisponibles », sans toucher à la date de succès."""
+    etat = _lire_etat()
+    etat[_CLE_ECHEC] = maintenant.isoformat(timespec="seconds")
+    try:
+        fichier_json.ecrire_atomique(_STATE_FILE, etat)
+    except OSError as e:
+        log.warning("calendar_digest: échec d'écriture de l'état (%s)", e)
+
+
+def dernier_echec_sources() -> datetime.datetime | None:
+    """Heure du dernier échec « sources indisponibles », ou None (absent d'un ancien fichier)."""
+    try:
+        return datetime.datetime.fromisoformat(_lire_etat().get(_CLE_ECHEC, ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def prochain_essai(maintenant: datetime.datetime) -> datetime.datetime | None:
+    """Heure du prochain essai autorisé après un échec récent, ou None s'il n'y a pas de délai en cours."""
+    echec = dernier_echec_sources()
+    if echec is None or not echec <= maintenant < echec + DELAI_NOUVEL_ESSAI:
+        return None
+    return echec + DELAI_NOUVEL_ESSAI
+
+
+def digest_already_run_today(aujourdhui: datetime.date | None = None) -> bool:
+    return get_last_run_date() == (aujourdhui or datetime.date.today())
+
+
+def digest_a_tenter(maintenant: datetime.datetime | None = None) -> bool:
+    """Vrai si le digest n'est pas fait aujourd'hui et qu'aucun échec récent n'impose d'attendre."""
+    maintenant = maintenant or datetime.datetime.now()
+    return not digest_already_run_today(maintenant.date()) and prochain_essai(maintenant) is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,7 +143,7 @@ def build_transcript(events: list, days: int = 15, generated_at: datetime.dateti
     Bloc d'en-tête : ligne "AGENDA PRÉVISIONNEL — Du … au …"
     Chaque semaine : ligne "SEMAINE N — …"
     Chaque jour    : ligne "▸ JOUR JJ mois AAAA" puis 0..N blocs RDV
-    Chaque RDV     :
+    Chaque RDV     : (réunion privée : seule la première ligne, objet « Privé »)
       [HH:MM → HH:MM]  Xmin|XhY  |  <Sujet>
       Lieu        : <lieu ou "(aucun)">
       Organisateur: <nom ou "(non renseigné)">
@@ -142,18 +194,23 @@ def build_transcript(events: list, days: int = 15, generated_at: datetime.dateti
                 dur_min = (ev["end"] - ev["start"]).total_seconds() / 60
                 time_range = (f"[{ev['start'].strftime('%H:%M')} → "
                               f"{ev['end'].strftime('%H:%M')}]")
+                if ev.get("prive"):
+                    # Créneau seul : ni objet, ni lieu, ni corps, ni participants.
+                    lines.append(f"  {time_range}  {_fmt_duration(dur_min)}  |  {_OBJET_PRIVE}")
+                    lines.append("")
+                    continue
                 lines.append(
                     f"  {time_range}  {_fmt_duration(dur_min)}  |  {ev['subject']}"
                 )
 
-                loc = ev.get("location", "").strip() or "(aucun)"
+                loc = (ev.get("location") or "").strip() or "(aucun)"
                 lines.append(f"  Lieu        : {loc}")
 
-                org = ev.get("organizer", "").strip() or "(non renseigné)"
+                org = (ev.get("organizer") or "").strip() or "(non renseigné)"
                 lines.append(f"  Organisateur: {org}")
 
-                req  = [n for n in ev.get("required", []) if n]
-                opt  = [n for n in ev.get("optional", []) if n]
+                req  = [n for n in (ev.get("required") or []) if n]
+                opt  = [n for n in (ev.get("optional") or []) if n]
                 if req:
                     lines.append(f"  Participants requis   : {' ; '.join(req)}")
                 else:
@@ -195,21 +252,41 @@ def build_transcript(events: list, days: int = 15, generated_at: datetime.dateti
 # Point d'entrée principal
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_digest(days: int = 15, force: bool = False) -> str | None:
+def run_digest(days: int = 15, force: bool = False,
+               sources: Sequence[source_agenda.Source] | None = None,
+               horloge: Callable[[], datetime.datetime] = datetime.datetime.now) -> str | None:
     """
     Récupère les RDV, formate le transcript, pousse vers Notion.
-    Retourne l'URL Notion de la page créée, ou None en cas d'erreur.
-    force=True : ignore le check "déjà fait aujourd'hui".
+    Retourne l'URL Notion de la page créée, ou None (déjà fait, délai de nouvel essai
+    en cours, ou échec du push Notion).
+    force=True : ignore le check "déjà fait aujourd'hui" et le délai de nouvel essai.
+
+    Les RDV viennent de la chaîne de sources de `source_agenda` (index → EWS → COM),
+    lue sur [maintenant, maintenant + days jours] sans toucher au cache des 24 h.
+    Si aucune source ne répond, rien n'est poussé, la date du jour n'est pas enregistrée
+    mais l'heure de l'échec l'est (nouvel essai automatique après DELAI_NOUVEL_ESSAI) et
+    `SourcesIndisponibles` est levée ; une source qui répond « aucune réunion » donne en
+    revanche un agenda vide, poussé normalement.
     """
-    if not force and digest_already_run_today():
-        log.info("calendar_digest: digest déjà effectué aujourd'hui, ignoré.")
+    now = horloge()
+    if not force and not digest_a_tenter(now):
+        log.info("calendar_digest: digest déjà effectué aujourd'hui ou nouvel essai différé, ignoré.")
         return None
 
+    # Importé ici : notion_push exige config.py dès son import, inutile pour construire l'agenda.
+    from notion_push import push_to_notion
+
     log.info("calendar_digest: récupération des RDV (%d jours)…", days)
-    events = outlook_cal.get_events_range(days=days)
+    chaine = source_agenda.sources_par_defaut() if sources is None else sources
+    retenue = source_agenda.premiere_source(chaine, now, now + datetime.timedelta(days=days))
+    if retenue is None:
+        log_agenda.warning("[Agenda] digest source=aucune échec (rien poussé vers Notion) jours=%d", days)
+        _memoriser_echec_sources(now)
+        raise SourcesIndisponibles(now + DELAI_NOUVEL_ESSAI)
+    nom_source, events = retenue
+    log_agenda.info("[Agenda] digest source=%s réunions=%d jours=%d", nom_source, len(events), days)
     log.info("calendar_digest: %d RDV récupérés.", len(events))
 
-    now        = datetime.datetime.now()
     transcript = build_transcript(events, days=days, generated_at=now)
 
     today_str = now.strftime("%d/%m/%Y")

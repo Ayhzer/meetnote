@@ -1,19 +1,26 @@
 """
 build_spec.py — Generate meetnote.spec and run PyInstaller build.
 
-Discovers:
-  - faster-whisper model files in the HF cache (base, small — whichever are present)
-  - ctranslate2, soundcard, sounddevice, tokenizers package files
-  - Writes meetnote.spec, then invokes PyInstaller
+Embarque :
+  - ctranslate2, soundcard, sounddevice, tokenizers, ffmpeg (voir build_paths)
+  - AUCUN modèle Whisper : il est téléchargé au premier lancement (modeles.py)
+  - Écrit meetnote.spec, puis lance PyInstaller
 """
 
 import os
-import shutil
 import subprocess
 import sys
 import time
 
-from build_paths import dist_dir_name, resolve_python_home, resolve_site_packages
+from build_paths import (
+    collecter_datas,
+    composer_bilan,
+    dist_dir_name,
+    formater_datas,
+    produire_archive,
+    resolve_python_home,
+    resolve_site_packages,
+)
 from build_version import build_version_resource
 from version import VERSION
 
@@ -56,7 +63,6 @@ Write-Host ("[build_spec] EXE signe: " + $r.Status + " — " + $cert.Thumbprint)
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-HF_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
 VENV        = resolve_python_home()
 SITE_PKG    = resolve_site_packages(VENV)
 # Dossiers de travail hors OneDrive (verrouillages de sync). Le fichier de version
@@ -67,86 +73,17 @@ DIST_DIR_TMP = os.path.join(BUILD_ROOT, "dist")
 VERSION_FILE = os.path.join(BUILD_ROOT, "meetnote.version.txt")
 DIST_NAME    = dist_dir_name(VERSION)
 
-# ─── Discover faster-whisper model snapshots ─────────────────────────────────
-# large-v3 (3 Go) exclu par défaut
-MODEL_NAMES = ["tiny", "base", "small", "medium"]
+# ─── Données embarquées ──────────────────────────────────────────────────────
+# Aucun modèle Whisper dans le paquet : il se télécharge au premier lancement
+# (modeles.py). Un cache Hugging Face vide sur ce poste n'arrête donc plus le build.
+# Alertes retenues pour le bilan final : celles du début se noient dans le journal
+# PyInstaller (poids de ffmpeg, ffmpeg absent...).
+ALERTES = []
+datas_block = formater_datas(
+    collecter_datas(SITE_PKG, journal=lambda m: print(f"[build_spec] {m}"),
+                    alertes=ALERTES, etape=os.path.join(BUILD_ROOT, "ffmpeg"))
+)
 
-def find_model_snapshot(name: str):
-    """Return the snapshot dir for a given model name if it exists."""
-    model_dir = os.path.join(HF_CACHE, f"models--Systran--faster-whisper-{name}")
-    snapshots_dir = os.path.join(model_dir, "snapshots")
-    if not os.path.isdir(snapshots_dir):
-        return None
-    snaps = [d for d in os.listdir(snapshots_dir)
-             if os.path.isdir(os.path.join(snapshots_dir, d))]
-    if not snaps:
-        return None
-    return os.path.join(snapshots_dir, snaps[0])
-
-
-# Collect (src_dir, dest_inside_bundle) for each present model
-model_datas = []
-for mname in MODEL_NAMES:
-    snap = find_model_snapshot(mname)
-    if snap:
-        dest = f"faster_whisper_models/{mname}"
-        model_datas.append((snap, dest))
-        print(f"[build_spec] Found model '{mname}': {snap}")
-    else:
-        print(f"[build_spec] Model '{mname}' not found — skipping")
-
-if not model_datas:
-    print("[build_spec] ERROR: No faster-whisper models found in HF cache!")
-    sys.exit(1)
-
-# ─── Build the datas list for the spec ───────────────────────────────────────
-# Format for spec file: list of (src, dst) tuples
-datas_lines = []
-
-# 1. Whisper models
-for src, dst in model_datas:
-    # Normalize backslashes for the spec (use raw strings / forward slashes)
-    src_norm = src.replace("\\", "/")
-    datas_lines.append(f"    (r'{src_norm}', r'{dst}'),")
-
-# 2. faster_whisper assets (silero_vad_v6.onnx)
-fw_assets = os.path.join(SITE_PKG, "faster_whisper", "assets")
-if os.path.isdir(fw_assets):
-    _fw = fw_assets.replace(chr(92), '/')
-    datas_lines.append(f"    (r'{_fw}', 'faster_whisper/assets'),")
-
-# 3. sounddevice portaudio DLLs
-sd_data = os.path.join(SITE_PKG, "_sounddevice_data")
-if os.path.isdir(sd_data):
-    _sd = sd_data.replace(chr(92), '/')
-    datas_lines.append(f"    (r'{_sd}', '_sounddevice_data'),")
-
-# 4. ctranslate2 package (DLLs live in its directory)
-ct2_dir = os.path.join(SITE_PKG, "ctranslate2")
-if os.path.isdir(ct2_dir):
-    datas_lines.append(f"    (r'{ct2_dir.replace(chr(92), '/')}', 'ctranslate2'),")
-
-# 5. tokenizers package (tokenizers.pyd and sub-modules)
-tk_dir = os.path.join(SITE_PKG, "tokenizers")
-if os.path.isdir(tk_dir):
-    datas_lines.append(f"    (r'{tk_dir.replace(chr(92), '/')}', 'tokenizers'),")
-
-# 6. soundcard mediafoundation CFFI module
-sc_dir = os.path.join(SITE_PKG, "soundcard")
-if os.path.isdir(sc_dir):
-    datas_lines.append(f"    (r'{sc_dir.replace(chr(92), '/')}', 'soundcard'),")
-
-# ─── Embed ffmpeg + ffprobe si disponibles (avant écriture du spec) ───────────
-for _bin in ("ffmpeg.exe", "ffprobe.exe"):
-    _found = shutil.which(_bin.replace(".exe", "")) or shutil.which(_bin)
-    if _found:
-        datas_lines.append(f"    (r'{_found.replace(chr(92), '/')}', r'.'),")
-        print(f"[build_spec] Bundling {_bin}: {_found}")
-    else:
-        print(f"[build_spec] {_bin} not found in PATH — "
-              "audio compression requires ffmpeg at runtime")
-
-datas_block = "\n".join(datas_lines)
 
 # ─── Hidden imports ───────────────────────────────────────────────────────────
 hidden_imports = [
@@ -185,12 +122,21 @@ hidden_imports = [
     "onnxruntime.capi",
     "cffi",
     "notion_push",
+    "notion_api",
+    "assistant_agenda",
+    "assistant_audio",
+    "assistant_fenetre",
+    "assistant_notion",
     "config",
     "user_config",
+    "fichier_json",
     "perf_profile",
+    "modeles",
     "version",
     "history",
+    "journal_app",
     "outlook_cal",
+    "source_agenda",
     "outlook_mail",
     "calendar_digest",
     "teams_roster",
@@ -205,6 +151,7 @@ hidden_imports = [
     "scipy",
     "scipy.signal",
     "noisereduce",
+    "debruitage",
     "pycaw",
     "pycaw.pycaw",
     "comtypes",
@@ -244,6 +191,13 @@ hidden_imports = [
 ]
 hidden_imports_str = ",\n    ".join(f"'{h}'" for h in hidden_imports)
 
+# Modules volontairement absents du paquet. `torch` (366 Mo) n'est importé par
+# noisereduce que dans un try/except ImportError (variante GPU inutilisée) ; il
+# entraînait `numba` puis `llvmlite` (115 Mo) via torch.testing._internal.
+# Voir debruitage.py et PLAN.md (T029).
+excludes = ['pandas', 'jupyter', 'IPython', 'PyQt5', 'wx', 'torch', 'numba', 'llvmlite']
+excludes_str = ", ".join(f"'{e}'" for e in excludes)
+
 # ─── Write the spec file ──────────────────────────────────────────────────────
 ENTRY_POINT = os.path.join(SCRIPT_DIR, "meetnote-tray.py").replace("\\", "/")
 
@@ -278,7 +232,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
-    excludes=['pandas', 'jupyter', 'IPython', 'PyQt5', 'wx'],
+    excludes=[{excludes_str}],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -345,46 +299,40 @@ result = subprocess.run(
 if result.returncode == 0:
     import shutil as _shutil_final
     dist_dir_final = os.path.join(SCRIPT_DIR, "dist", DIST_NAME)
+    # `--noconfirm` + COLLECT vident DIST_DIR_TMP\MeetNote avant d'y écrire
+    # (PyInstaller, _make_clean_directory) : ce dossier ne contient que ce que ce
+    # build vient de produire. C'est lui qu'on signe et qu'on archive.
+    sortie_fraiche = os.path.join(DIST_DIR_TMP, "MeetNote")
 
     # Arrêter MeetNote s'il tourne (sinon MeetNote.exe est verrouillé)
     subprocess.run(["taskkill", "/F", "/IM", "MeetNote.exe"],
                    capture_output=True)
     time.sleep(1)
 
-    print(f"[build_spec] Copying output to {dist_dir_final} ...")
-    _shutil_final.copytree(os.path.join(DIST_DIR_TMP, "MeetNote"), dist_dir_final,
-                           dirs_exist_ok=True)
-    dist_dir = dist_dir_final
-    print(f"\n[build_spec] SUCCESS — output: {dist_dir}")
-
     # ── Signature numérique (certificat auto-signé, stocké dans CurrentUser\My) ──
-    _sign_exe(os.path.join(dist_dir, "MeetNote.exe"))
-
-    # Copier les modèles extra (medium, large…) depuis le cache HF vers dist/models/
-    EXTRA_MODELS = ["medium"]
-    for mname in EXTRA_MODELS:
-        snap = find_model_snapshot(mname)
-        if snap:
-            dest_model = os.path.join(dist_dir, "models", mname)
-            if not os.path.isfile(os.path.join(dest_model, "model.bin")):
-                print(f"[build_spec] Copying model '{mname}' to {dest_model} ...")
-                import shutil as _shutil2
-                _shutil2.copytree(snap, dest_model, dirs_exist_ok=True)
-                print(f"[build_spec] Model '{mname}' copied.")
-            else:
-                print(f"[build_spec] Model '{mname}' already present — skipping copy.")
-        else:
-            print(f"[build_spec] Model '{mname}' not in HF cache — "
-                  "will be downloaded on first use.")
+    _sign_exe(os.path.join(sortie_fraiche, "MeetNote.exe"))
 
     # Report size
     total = 0
     count = 0
-    for root, _dirs, files in os.walk(dist_dir):
+    for root, _dirs, files in os.walk(sortie_fraiche):
         for f in files:
             total += os.path.getsize(os.path.join(root, f))
             count += 1
     print(f"[build_spec] {count} files, total size: {total / 1024 / 1024:.1f} MB")
+
+    # Dossier livré (compatibilité) : fusionné avec l'existant, rien n'est supprimé.
+    print(f"[build_spec] Copying output to {dist_dir_final} ...")
+    _shutil_final.copytree(sortie_fraiche, dist_dir_final, dirs_exist_ok=True)
+    print(f"\n[build_spec] SUCCESS — output: {dist_dir_final}")
+
+    # ── Archive à télécharger : pc\dist\MeetNote-<version>.zip, depuis la sortie
+    # fraîche seule ; les restes d'anciens builds du dossier livré sont nommés. ──
+    produire_archive(sortie_fraiche, VERSION, os.path.join(SCRIPT_DIR, "dist"),
+                     journal=lambda m: print(f"[build_spec] {m}"),
+                     alertes=ALERTES, dossier_livre=dist_dir_final)
+    for ligne in composer_bilan(ALERTES):
+        print(f"[build_spec] {ligne}")
 else:
     print(f"\n[build_spec] FAILED with exit code {result.returncode}")
     sys.exit(result.returncode)

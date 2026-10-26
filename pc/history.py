@@ -4,8 +4,12 @@ Stocké dans %APPDATA%/MeetNote/history.json (100 entrées max).
 """
 import dataclasses
 import datetime
-import json
+import logging
 import os
+
+import fichier_json
+
+_log = logging.getLogger("meetnote")
 
 HISTORY_PATH = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
                              "MeetNote", "history.json")
@@ -25,6 +29,7 @@ def _dict_to_job_dict(d: dict) -> dict:
     defaults = {
         "meeting_name": "",
         "teams_participants": [],
+        "participants_invites": [],
         "status_audio": "done",
         "status_transcript": "queued",
         "status_notion": "pending",
@@ -43,28 +48,62 @@ def _dict_to_job_dict(d: dict) -> dict:
     return d
 
 
+def champs_job(entree: dict) -> dict:
+    """Entrée d'historique -> arguments de `_Job(**...)`.
+
+    Tous les champs du `_Job` sont persistés par `_job_to_dict` ; ils doivent
+    donc tous être relus ici, sinon la reprise au démarrage les réécrit vides
+    dans history.json (notes manuelles et transcriptions perdues).
+    `start_time` absent ou non textuel : maintenant. Texte invalide : ValueError.
+    """
+    st = entree.get("start_time", "")
+    if isinstance(st, str) and st:
+        start = datetime.datetime.fromisoformat(st)
+    else:
+        start = datetime.datetime.now()  # noqa: DTZ005 — heure locale naïve voulue
+    return {
+        "id": entree.get("id", ""),
+        "wav_path": entree.get("wav_path", ""),
+        "start_time": start,
+        "duration_min": entree.get("duration_min", 0),
+        "model_name": entree.get("model_name", "base"),
+        "language": entree.get("language", "fr"),
+        "meeting_type": entree.get("meeting_type", ""),
+        "output_mode": entree.get("output_mode", "notion"),
+        "meeting_name": entree.get("meeting_name", ""),
+        "teams_participants": entree.get("teams_participants", []),
+        "participants_invites": entree.get("participants_invites", []),
+        "status_audio": entree.get("status_audio", "done"),
+        "status_transcript": entree.get("status_transcript", "done"),
+        "status_notion": entree.get("status_notion", "done"),
+        "transcript": entree.get("transcript", ""),
+        "whisper_transcript": entree.get("whisper_transcript", ""),
+        "teams_transcript": entree.get("teams_transcript", ""),
+        "notes": entree.get("notes", ""),
+        "transcript_path": entree.get("transcript_path", ""),
+        "notion_url": entree.get("notion_url", ""),
+        "error_msg": entree.get("error_msg", ""),
+        "attachments": entree.get("attachments", []),
+    }
+
+
 def load() -> list:
-    """Charge l'historique depuis le fichier JSON. Retourne une liste de dicts."""
-    if not os.path.isfile(HISTORY_PATH):
+    """Charge l'historique. Absent : []. Illisible : mis de cote + WARNING + []."""
+    entries = fichier_json.lire_ou_ecarter(HISTORY_PATH, list)
+    if entries is None:
         return []
-    try:
-        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
-            entries = json.load(f)
-        if not isinstance(entries, list):
-            return []
-        return [_dict_to_job_dict(e) for e in entries]
-    except Exception:
-        return []
+    return [_dict_to_job_dict(e) for e in entries if isinstance(e, dict)]
 
 
 def save(entries: list) -> None:
-    """Sauvegarde la liste de dicts dans le fichier JSON."""
+    """Sauvegarde de facon atomique. Un echec est journalise, jamais propage :
+    les appelants (worker de transcription, UI) ne l'attendent pas, et l'ancien
+    fichier reste intact."""
     try:
-        os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
-        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
-            json.dump(entries[:MAX_ENTRIES], f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        fichier_json.ecrire_atomique(HISTORY_PATH, entries[:MAX_ENTRIES],
+                                     ensure_ascii=False, indent=2)
+    except (OSError, TypeError, ValueError) as exc:
+        _log.warning("history.json non sauvegarde (%s) : ancien fichier conserve", exc)
 
 
 def add(job) -> None:

@@ -7,6 +7,7 @@ Stratégie :
      → fonctionne avec l'Outlook classique
 Silencieux si aucune méthode n'est disponible.
 """
+import contextlib
 import datetime
 import logging
 
@@ -17,6 +18,11 @@ try:
     _COM_AVAILABLE = True
 except ImportError:
     _COM_AVAILABLE = False
+
+try:
+    import pythoncom
+except ImportError:
+    pythoncom = None
 
 
 def _to_naive_local(dt) -> datetime.datetime:
@@ -42,78 +48,173 @@ def _get_ews_credentials():
         return None, None, None, None
 
 
-def get_current_or_next_meeting(window_minutes: int = 30) -> dict | None:
-    """
-    Cherche le RDV en cours ou démarrant dans les 'window_minutes' prochaines minutes.
-    Retourne {"subject": str, "start": datetime, "end": datetime} ou None.
-    """
-    # ── 1. Tentative EWS ─────────────────────────────────────────────────────
-    email, username, password, ews_url = _get_ews_credentials()
-    if email:
-        try:
-            import ews_cal
-            result = ews_cal.get_current_or_next_meeting(
-                email=email, username=username, password=password,
-                ews_url=ews_url, window_minutes=window_minutes,
-            )
-            if result is not None:
-                return result
-            # None = EWS injoignable → on tente le fallback COM/MAPI ci-dessous
-        except Exception as e:
-            log.debug("outlook_cal: EWS échoué, fallback COM (%s)", e)
+_IGNORE = {"off", "absent", "busy", "ooo", "out of office", "hors bureau"}
+_FORMAT_RESTRICTION_COM = "%m/%d/%Y %H:%M"
+_COM_DOSSIER_CALENDRIER = 9  # olFolderCalendar
+_COM_CORPS_MAX = 600
+_DUREE_MAX_H = 12
+# Sensibilité Outlook (OlSensitivity) : seul « Privé » masque la réunion dans l'agenda envoyé
+# à Notion. « Confidentiel » (3) est une simple étiquette, Outlook ne la cache pas aux délégués.
+_COM_SENSIBILITE_PRIVE = 2  # olPrivate
 
-    # ── 2. Fallback COM/MAPI ──────────────────────────────────────────────────
+
+def _split_recipients(raw: str) -> list:
+    """Découpe une chaîne 'Nom1; Nom2' en liste propre.
+
+    Le séparateur d'Outlook est « ; » : la virgule fait partie d'un nom (« Martin, Alice »).
+    """
+    if not raw:
+        return []
+    return [n.strip() for n in raw.split(";") if n.strip()]
+
+
+@contextlib.contextmanager
+def _contexte_com():
+    """Initialise COM pour le thread appelant (requis hors du thread principal) et le
+    libère toujours à la sortie. Sans pythoncom, ne fait rien."""
+    if pythoncom is None:
+        yield
+        return
+    pythoncom.CoInitialize()
+    try:
+        yield
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def _est_prive_com(item) -> bool:
+    """Vrai si la réunion est marquée « Privé » ; toute lecture impossible vaut False."""
+    try:
+        return int(item.Sensitivity) == _COM_SENSIBILITE_PRIVE
+    except Exception as e:  # com_error, attribut absent, valeur non numérique
+        log.debug("outlook_cal: sensibilité illisible (%s)", e)
+        return False
+
+
+def _evenement_com(item) -> dict | None:
+    """Convertit un item COM en dict d'agenda, ou None s'il est à ignorer
+    (journée entière, objet vide ou « off/absent/ooo… », plus de 12 h)."""
+    subject = str(item.Subject).strip()
+    try:
+        if item.AllDayEvent:
+            return None
+    except Exception:
+        pass
+    if not subject or subject.lower() in _IGNORE:
+        return None
+    start = _to_naive_local(item.Start)
+    end   = _to_naive_local(item.End)
+    if (end - start).total_seconds() / 3600 > _DUREE_MAX_H:
+        return None
+
+    # Corps — texte brut tronqué
+    try:
+        raw_body = str(item.Body or "").strip()
+    except Exception:
+        raw_body = ""
+    body = " ".join(raw_body.split())[:_COM_CORPS_MAX]
+
+    return {
+        "subject":      subject,
+        "start":        start,
+        "end":          end,
+        "location":     str(getattr(item, "Location", "") or "").strip(),
+        "body":         body,
+        "organizer":    str(getattr(item, "Organizer", "") or "").strip(),
+        "required":     _split_recipients(str(getattr(item, "RequiredAttendees", "") or "")),
+        "optional":     _split_recipients(str(getattr(item, "OptionalAttendees", "") or "")),
+        "is_recurring": bool(getattr(item, "IsRecurring", False)),
+        "prive":        _est_prive_com(item),
+    }
+
+
+def evenements_ews(debut: datetime.datetime, fin: datetime.datetime) -> list | None:
+    """
+    RDV de la fenêtre [debut, fin] (datetimes naïfs locaux) lus via EWS, au format
+    de `get_events_range`. None si EWS est injoignable (pas d'identifiants,
+    exchangelib absent, connexion en échec) ; [] = joignable, aucune réunion.
+    """
+    email, username, password, ews_url = _get_ews_credentials()
+    if not email:
+        return None
+    try:
+        import ews_cal
+        return ews_cal.evenements(email, username, password, ews_url, debut, fin)
+    except Exception as e:
+        log.debug("outlook_cal: EWS échoué (%s)", e)
+        return None
+
+
+def evenements_com(debut: datetime.datetime, fin: datetime.datetime) -> list | None:
+    """
+    RDV de la fenêtre [debut, fin] (datetimes naïfs locaux) lus via COM/MAPI, au
+    format de `get_events_range`. None si win32com est absent ou Outlook
+    injoignable ; [] = joignable, aucune réunion.
+    """
     if not _COM_AVAILABLE:
         return None
     try:
-        outlook = win32com.client.Dispatch("Outlook.Application")
-        ns = outlook.GetNamespace("MAPI")
-        cal = ns.GetDefaultFolder(9)  # olFolderCalendar
-
-        now = datetime.datetime.now()
-        end_window = now + datetime.timedelta(minutes=window_minutes)
-
-        items = cal.Items
-        items.IncludeRecurrences = True
-        items.Sort("[Start]")
-
-        fmt = "%m/%d/%Y %H:%M"
-        restriction = (
-            f"[Start] <= '{end_window.strftime(fmt)}' AND "
-            f"[End] >= '{now.strftime(fmt)}'"
-        )
-        restricted = items.Restrict(restriction)
-
-        _IGNORE = {"off", "absent", "busy", "ooo", "out of office", "hors bureau"}
-
-        for item in restricted:
-            try:
-                subject = str(item.Subject).strip()
-
-                try:
-                    if item.AllDayEvent:
-                        continue
-                except Exception:
-                    pass
-
-                if not subject or subject.lower() in _IGNORE:
-                    continue
-
-                start = _to_naive_local(item.Start)
-                end   = _to_naive_local(item.End)
-
-                duration_h = (end - start).total_seconds() / 3600
-                if duration_h > 12:
-                    continue
-
-                return {"subject": subject, "start": start, "end": end}
-            except Exception as e:
-                log.debug("outlook_cal: item skip (%s)", e)
-                continue
-
+        with _contexte_com():
+            return _lire_calendrier_com(debut, fin)
     except Exception as e:
         log.debug("outlook_cal: COM unavailable (%s)", e)
-    return None
+        return None
+
+
+def _lire_calendrier_com(debut: datetime.datetime, fin: datetime.datetime) -> list:
+    """Lecture COM de la fenêtre ; COM doit déjà être initialisé pour ce thread."""
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    ns  = outlook.GetNamespace("MAPI")
+    cal = ns.GetDefaultFolder(_COM_DOSSIER_CALENDRIER)
+
+    items = cal.Items
+    items.IncludeRecurrences = True
+    items.Sort("[Start]")
+
+    fmt = _FORMAT_RESTRICTION_COM
+    restricted = items.Restrict(
+        f"[Start] <= '{fin.strftime(fmt)}' AND [End] >= '{debut.strftime(fmt)}'"
+    )
+
+    results = []
+    for item in restricted:
+        try:
+            evt = _evenement_com(item)
+        except Exception as e:
+            log.debug("outlook_cal: item skip (%s)", e)
+            continue
+        if evt is not None:
+            results.append(evt)
+    return results
+
+
+def _evenements_fenetre(debut: datetime.datetime, fin: datetime.datetime) -> list | None:
+    """EWS d'abord, COM en repli ; None si aucune des deux sources ne répond."""
+    result = evenements_ews(debut, fin)
+    if result is None:
+        result = evenements_com(debut, fin)
+    return result
+
+
+def _reunions_proches(window_minutes: int) -> list:
+    """Réunions en cours ou démarrant dans `window_minutes`, au format
+    {"subject", "start", "end"}, triées par début. [] si aucune source ne répond."""
+    now = datetime.datetime.now()
+    evts = _evenements_fenetre(now, now + datetime.timedelta(minutes=window_minutes))
+    return [
+        {"subject": e["subject"], "start": e["start"], "end": e["end"]}
+        for e in sorted(evts or [], key=lambda e: e["start"])
+    ]
+
+
+def get_current_or_next_meeting(window_minutes: int = 30) -> dict | None:
+    """
+    Cherche le RDV en cours ou démarrant dans les 'window_minutes' prochaines minutes
+    (le premier par heure de début).
+    Retourne {"subject": str, "start": datetime, "end": datetime} ou None.
+    """
+    reunions = _reunions_proches(window_minutes)
+    return reunions[0] if reunions else None
 
 
 def get_all_current_meetings(window_minutes: int = 30) -> list:
@@ -121,65 +222,7 @@ def get_all_current_meetings(window_minutes: int = 30) -> list:
     Retourne TOUTES les réunions en cours ou démarrant dans les 'window_minutes' prochaines minutes.
     Chaque item : {"subject": str, "start": datetime, "end": datetime}
     """
-    email, username, password, ews_url = _get_ews_credentials()
-    if email:
-        try:
-            import ews_cal
-            if hasattr(ews_cal, "get_all_current_meetings"):
-                result = ews_cal.get_all_current_meetings(
-                    email=email, username=username, password=password,
-                    ews_url=ews_url, window_minutes=window_minutes,
-                )
-                if result is not None:
-                    return result
-                # None = EWS injoignable → fallback COM/MAPI ci-dessous
-        except Exception as e:
-            log.debug("outlook_cal: EWS get_all échoué (%s)", e)
-
-    if not _COM_AVAILABLE:
-        return []
-    try:
-        outlook = win32com.client.Dispatch("Outlook.Application")
-        ns      = outlook.GetNamespace("MAPI")
-        cal     = ns.GetDefaultFolder(9)
-
-        now        = datetime.datetime.now()
-        end_window = now + datetime.timedelta(minutes=window_minutes)
-
-        items = cal.Items
-        items.IncludeRecurrences = True
-        items.Sort("[Start]")
-
-        fmt = "%m/%d/%Y %H:%M"
-        restriction = (
-            f"[Start] <= '{end_window.strftime(fmt)}' AND "
-            f"[End] >= '{now.strftime(fmt)}'"
-        )
-        restricted = items.Restrict(restriction)
-        _IGNORE = {"off", "absent", "busy", "ooo", "out of office", "hors bureau"}
-
-        results = []
-        for item in restricted:
-            try:
-                subject = str(item.Subject).strip()
-                try:
-                    if item.AllDayEvent:
-                        continue
-                except Exception:
-                    pass
-                if not subject or subject.lower() in _IGNORE:
-                    continue
-                start = _to_naive_local(item.Start)
-                end   = _to_naive_local(item.End)
-                if (end - start).total_seconds() / 3600 > 12:
-                    continue
-                results.append({"subject": subject, "start": start, "end": end})
-            except Exception as e:
-                log.debug("outlook_cal: item skip (%s)", e)
-        return results
-    except Exception as e:
-        log.debug("outlook_cal: COM get_all unavailable (%s)", e)
-    return []
+    return _reunions_proches(window_minutes)
 
 
 def get_events_range(days: int = 15) -> list:
@@ -189,97 +232,12 @@ def get_events_range(days: int = 15) -> list:
         "subject", "start", "end",
         "location", "body", "organizer",
         "required": [str], "optional": [str],
-        "is_recurring": bool,
+        "is_recurring": bool, "prive": bool,
     }
-    Essaie EWS en priorité, sinon COM/MAPI.
+    Essaie EWS en priorité, sinon COM/MAPI ; [] si aucune source ne répond.
     """
-    # ── 1. Tentative EWS ─────────────────────────────────────────────────────
-    email, username, password, ews_url = _get_ews_credentials()
-    if email:
-        try:
-            import ews_cal
-            if hasattr(ews_cal, "get_events_range"):
-                result = ews_cal.get_events_range(
-                    email=email, username=username, password=password,
-                    ews_url=ews_url, days=days,
-                )
-                if result is not None:
-                    return result
-        except Exception as e:
-            log.debug("outlook_cal: EWS get_events_range échoué, fallback COM (%s)", e)
-
-    # ── 2. Fallback COM/MAPI ──────────────────────────────────────────────────
-    if not _COM_AVAILABLE:
-        return []
-    try:
-        outlook = win32com.client.Dispatch("Outlook.Application")
-        ns  = outlook.GetNamespace("MAPI")
-        cal = ns.GetDefaultFolder(9)  # olFolderCalendar
-
-        now        = datetime.datetime.now()
-        end_window = now + datetime.timedelta(days=days)
-
-        items = cal.Items
-        items.IncludeRecurrences = True
-        items.Sort("[Start]")
-
-        fmt = "%m/%d/%Y %H:%M"
-        restriction = (
-            f"[Start] <= '{end_window.strftime(fmt)}' AND "
-            f"[End] >= '{now.strftime(fmt)}'"
-        )
-        restricted = items.Restrict(restriction)
-
-        _IGNORE = {"off", "absent", "busy", "ooo", "out of office", "hors bureau"}
-
-        def _split_recipients(raw: str) -> list:
-            """Découpe une chaîne 'Nom1; Nom2' en liste propre."""
-            if not raw:
-                return []
-            return [n.strip() for n in raw.replace(",", ";").split(";") if n.strip()]
-
-        results = []
-        for item in restricted:
-            try:
-                subject = str(item.Subject).strip()
-                try:
-                    if item.AllDayEvent:
-                        continue
-                except Exception:
-                    pass
-                if not subject or subject.lower() in _IGNORE:
-                    continue
-                start = _to_naive_local(item.Start)
-                end   = _to_naive_local(item.End)
-                if (end - start).total_seconds() / 3600 > 12:
-                    continue
-
-                # Corps — texte brut tronqué
-                try:
-                    raw_body = str(item.Body or "").strip()
-                except Exception:
-                    raw_body = ""
-                body = " ".join(raw_body.split())[:600]
-
-                results.append({
-                    "subject":      subject,
-                    "start":        start,
-                    "end":          end,
-                    "location":     str(getattr(item, "Location", "") or "").strip(),
-                    "body":         body,
-                    "organizer":    str(getattr(item, "Organizer", "") or "").strip(),
-                    "required":     _split_recipients(str(getattr(item, "RequiredAttendees", "") or "")),
-                    "optional":     _split_recipients(str(getattr(item, "OptionalAttendees", "") or "")),
-                    "is_recurring": bool(getattr(item, "IsRecurring", False)),
-                })
-            except Exception as e:
-                log.debug("outlook_cal: get_events_range item skip (%s)", e)
-
-        return results
-
-    except Exception as e:
-        log.debug("outlook_cal: get_events_range COM unavailable (%s)", e)
-    return []
+    now = datetime.datetime.now()
+    return _evenements_fenetre(now, now + datetime.timedelta(days=days)) or []
 
 
 def is_available() -> bool:

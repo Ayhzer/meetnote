@@ -4,6 +4,7 @@ Upload audio : wav -> opus (via ffmpeg) -> POST /v1/file_uploads -> attach a la 
 """
 import datetime
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,9 +13,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config
-
-NOTION_API = "https://api.notion.com/v1"
-NOTION_VERSION = "2026-03-11"
+from notion_api import NOTION_API, NOTION_VERSION
 
 HEADERS = {
     "Authorization": f"Bearer {config.NOTION_TOKEN}",
@@ -208,17 +207,38 @@ def _find_ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 
 
-def _find_ffprobe() -> str | None:
-    """Cherche ffprobe : déduit du chemin ffmpeg, puis dans PATH."""
-    import shutil
-    ffmpeg = _find_ffmpeg()
-    if ffmpeg:
-        # Cherche ffprobe dans le même dossier que ffmpeg
-        ffprobe = os.path.join(os.path.dirname(ffmpeg),
-                               "ffprobe.exe" if sys.platform == "win32" else "ffprobe")
-        if os.path.isfile(ffprobe):
-            return ffprobe
-    return shutil.which("ffprobe")
+# Délai maximal de la lecture de durée (ffmpeg -i), en secondes.
+DELAI_LECTURE_DUREE_S = 15
+
+# « Duration: 01:02:03.45, start: … » — les heures peuvent dépasser 24, les
+# centièmes peuvent manquer ; « Duration: N/A » ne correspond pas (durée inconnue).
+_RE_DUREE_FFMPEG = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2})(?:\.(\d+))?")
+
+
+def duree_depuis_sortie_ffmpeg(texte: str) -> float | None:
+    """Durée en secondes lue dans la sortie de `ffmpeg -i`, ou None si absente."""
+    m = _RE_DUREE_FFMPEG.search(texte or "")
+    if not m:
+        return None
+    heures, minutes, secondes, fraction = m.groups()
+    total = int(heures) * 3600 + int(minutes) * 60 + int(secondes)
+    return total + (float(f"0.{fraction}") if fraction else 0.0)
+
+
+def _lire_duree_s(ffmpeg: str, chemin: str) -> float | None:
+    """Durée d'un fichier audio via `ffmpeg -i` (None si illisible).
+
+    ffmpeg sans fichier de sortie rend un code non nul : seul stderr compte.
+    """
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", chemin],
+            capture_output=True, timeout=DELAI_LECTURE_DUREE_S,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return duree_depuis_sortie_ffmpeg(r.stderr.decode(errors="replace"))
 
 
 def _split_audio_for_upload(opus_path: str, segment_min: int = 10) -> list:
@@ -228,28 +248,13 @@ def _split_audio_for_upload(opus_path: str, segment_min: int = 10) -> list:
     Si le fichier est assez court, retourne [opus_path] sans modification.
     """
     import glob as _glob
-    import json as _json
 
-    ffmpeg  = _find_ffmpeg()
-    ffprobe = _find_ffprobe()
+    ffmpeg = _find_ffmpeg()
 
     if not ffmpeg:
         return [opus_path]
 
-    # Déterminer la durée
-    duration_s = None
-    if ffprobe:
-        try:
-            r = subprocess.run(
-                [ffprobe, "-v", "quiet", "-print_format", "json",
-                 "-show_format", opus_path],
-                capture_output=True, timeout=15,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            if r.returncode == 0:
-                duration_s = float(_json.loads(r.stdout)["format"]["duration"])
-        except Exception:
-            pass
+    duration_s = _lire_duree_s(ffmpeg, opus_path)
 
     # Si on n'a pas pu mesurer la durée, on découpe si le fichier > 50 Mo
     if duration_s is None:

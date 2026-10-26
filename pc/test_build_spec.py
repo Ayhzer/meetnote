@@ -1,11 +1,14 @@
 """Tests de la résolution des chemins Python des scripts de build."""
 
+import ast
 import getpass
 import os
 import re
 import sys
 import tempfile
 import unittest
+import zipfile
+from pathlib import Path
 from unittest import mock
 
 import build_paths
@@ -110,6 +113,523 @@ class VersionResourceTest(unittest.TestCase):
         champs = {c.name: c.val for c in info.kids[0].kids[0].kids}
         self.assertEqual(champs["FileVersion"], "3.3.0")
         self.assertEqual(champs["ProductName"], "MeetNote")
+
+
+class DatasEmbarqueesTest(unittest.TestCase):
+    """Le spec n'embarque aucun modèle Whisper (retiré du paquet, T028)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.site = os.path.join(self._tmp.name, "site-packages")
+        for sous_dossier, _dest in build_paths.PAQUETS_EMBARQUES:
+            os.makedirs(os.path.join(self.site, sous_dossier))
+        self.messages = []
+
+    def _collecter(self, trouver=lambda nom: None):
+        return build_paths.collecter_datas(
+            self.site, trouver, self.messages.append, environ={})
+
+    def test_paquets_presents_embarques(self):
+        destinations = {dest for _src, dest in self._collecter()}
+        self.assertEqual(destinations,
+                         {dest for _s, dest in build_paths.PAQUETS_EMBARQUES})
+
+    def test_paquet_absent_ignore(self):
+        os.rmdir(os.path.join(self.site, "soundcard"))
+        destinations = {dest for _src, dest in self._collecter()}
+        self.assertNotIn("soundcard", destinations)
+
+    def test_aucun_dossier_de_modele_dans_le_spec(self):
+        # Même avec un cache Hugging Face présent sur le poste de build.
+        cache = os.path.join(self._tmp.name, "hf", "models--Systran--faster-whisper-x")
+        os.makedirs(cache)
+        bloc = build_paths.formater_datas(self._collecter(lambda nom: None))
+        for interdit in ("faster_whisper_models", "models--Systran", "faster-whisper-",
+                         "huggingface", "snapshots", "r'models'", "/models"):
+            self.assertNotIn(interdit, bloc)
+        self.assertNotIn("model.bin", bloc)
+
+    def test_cache_vide_ne_fait_pas_echouer(self):
+        """Aucun modèle trouvé n'est plus une erreur : la liste est rendue."""
+        self.assertIsInstance(self._collecter(), list)
+
+    def test_binaires_trouves_copies_a_la_racine(self):
+        faux = {"ffmpeg": "C:/outils/ffmpeg.exe", "ffprobe": "C:/outils/ffprobe.exe"}
+        datas = self._collecter(faux.get)
+        self.assertIn(("C:/outils/ffmpeg.exe", "."), datas)
+        self.assertNotIn(("C:/outils/ffprobe.exe", "."), datas)
+
+    def test_ffprobe_n_est_plus_embarque(self):
+        self.assertNotIn("ffprobe.exe", build_paths.BINAIRES_EMBARQUES)
+        appels = []
+        self._collecter(lambda nom: appels.append(nom))
+        self.assertFalse(any("ffprobe" in nom for nom in appels))
+
+    def test_binaire_absent_signale(self):
+        self._collecter()
+        self.assertTrue(any("ffmpeg.exe" in m for m in self.messages))
+
+    def test_format_du_bloc(self):
+        bloc = build_paths.formater_datas([("C:/a/b", "dest"), ("C:/c.exe", ".")])
+        self.assertEqual(bloc, "    (r'C:/a/b', r'dest'),\n    (r'C:/c.exe', r'.'),")
+
+
+class ResoudreFfmpegTest(unittest.TestCase):
+    """ffmpeg vient de MEETNOTE_FFMPEG, à défaut du PATH (T031)."""
+
+    def setUp(self):
+        self.messages = []
+
+    def _resoudre(self, environ, trouve=None, existe=lambda chemin: True):
+        return build_paths.resoudre_ffmpeg(
+            environ, lambda nom: trouve, self.messages.append, existe)
+
+    def test_variable_valide_prime_sur_le_path(self):
+        env = {build_paths.ENV_FFMPEG: r"D:\essentials\ffmpeg.exe"}
+        self.assertEqual(self._resoudre(env, r"C:\path\ffmpeg.exe"),
+                         r"D:\essentials\ffmpeg.exe")
+        self.assertEqual(self.messages, [])
+
+    def test_sans_variable_le_path_est_utilise(self):
+        self.assertEqual(self._resoudre({}, r"C:\path\ffmpeg.exe"),
+                         r"C:\path\ffmpeg.exe")
+
+    def test_variable_vide_ignoree(self):
+        env = {build_paths.ENV_FFMPEG: "  "}
+        self.assertEqual(self._resoudre(env, "X"), "X")
+        self.assertEqual(self.messages, [])
+
+    def test_variable_invalide_signalee_et_repli_sur_le_path(self):
+        env = {build_paths.ENV_FFMPEG: r"D:\absent\ffmpeg.exe"}
+        resolu = self._resoudre(env, r"C:\path\ffmpeg.exe",
+                                existe=lambda chemin: False)
+        self.assertEqual(resolu, r"C:\path\ffmpeg.exe")
+        self.assertTrue(any(build_paths.ENV_FFMPEG in m and "absent" in m
+                            for m in self.messages))
+
+    def test_rien_nulle_part_rend_none(self):
+        self.assertIsNone(self._resoudre({}))
+
+    def test_collecter_datas_embarque_le_ffmpeg_de_la_variable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ffmpeg = os.path.join(tmp, "ffmpeg.exe")
+            Path(ffmpeg).write_bytes(b"x" * 10)
+            datas = build_paths.collecter_datas(
+                tmp, lambda nom: None, lambda m: None,
+                environ={build_paths.ENV_FFMPEG: ffmpeg})
+        self.assertIn((ffmpeg.replace("\\", "/"), "."), datas)
+
+
+class PoidsTest(unittest.TestCase):
+    """Contrôles de poids : fonctions pures, seuils nommés en constante."""
+
+    MO = build_paths.OCTETS_PAR_MO
+
+    def test_unite_coherente_avec_modeles(self):
+        import modeles
+        self.assertEqual(build_paths.OCTETS_PAR_MO, modeles.OCTETS_PAR_MO)
+
+    def test_ffmpeg_sous_le_seuil_sans_alerte(self):
+        limite = build_paths.POIDS_MAX_FFMPEG_MO * self.MO
+        self.assertIsNone(build_paths.avertissement_poids_ffmpeg(limite))
+
+    def test_ffmpeg_complet_signale_en_clair(self):
+        message = build_paths.avertissement_poids_ffmpeg(232 * self.MO)
+        self.assertIn("ffmpeg complet détecté (232.0 Mo", message)
+        self.assertIn("essentials", message)
+        self.assertIn(build_paths.ENV_FFMPEG, message)
+
+    def test_archive_sous_le_seuil_sans_alerte(self):
+        limite = build_paths.POIDS_MAX_ARCHIVE_MO * self.MO
+        self.assertIsNone(build_paths.avertissement_poids_archive(limite))
+
+    def test_archive_trop_lourde_signalee(self):
+        octets = (build_paths.POIDS_MAX_ARCHIVE_MO + 1) * self.MO
+        message = build_paths.avertissement_poids_archive(octets)
+        self.assertIn("301.0 Mo", message)
+        self.assertIn("300 Mo", message)
+
+    def test_un_octet_au_dela_du_seuil_n_est_pas_affiche_egal_au_seuil(self):
+        octets = build_paths.POIDS_MAX_ARCHIVE_MO * self.MO + 1
+        message = build_paths.avertissement_poids_archive(octets)
+        self.assertIn("archive de 300.1 Mo, au-delà de 300 Mo", message)
+        octets = build_paths.POIDS_MAX_FFMPEG_MO * self.MO + 1
+        message = build_paths.avertissement_poids_ffmpeg(octets)
+        self.assertIn("120.1 Mo, au-delà de 120 Mo", message)
+
+    def test_arrondi_par_exces_a_une_decimale(self):
+        self.assertEqual(build_paths.mo_arrondi_au_dessus(301 * self.MO), 301.0)
+        self.assertEqual(build_paths.mo_arrondi_au_dessus(301 * self.MO + 1), 301.1)
+
+    def test_seuils_attendus(self):
+        self.assertEqual(build_paths.POIDS_MAX_ARCHIVE_MO, 300)
+        self.assertEqual(build_paths.POIDS_MAX_FFMPEG_MO, 120)
+
+    def test_collecter_datas_avertit_d_un_ffmpeg_trop_lourd(self):
+        messages = []
+        build_paths.collecter_datas(
+            "absent", lambda nom: "C:/outils/ffmpeg.exe", messages.append,
+            environ={}, taille=lambda chemin: 232 * self.MO)
+        self.assertTrue(any("ffmpeg complet détecté (232.0 Mo" in m for m in messages))
+
+    def test_collecter_datas_ffmpeg_leger_sans_alerte(self):
+        messages = []
+        build_paths.collecter_datas(
+            "absent", lambda nom: "C:/outils/ffmpeg.exe", messages.append,
+            environ={}, taille=lambda chemin: 90 * self.MO)
+        self.assertFalse(any("ATTENTION" in m for m in messages))
+        self.assertTrue(any("90 Mo" in m for m in messages))
+
+    def test_alerte_ffmpeg_retenue_pour_le_bilan(self):
+        alertes = []
+        build_paths.collecter_datas(
+            "absent", lambda nom: "C:/outils/ffmpeg.exe", lambda m: None,
+            environ={}, taille=lambda chemin: 232 * self.MO, alertes=alertes)
+        self.assertEqual(len(alertes), 1)
+        self.assertIn("ffmpeg complet détecté", alertes[0])
+
+    def test_ffmpeg_absent_retenu_pour_le_bilan(self):
+        alertes = []
+        build_paths.collecter_datas(
+            "absent", lambda nom: None, lambda m: None, environ={},
+            alertes=alertes)
+        self.assertTrue(any("ffmpeg.exe" in a for a in alertes))
+
+    def test_variable_invalide_retenue_pour_le_bilan(self):
+        alertes = []
+        build_paths.collecter_datas(
+            "absent", lambda nom: None, lambda m: None,
+            environ={build_paths.ENV_FFMPEG: r"D:\absent\ffmpeg.exe"},
+            alertes=alertes)
+        self.assertTrue(any(build_paths.ENV_FFMPEG in a for a in alertes))
+
+    def test_ffmpeg_leger_ne_laisse_aucune_alerte(self):
+        alertes = []
+        build_paths.collecter_datas(
+            "absent", lambda nom: "C:/outils/ffmpeg.exe", lambda m: None,
+            environ={}, taille=lambda chemin: 90 * self.MO, alertes=alertes)
+        self.assertEqual(alertes, [])
+
+
+class BilanTest(unittest.TestCase):
+    """Le bilan final répète les alertes, que le journal PyInstaller noie."""
+
+    def test_sans_alerte_aucune_ligne(self):
+        self.assertEqual(build_paths.composer_bilan([]), [])
+
+    def test_alertes_listees_apres_un_titre_compte(self):
+        lignes = build_paths.composer_bilan(["ffmpeg trop lourd", "archive lourde"])
+        self.assertIn("2 alerte(s)", lignes[0])
+        self.assertEqual(lignes[1:], ["  - ffmpeg trop lourd", "  - archive lourde"])
+
+    def test_alertes_d_archive_et_de_ffmpeg_dans_le_meme_bilan(self):
+        alertes = []
+        build_paths.collecter_datas(
+            "absent", lambda nom: "C:/o/ffmpeg.exe", lambda m: None, environ={},
+            taille=lambda chemin: 232 * build_paths.OCTETS_PAR_MO, alertes=alertes)
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "MeetNote")
+            os.makedirs(source)
+            Path(source, "MeetNote.exe").write_bytes(b"x")
+            with mock.patch.object(build_paths, "POIDS_MAX_ARCHIVE_MO", 0):
+                build_paths.produire_archive(
+                    source, "9.9.9", tmp, journal=lambda m: None, alertes=alertes)
+        texte = "\n".join(build_paths.composer_bilan(alertes))
+        self.assertIn("ffmpeg complet détecté", texte)
+        self.assertIn("archive de", texte)
+
+
+class FfmpegRenommeTest(unittest.TestCase):
+    """Un ffmpeg d'un autre nom est embarqué sous « ffmpeg.exe » (A2, T031)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.source = os.path.join(self._tmp.name, "ffmpeg-essentials-7.exe")
+        Path(self.source).write_bytes(b"binaire")
+        self.etape = os.path.join(self._tmp.name, "etape")
+        self.messages = []
+
+    def _collecter(self, **options):
+        return build_paths.collecter_datas(
+            "absent", lambda nom: None, self.messages.append,
+            environ={build_paths.ENV_FFMPEG: self.source}, **options)
+
+    def test_copie_nommee_ffmpeg_exe_embarquee(self):
+        datas = self._collecter(etape=self.etape)
+        copie = os.path.join(self.etape, "ffmpeg.exe")
+        self.assertEqual(datas, [(copie.replace("\\", "/"), ".")])
+        self.assertEqual(Path(copie).read_bytes(), b"binaire")
+        # L'original n'est jamais touché.
+        self.assertTrue(os.path.isfile(self.source))
+
+    def test_nom_conforme_embarque_tel_quel_sans_copie(self):
+        conforme = os.path.join(self._tmp.name, "FFMPEG.EXE")
+        Path(conforme).write_bytes(b"x")
+        copies = []
+        datas = build_paths.collecter_datas(
+            "absent", lambda nom: None, self.messages.append,
+            environ={build_paths.ENV_FFMPEG: conforme}, etape=self.etape,
+            copier=lambda *args: copies.append(args))
+        self.assertEqual(datas, [(conforme.replace("\\", "/"), ".")])
+        self.assertEqual(copies, [])
+
+    def test_sans_dossier_d_etape_le_decalage_est_signale(self):
+        alertes = []
+        datas = self._collecter(alertes=alertes)
+        self.assertEqual(datas, [(self.source.replace("\\", "/"), ".")])
+        self.assertTrue(any("ffmpeg-essentials-7.exe" in a and "ffmpeg.exe" in a
+                            for a in alertes))
+
+
+class NomArchiveTest(unittest.TestCase):
+    def test_archive_complete(self):
+        self.assertEqual(build_paths.nom_archive("3.3.0"), "MeetNote-3.3.0.zip")
+
+    def test_archive_slim_coherente_avec_le_dossier(self):
+        self.assertEqual(build_paths.nom_archive("3.3.0", slim=True),
+                         "MeetNote-slim-3.3.0.zip")
+        for slim in (False, True):
+            self.assertEqual(build_paths.nom_archive("3.3.0", slim),
+                             build_paths.dist_dir_name("3.3.0", slim) + ".zip")
+
+    def test_suit_version_py(self):
+        self.assertEqual(build_paths.nom_archive(version.VERSION),
+                         f"MeetNote-{version.VERSION}.zip")
+
+
+class ResteTest(unittest.TestCase):
+    """`lister_restes` : fonction pure, chemins relatifs à barres obliques."""
+
+    def test_aucun_reste_si_tout_est_dans_la_sortie_fraiche(self):
+        frais = ["MeetNote.exe", "_internal/a.dll"]
+        self.assertEqual(build_paths.lister_restes(frais, frais), [])
+
+    def test_dossier_absent_nomme_une_seule_fois(self):
+        livres = ["MeetNote.exe", "_internal/torch/x.dll",
+                  "_internal/torch/lib/y.dll"]
+        restes = build_paths.lister_restes(livres, ["MeetNote.exe"])
+        self.assertEqual(restes, ["_internal"])
+
+    def test_fichier_perdu_dans_un_dossier_encore_present_nomme_seul(self):
+        livres = ["_internal/ffprobe.EXE", "_internal/a.dll", "_internal/torch/x.dll"]
+        frais = ["_internal/a.dll"]
+        self.assertEqual(build_paths.lister_restes(livres, frais),
+                         ["_internal/ffprobe.EXE", "_internal/torch"])
+
+    def test_comparaison_insensible_a_la_casse(self):
+        self.assertEqual(
+            build_paths.lister_restes(["_internal/FFMPEG.exe"],
+                                      ["_internal/ffmpeg.exe"]), [])
+
+    def test_modele_herite_est_un_reste_comme_un_autre(self):
+        livres = ["MeetNote.exe", "models/small/model.bin",
+                  "_internal/faster_whisper_models/m.bin"]
+        restes = build_paths.lister_restes(livres, ["MeetNote.exe"])
+        self.assertEqual(restes, ["_internal", "models"])
+
+
+class ProduireArchiveTest(unittest.TestCase):
+    """Archive produite depuis une fausse sortie fraîche, jamais par PyInstaller."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dist = os.path.join(self._tmp.name, "dist")
+        self.frais = os.path.join(self._tmp.name, "build", "MeetNote")
+        self.livre = os.path.join(self.dist, "MeetNote-9.9.9")
+        for racine in (self.frais, self.livre):
+            self._ecrire(racine, "MeetNote.exe", b"exe")
+            self._ecrire(racine, os.path.join("_internal", "ffmpeg.exe"), b"ff")
+            self._ecrire(racine, os.path.join("_internal", "ctranslate2", "models",
+                                              "x.bin"), b"ok")
+        self.messages = []
+        self.alertes = []
+
+    @staticmethod
+    def _ecrire(racine, relatif, contenu=b"x"):
+        chemin = os.path.join(racine, relatif)
+        os.makedirs(os.path.dirname(chemin), exist_ok=True)
+        Path(chemin).write_bytes(contenu)
+
+    def _produire(self, **options):
+        return build_paths.produire_archive(
+            self.frais, "9.9.9", self.dist, journal=self.messages.append,
+            alertes=self.alertes, **options)
+
+    def _noms(self, chemin):
+        with zipfile.ZipFile(chemin) as z:
+            return {n.replace("\\", "/") for n in z.namelist()}
+
+    def test_archive_dans_le_dossier_de_sortie_sous_la_racine_versionnee(self):
+        chemin = self._produire()
+        self.assertEqual(chemin, os.path.join(self.dist, "MeetNote-9.9.9.zip"))
+        self.assertEqual(self._noms(chemin), {
+            "MeetNote-9.9.9/MeetNote.exe",
+            "MeetNote-9.9.9/_internal/ffmpeg.exe",
+            "MeetNote-9.9.9/_internal/ctranslate2/models/x.bin",
+        })
+
+    def test_archive_slim_nommee_comme_son_dossier(self):
+        chemin = self._produire(slim=True)
+        self.assertEqual(os.path.basename(chemin), "MeetNote-slim-9.9.9.zip")
+        self.assertTrue(all(n.startswith("MeetNote-slim-9.9.9/")
+                            for n in self._noms(chemin)))
+
+    def test_poids_affiche(self):
+        self._produire()
+        self.assertTrue(any("Archive prête" in m and "Mo)" in m
+                            for m in self.messages))
+
+    def test_archive_existante_remplacee(self):
+        ancienne = os.path.join(self.dist, "MeetNote-9.9.9.zip")
+        Path(ancienne).write_bytes(b"ancien contenu non zip")
+        chemin = self._produire()
+        self.assertTrue(zipfile.is_zipfile(chemin))
+
+    def test_restes_d_anciens_builds_absents_du_zip_presents_sur_le_disque(self):
+        self._ecrire(self.livre, os.path.join("_internal", "torch", "x.dll"))
+        self._ecrire(self.livre, os.path.join("_internal", "ffprobe.EXE"))
+        self._ecrire(self.livre, os.path.join("models", "small", "model.bin"))
+        chemin = self._produire(dossier_livre=self.livre)
+        noms = self._noms(chemin)
+        self.assertFalse(any("torch" in n or "ffprobe" in n or "/models/small" in n
+                             for n in noms))
+        # Le models d'un paquet, lui, est dans la sortie fraîche : il reste.
+        self.assertIn("MeetNote-9.9.9/_internal/ctranslate2/models/x.bin", noms)
+        # Rien n'est supprimé du dossier livré.
+        for relatif in (os.path.join("_internal", "torch", "x.dll"),
+                        os.path.join("_internal", "ffprobe.EXE"),
+                        os.path.join("models", "small", "model.bin")):
+            self.assertTrue(os.path.isfile(os.path.join(self.livre, relatif)))
+        # Les restes sont nommés dans l'avertissement, repris dans le bilan.
+        restes = [a for a in self.alertes if "reste(s)" in a]
+        self.assertEqual(len(restes), 1)
+        for nom in ("_internal/torch", "_internal/ffprobe.EXE", "models"):
+            self.assertIn(nom, restes[0])
+        self.assertTrue(any("ATTENTION" in m and "reste(s)" in m
+                            for m in self.messages))
+
+    def test_dossier_livre_propre_sans_avertissement(self):
+        self._produire(dossier_livre=self.livre)
+        self.assertFalse(any("reste(s)" in a for a in self.alertes))
+
+    def test_dossier_livre_absent_ignore(self):
+        self._produire(dossier_livre=os.path.join(self.dist, "absent"))
+        self.assertEqual(self.alertes, [])
+
+    def test_restes_nombreux_resumes(self):
+        for i in range(build_paths.MAX_RESTES_NOMMES + 2):
+            self._ecrire(self.livre, f"reste{i:02d}.bin")
+        self._produire(dossier_livre=self.livre)
+        message = next(a for a in self.alertes if "reste(s)" in a)
+        self.assertIn("…", message)
+        self.assertNotIn(f"reste{build_paths.MAX_RESTES_NOMMES + 1:02d}.bin", message)
+
+    def test_avertissement_si_archive_trop_lourde(self):
+        with mock.patch.object(build_paths, "POIDS_MAX_ARCHIVE_MO", 0):
+            self._produire()
+        self.assertTrue(any("ATTENTION" in m and "au-delà" in m
+                            for m in self.messages))
+        self.assertTrue(any("au-delà" in a for a in self.alertes))
+
+    def test_pas_d_avertissement_si_archive_legere(self):
+        self._produire()
+        self.assertFalse(any("ATTENTION" in m for m in self.messages))
+        self.assertEqual(self.alertes, [])
+
+
+class ScriptsDeBuildSansModeleTest(unittest.TestCase):
+    """Les deux scripts de build n'embarquent ni ne copient plus de modèle."""
+
+    SCRIPTS = ("build_spec.py", "build_spec_slim.py")
+    DOSSIER = Path(__file__).resolve().parent
+
+    def _source(self, nom):
+        return (self.DOSSIER / nom).read_text(encoding="utf-8")
+
+    def _hidden_imports(self, nom):
+        for noeud in ast.walk(ast.parse(self._source(nom))):
+            if not isinstance(noeud, ast.Assign):
+                continue
+            if any(getattr(c, "id", "") == "hidden_imports" for c in noeud.targets):
+                return ast.literal_eval(noeud.value)
+        self.fail(f"hidden_imports introuvable dans {nom}")
+
+    def test_archive_produite_par_la_fonction_commune(self):
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("produire_archive(", self._source(nom))
+                self.assertNotIn("make_archive", self._source(nom))
+
+    def test_archive_faite_depuis_la_sortie_fraiche_et_bilan_final(self):
+        for nom in self.SCRIPTS:
+            source = self._source(nom)
+            with self.subTest(script=nom):
+                self.assertIn("composer_bilan(ALERTES)", source)
+                self.assertIn("alertes=ALERTES", source)
+        complet = self._source("build_spec.py")
+        self.assertIn("produire_archive(sortie_fraiche", complet)
+        # La signature se fait dans la sortie fraîche, avant la copie livrée.
+        self.assertLess(complet.index("_sign_exe(os.path.join(sortie_fraiche"),
+                        complet.index("copytree(sortie_fraiche"))
+
+    def test_aucune_copie_de_modele(self):
+        for nom in self.SCRIPTS:
+            source = self._source(nom)
+            for interdit in ("faster_whisper_models", "EXTRA_MODELS",
+                             "find_model_snapshot", "MODEL_NAMES", "HF_CACHE",
+                             "snapshots"):
+                with self.subTest(script=nom, interdit=interdit):
+                    self.assertNotIn(interdit, source)
+
+    def test_ffprobe_non_embarque_par_les_scripts(self):
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertNotIn("ffprobe", self._source(nom).lower())
+
+    def test_huggingface_hub_reste_embarque_pour_le_telechargement(self):
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("huggingface_hub", self._hidden_imports(nom))
+
+    def test_modeles_embarque_comme_module(self):
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("modeles", self._hidden_imports(nom))
+
+    def test_debruitage_embarque_comme_module(self):
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("debruitage", self._hidden_imports(nom))
+
+    def _liste_litterale(self, nom, variable):
+        for noeud in ast.walk(ast.parse(self._source(nom))):
+            if not isinstance(noeud, ast.Assign):
+                continue
+            if any(getattr(c, "id", "") == variable for c in noeud.targets):
+                return ast.literal_eval(noeud.value)
+        self.fail(f"{variable} introuvable dans {nom}")
+
+    def test_torch_numba_llvmlite_exclus_du_paquet(self):
+        for nom in self.SCRIPTS:
+            exclusions = self._liste_litterale(nom, "excludes")
+            for module in ("torch", "numba", "llvmlite"):
+                with self.subTest(script=nom, module=module):
+                    self.assertIn(module, exclusions)
+
+    def test_excludes_est_bien_injecte_dans_le_spec(self):
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("excludes=[{excludes_str}]", self._source(nom))
+
+    def test_aucun_module_exclu_n_est_demande_en_hidden_import(self):
+        for nom in self.SCRIPTS:
+            communs = set(self._liste_litterale(nom, "excludes")) & set(
+                self._hidden_imports(nom))
+            with self.subTest(script=nom):
+                self.assertEqual(communs, set())
 
 
 if __name__ == "__main__":

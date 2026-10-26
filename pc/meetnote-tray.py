@@ -31,7 +31,6 @@ import numpy as np
 # isort: on
 
 sys.path.insert(0, os.path.dirname(__file__))
-import faulthandler
 
 # ─── Logging de crash persistant ──────────────────────────────────────────────
 # L'app ne loguait rien dans un fichier : un plantage (exception non catchée,
@@ -39,43 +38,34 @@ import faulthandler
 #   - les exceptions Python du thread principal (sys.excepthook)
 #   - les exceptions des threads (threading.excepthook, Python 3.8+)
 #   - les crashs natifs (faulthandler : segfault, access violation…)
-# Tout est écrit dans %APPDATA%/MeetNote/crash.log
+# Tout est écrit dans %APPDATA%/MeetNote/crash.log (crashs natifs : crash-natif.log)
 import logging
 import traceback
 
+import assistant_fenetre
 import calendar_digest
 import config
+import debruitage
 import history as hist_mod
-import outlook_cal
+import journal_app
+import modeles
 import perf_profile
+import source_agenda
 import teams_roster
 import user_config
 from notion_push import push_to_notion
 from version import VERSION
 
 _LOG_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "MeetNote")
-_LOG_PATH = os.path.join(_LOG_DIR, "crash.log")
 
 try:
-    os.makedirs(_LOG_DIR, exist_ok=True)
     # Root en WARNING pour ne pas polluer avec les logs INFO des libs
     # (exchangelib autodiscover, urllib3…) ; notre logger reste en INFO.
-    logging.basicConfig(
-        filename=_LOG_PATH,
-        level=logging.WARNING,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        encoding="utf-8",
-    )
+    # Rotation quotidienne + faulthandler dans un fichier distinct : voir journal_app.
+    _journal = journal_app.configurer_journal(_LOG_DIR)
     _logger = logging.getLogger("meetnote")
-    _logger.setLevel(logging.INFO)
     _logger.info("=" * 60)
     _logger.info("Démarrage MeetNote")
-
-    # faulthandler : capture les crashs natifs (dumpe la stack C/Python).
-    # On garde le fichier ouvert pour toute la durée du process.
-    _fault_fp = open(_LOG_PATH, "a", encoding="utf-8")
-    faulthandler.enable(file=_fault_fp)
 except Exception:
     _logger = logging.getLogger("meetnote")
 
@@ -181,23 +171,33 @@ RELEASE_NOTES = """\
 - Le fichier WAV temporaire était supprimé avant d'être archivé localement
 """
 
-# Surcharge les credentials avec les valeurs utilisateur persistées
-_uc = user_config.load()
-if _uc.get("notion_token"):
-    config.NOTION_TOKEN = _uc["notion_token"]
-if _uc.get("notion_database_id"):
-    config.NOTION_DATABASE_ID = _uc["notion_database_id"]
-_auto_start_exclusions = [
-    s.strip().lower()
-    for s in _uc.get("auto_start_exclusions", "").splitlines()
-    if s.strip()
-]
-
-# Synchronise les HEADERS de notion_push avec le token effectif (user_config
-# est chargé APRÈS l'import de notion_push, donc HEADERS aurait l'ancienne valeur)
 import notion_push as _np_mod
 
-_np_mod.HEADERS["Authorization"] = f"Bearer {config.NOTION_TOKEN}"
+_auto_start_exclusions = []
+
+
+def _recaler_reglages():
+    """Recale les copies en mémoire sur settings.json : credentials Notion, HEADERS
+    de notion_push et exclusions auto-start.
+
+    Appelée au chargement du module, puis après chaque enregistrement des réglages
+    (paramètres, assistant). user_config est chargé APRÈS l'import de notion_push :
+    sans ce recalage, HEADERS garderait l'ancien token.
+    """
+    global _auto_start_exclusions
+    reglages = user_config.load()
+    if reglages.get("notion_token"):
+        config.NOTION_TOKEN = reglages["notion_token"]
+    if reglages.get("notion_database_id"):
+        config.NOTION_DATABASE_ID = reglages["notion_database_id"]
+    _np_mod.HEADERS["Authorization"] = f"Bearer {config.NOTION_TOKEN}"
+    _auto_start_exclusions = user_config.liste_exclusions(
+        reglages.get("auto_start_exclusions", "")
+    )
+
+
+# Surcharge les credentials avec les valeurs utilisateur persistées
+_recaler_reglages()
 
 # ─── Win32 sleep prevention ──────────────────────────────────────────────────
 ES_CONTINUOUS        = 0x80000000
@@ -269,6 +269,7 @@ _type_var        = None
 _output_var      = None
 _meeting_name_var = None   # champ nom réunion (pré-rempli depuis Outlook)
 _outlook_poll_fn  = None   # handle pour forcer le polling Outlook depuis le bouton
+_cache_agenda     = source_agenda.CacheAgenda()  # réunions des 24 h, lues sans solliciter Outlook
 _log_text        = None
 _btn_start       = None
 _btn_stop        = None
@@ -297,6 +298,11 @@ _notes_pinned:      bool               = True
 _current_meeting_end:  datetime.datetime | None = None
 _end_warned_key:       str | None = None  # ISO[:16] de la fin déjà signalée
 
+# Invités de la réunion enregistrée (issus du cache d'agenda, jamais d'Outlook en direct)
+_reunion_imposee:      dict | None = None  # réunion choisie par l'auto-start / « Arrêter + Relancer »
+_invites_retenus:      tuple[str, list] | None = None  # (objet, invités) de l'enregistrement en cours
+_preremplissage_en_attente = False  # réunion inconnue au démarrage : à compléter au prochain rechargement réussi
+
 # Auto-start : sujets exclus (motifs en minuscules, chargés depuis user_config l.122)
 
 # Indicateur de statut (dot coloré)
@@ -318,6 +324,7 @@ class _Job:
     output_mode:     str
     meeting_name:        str = ""
     teams_participants:  list = dataclasses.field(default_factory=list)
+    participants_invites: list = dataclasses.field(default_factory=list)  # invités de l'agenda (requis puis facultatifs)
     # Statuts par étape
     status_audio:      str = "done"    # done
     status_transcript: str = "queued"  # queued / running / done / error
@@ -338,6 +345,10 @@ _work_event           = threading.Event()
 _worker_busy          = False
 _worker_cancel_event  = threading.Event()   # set() pour annuler la transcription en cours
 _current_job: "_Job | None" = None          # job actuellement traité par le worker
+# Jobs à transcrire dont le modèle n'est pas encore là : sortis de la file (le worker
+# reste libre pour les autres), remis en tête dès que le modèle est complet.
+# Protégé par _queue_lock.
+_jobs_attente_modele  = []
 
 # Tous les jobs chargés (en mémoire, pour l'historique)
 _all_jobs: list[_Job] = []
@@ -463,31 +474,10 @@ def _resample(data: np.ndarray, src: int, dst: int) -> np.ndarray:
         ).astype(np.float32)
 
 
-# ─── Débruitage (noisereduce) ─────────────────────────────────────────────────
-_nr_noise_profile: np.ndarray | None = None  # profil de bruit estimé au démarrage
-_nr_calibrated    = False
-_nr_lock          = threading.Lock()
-
+# ─── Débruitage (module debruitage, sans torch) ───────────────────────────────
 def _denoise(samples: np.ndarray) -> np.ndarray:
-    """Applique noisereduce si disponible. Silencieux en cas d'erreur."""
-    global _nr_noise_profile, _nr_calibrated
-    try:
-        import noisereduce as nr
-        with _nr_lock:
-            if not _nr_calibrated:
-                # Première passe : utiliser les samples courants comme profil de bruit
-                _nr_noise_profile = samples.copy()
-                _nr_calibrated = True
-            reduced = nr.reduce_noise(
-                y=samples,
-                sr=config.SAMPLE_RATE,
-                y_noise=_nr_noise_profile,
-                prop_decrease=0.75,   # 75% de réduction — équilibre qualité/artefacts
-                stationary=True,
-            )
-        return reduced.astype(np.float32)
-    except Exception:
-        return samples
+    """Débruite un bloc du micro ; rend le bloc intact si le débruitage est indisponible."""
+    return debruitage.debruiter(samples, config.SAMPLE_RATE)
 
 
 # ─── Level update ────────────────────────────────────────────────────────────
@@ -1041,6 +1031,38 @@ def _append_teams_to_notion(job: "_Job"):
         _log_error(f"[{job.id}] Append Teams→Notion : {e}")
 
 
+# ─── Participants affichés et envoyés ────────────────────────────────────────
+def _participants_job(job: _Job) -> list[str]:
+    """Invités de l'agenda puis participants Teams, sans doublon (affichage, envoi).
+
+    Le renommage des locuteurs n'utilise pas cette liste : seuls les noms Teams y servent.
+    """
+    return source_agenda.fusionner_participants(job.participants_invites,
+                                                job.teams_participants)
+
+
+def _texte_transcript(job: _Job) -> str:
+    """Texte transcrit tel qu'il part (fichier et Notion) : ligne « Participants : … » en tête.
+
+    `job.transcript` reste intact (historique, re-traitement) : la ligne est ajoutée à
+    l'envoi seulement, donc jamais deux fois.
+    """
+    return source_agenda.avec_ligne_participants(job.transcript, _participants_job(job))
+
+
+def _consommer_invites(nom_saisi: str) -> list[str]:
+    """Invités retenus au démarrage pour le job qu'on crée ; remet la mémoire à zéro.
+
+    Un nom de réunion saisi à la main, différent de l'objet de la réunion retenue,
+    n'hérite d'aucun invité.
+    """
+    global _invites_retenus
+    retenus, _invites_retenus = _invites_retenus, None
+    if retenus is None:
+        return []
+    return source_agenda.invites_pour_nom(retenus[0], retenus[1], nom_saisi)
+
+
 # ─── Sauvegarde transcript local ─────────────────────────────────────────────
 def _save_transcript_local(job: _Job) -> str | None:
     """Sauvegarde le transcript dans Documents/MeetNote/transcripts/."""
@@ -1062,7 +1084,7 @@ def _save_transcript_local(job: _Job) -> str | None:
                 f.write("=== NOTES MANUELLES ===\n")
                 f.write(job.notes.strip() + "\n\n")
                 f.write("-" * 60 + "\n\n")
-            f.write(job.transcript)
+            f.write(_texte_transcript(job))
         return path
     except Exception as e:
         _log_error(f"Sauvegarde transcript : {e}")
@@ -1266,22 +1288,15 @@ def _do_step_transcribe(job: _Job) -> bool:
         if _whisper_model is None or _whisper_model_name != cle_modele:
             _set_progress(5)
             _set_status(f"Chargement modèle {job.model_name}…")
-            if getattr(sys, "frozen", False):
-                bundle_dir   = sys._MEIPASS
-                embedded     = os.path.join(bundle_dir, "faster_whisper_models", job.model_name)
-                exe_dir      = os.path.dirname(sys.executable)
-                local_models = os.path.join(exe_dir, "models", job.model_name)
-                if os.path.isfile(os.path.join(embedded, "model.bin")):
-                    model_path = embedded
-                elif os.path.isfile(os.path.join(local_models, "model.bin")):
-                    model_path = local_models
-                else:
-                    _set_status(f"Téléchargement modèle {job.model_name}…")
-                    _log_error(f"[{job.id}] Modèle {job.model_name} absent — téléchargement via faster-whisper…")
-                    # Laisser faster-whisper gérer le téléchargement + cache HF lui-même
-                    model_path = job.model_name   # nom symbolique → DL auto
-            else:
-                model_path = job.model_name
+            # Jamais de nom symbolique : faster-whisper téléchargerait dans le cache
+            # HF sans progression. Le worker ne laisse passer un job que si le
+            # modèle est complet (_job_attend_modele) ; ce cas ne reste possible
+            # que si le dossier a disparu entre-temps.
+            model_path = modeles.chemin_modele(job.model_name)
+            if model_path is None:
+                raise RuntimeError(
+                    f"Modèle {job.model_name} introuvable : relancez la transcription "
+                    "pour le télécharger.")
             _whisper_model      = WhisperModel(
                 model_path, device="cpu", compute_type="int8",
                 cpu_threads=profil.threads, num_workers=profil.fils,
@@ -1480,7 +1495,7 @@ def _do_step_notion(job: _Job) -> bool:
         title = job.meeting_name or f"Réunion {job.start_time.strftime('%Y-%m-%d %H:%M')}"
         notion_type = "Audio" if job.wav_path else job.meeting_type
         page = push_to_notion(
-            job.transcript,
+            _texte_transcript(job),
             source="PC",
             duration_min=job.duration_min,
             whisper_model=job.model_name,
@@ -1577,6 +1592,294 @@ def _process_job(job: _Job):
         _root.after(3000, lambda: _set_progress(0))
 
 
+# ─── Modèles Whisper : récupération en arrière-plan ──────────────────────────
+# Un seul fil de téléchargement, qui sert les demandes une à une (le verrou de
+# modeles.telecharger garantit en plus qu'il n'y en a jamais deux de front). Une
+# nouvelle demande passe devant les autres : c'est le dernier choix de l'utilisateur.
+_dl_lock       = threading.Lock()
+_dl_demandes   = collections.deque()   # noms de modèles à récupérer, le prochain à gauche
+_dl_nom        = None                  # modèle en cours de téléchargement
+_choix_modele_courant = ""             # choix du combo, copié ici : tkinter interdit hors thread Tk
+_dl_thread     = None
+_dl_annuler    = threading.Event()     # fermeture de l'application
+_dl_reveil     = threading.Event()     # nouvelle demande : écourte l'attente avant un essai
+_dl_texte      = ""                    # libellé affiché ("" = rien à montrer)
+_dl_anime      = False                 # points d'activité tant que ce n'est pas fini
+_dl_tick       = 0
+_dl_label      = None                  # Label Tk du libellé (créé dans _build_window)
+_DL_PRET_AFFICHE_MS = 4000            # durée d'affichage de « modèle prêt »
+_DL_ANIMATION_MS    = 600             # pas de l'animation des points
+
+
+def _rafraichir_telechargement():
+    """Écrit le libellé dans la fenêtre. Thread Tk uniquement."""
+    if _dl_label is None:
+        return
+    if not _dl_texte:
+        _dl_label.pack_forget()
+        return
+    points = modeles.points_activite(_dl_tick) if _dl_anime else ""
+    _dl_label.config(text=_dl_texte + points)
+    if not _dl_label.winfo_ismapped():
+        _dl_label.pack(fill="x", padx=10, pady=(0, 8))
+
+
+def _animer_telechargement():
+    """Fait avancer les points tant qu'un téléchargement est affiché. Thread Tk."""
+    global _dl_tick
+    _dl_tick += 1
+    if _dl_texte and _dl_anime:
+        _rafraichir_telechargement()
+    if _root:
+        _root.after(_DL_ANIMATION_MS, _animer_telechargement)
+
+
+def _afficher_telechargement(texte: str, anime: bool = False):
+    """Fixe le libellé depuis n'importe quel thread ; l'affichage passe par Tk."""
+    global _dl_texte, _dl_anime
+    _dl_texte, _dl_anime = texte, anime
+    if _root is None:
+        return
+    try:
+        _root.after(0, _rafraichir_telechargement)
+    except (RuntimeError, tk.TclError):
+        pass  # fenêtre déjà détruite : l'application se ferme
+
+
+def _effacer_telechargement_si(texte: str):
+    """Efface le libellé s'il n'a pas changé entre-temps (autre téléchargement lancé)."""
+    if _dl_texte == texte:
+        _afficher_telechargement("")
+
+
+def _rappel_progression(nom: str, recus: int, total: int):
+    """Rappel de modeles.telecharger (thread de suivi). Ne lève jamais : une exception
+    ici ferait échouer un téléchargement pourtant réussi."""
+    try:
+        fini = total > 0 and recus >= total
+        _afficher_telechargement(
+            modeles.libelle_progression(nom, recus, total), anime=not fini)
+    except Exception as exc:
+        _logger.warning("Progression du modèle %s non affichée (%s)",
+                        nom, type(exc).__name__)
+
+
+def _liberer_jobs_attente():
+    """Remet en tête de file les jobs dont le modèle est maintenant complet. Ne remet
+    que les jobs encore `queued` et absents de la file ; écarte les autres de l'attente."""
+    with _queue_lock:
+        prets = modeles.jobs_a_liberer(
+            _jobs_attente_modele, _job_queue,
+            lambda nom: modeles.chemin_modele(nom) is not None)
+        ids_prets = {j.id for j in prets}
+        _jobs_attente_modele[:] = [
+            j for j in modeles.jobs_a_conserver(_jobs_attente_modele, _job_queue)
+            if j.id not in ids_prets]
+        for job in reversed(prets):
+            _job_queue.appendleft(job)
+    if prets:
+        _work_event.set()
+        _refresh_ui()
+
+
+def _remettre_en_file(job: "_Job", tete: bool = False):
+    """Met le job en file après l'avoir retiré de l'attente du modèle (une seule source
+    de vérité : sinon il serait traité deux fois). Sans effet s'il est déjà en file."""
+    with _queue_lock:
+        _jobs_attente_modele[:] = modeles.sans_job(_jobs_attente_modele, job.id)
+        if any(j.id == job.id for j in _job_queue):
+            return
+        if tete:
+            _job_queue.appendleft(job)
+        else:
+            _job_queue.append(job)
+
+
+def _noms_attendus_par_les_jobs() -> list:
+    with _queue_lock:
+        return [j.model_name for j in _jobs_attente_modele]
+
+
+def _modele_encore_voulu(nom: str) -> bool:
+    """Vrai si `nom` est le choix courant du combo ou attendu par un job en attente."""
+    return bool(modeles.modeles_voulus(
+        [nom], _choix_modele_courant, _noms_attendus_par_les_jobs()))
+
+
+def _modeles_voulus_maintenant() -> list:
+    """Demandes encore utiles : purge `_dl_demandes` des modèles abandonnés (ni choisis
+    dans la liste, ni attendus par un job) et efface leur libellé d'échec périmé."""
+    attendus = _noms_attendus_par_les_jobs()
+    with _dl_lock:
+        demandes = list(_dl_demandes)
+        voulus = modeles.modeles_voulus(demandes, _choix_modele_courant, attendus)
+        _dl_demandes.clear()
+        _dl_demandes.extend(voulus)
+    for nom in demandes:
+        if nom not in voulus and modeles.est_libelle_echec(_dl_texte, nom):
+            _afficher_telechargement("")
+    return voulus
+
+
+def _echec_telechargement(nom: str, cause: str):
+    """Affiche la cause, remet le modèle en file et attend le délai (ou une nouvelle
+    demande) avant le prochain essai. Les jobs concernés restent en attente. Un modèle
+    qui n'est plus voulu est abandonné sans libellé ni nouvel essai."""
+    global _dl_nom
+    if not _modele_encore_voulu(nom):
+        _afficher_telechargement("")
+        return
+    texte = modeles.libelle_echec(nom, cause, modeles.DELAI_NOUVEL_ESSAI_S)
+    _afficher_telechargement(texte)
+    _log_error(texte)
+    with _dl_lock:
+        if nom not in _dl_demandes:
+            _dl_demandes.append(nom)
+        # Pendant l'attente, plus rien n'est « en cours » : redemander le même modèle
+        # doit réveiller le fil au lieu d'être ignoré.
+        _dl_nom = None
+        attendre = not _dl_reveil.is_set()
+        _dl_reveil.clear()
+    if attendre:
+        _dl_reveil.wait(modeles.DELAI_NOUVEL_ESSAI_S)
+
+
+def _telecharger_un_modele(nom: str):
+    """Télécharge `nom` avec progression ; libère les jobs en attente au succès."""
+    _afficher_telechargement(modeles.libelle_demarrage(nom), anime=True)
+    try:
+        modeles.telecharger(
+            nom,
+            rappel=lambda recus, total: _rappel_progression(nom, recus, total),
+            annuler=_dl_annuler)
+    except modeles.TelechargementAnnule:
+        _afficher_telechargement("")
+    except modeles.ErreurTelechargement as exc:
+        _echec_telechargement(nom, str(exc))
+    except Exception as exc:
+        _logger.exception("Téléchargement du modèle %s", nom)
+        _echec_telechargement(
+            nom, f"erreur inattendue ({type(exc).__name__}).")
+    else:
+        texte = f"Modèle {nom} prêt."
+        _afficher_telechargement(texte)
+        _log_error(texte)
+        if _root:
+            _root.after(_DL_PRET_AFFICHE_MS, lambda: _effacer_telechargement_si(texte))
+        _liberer_jobs_attente()
+
+
+def _boucle_telechargement():
+    """Sert les demandes une à une ; s'arrête quand il n'y en a plus (ou à la fermeture).
+    Une exception inattendue ne doit pas laisser l'état figé : le `finally` remet
+    `_dl_thread` et `_dl_nom` à None pour qu'une demande suivante relance un fil."""
+    global _dl_nom, _dl_thread
+    try:
+        while True:
+            _modeles_voulus_maintenant()  # abandonne les modèles que plus personne ne veut
+            with _dl_lock:
+                if _dl_annuler.is_set() or not _dl_demandes:
+                    _dl_nom = None
+                    _dl_thread = None
+                    return
+                nom = _dl_demandes.popleft()
+                _dl_nom = nom
+                _dl_reveil.clear()
+            if modeles.chemin_modele(nom) is not None:
+                _liberer_jobs_attente()
+                continue
+            _telecharger_un_modele(nom)
+    except Exception:
+        _logger.warning("Fil de téléchargement des modèles interrompu", exc_info=True)
+    finally:
+        with _dl_lock:
+            if _dl_thread is threading.current_thread():
+                _dl_nom = None
+                _dl_thread = None
+
+
+def _demander_modele(nom: str):
+    """Demande la présence du modèle : sans effet s'il est complet ou déjà en cours,
+    sinon il est téléchargé (relancé tout de suite s'il attendait un nouvel essai)."""
+    global _dl_thread
+    if nom not in modeles.MODELES or _dl_annuler.is_set():
+        return
+    if modeles.chemin_modele(nom) is not None:
+        _liberer_jobs_attente()
+        return
+    with _dl_lock:
+        if nom == _dl_nom:
+            return
+        if nom in _dl_demandes:
+            _dl_demandes.remove(nom)
+        _dl_demandes.appendleft(nom)
+        _dl_reveil.set()
+        if _dl_thread is None:
+            _dl_thread = threading.Thread(
+                target=_boucle_telechargement, name="telechargement-modele", daemon=True)
+            _dl_thread.start()
+
+
+def _arreter_telechargement():
+    """Fermeture : annule le téléchargement en cours (fichiers partiels conservés pour
+    la reprise) sans attendre le fil, qui est un démon."""
+    _dl_annuler.set()
+    _dl_reveil.set()
+
+
+def _job_attend_modele(job: "_Job") -> bool:
+    """Vrai (et job mis de côté) si le job doit transcrire avec un modèle absent."""
+    requise = modeles.transcription_requise(
+        job.status_transcript, job.transcript, job.wav_path)
+    # Un nom hors liste n'est pas téléchargeable : on laisse la transcription échouer
+    # avec son message plutôt que de faire attendre le job indéfiniment.
+    disponible = (job.model_name not in modeles.MODELES
+                  or modeles.chemin_modele(job.model_name) is not None)
+    if modeles.decision_job(requise, disponible) == modeles.PRET:
+        return False
+    with _queue_lock:
+        if all(j.id != job.id for j in _jobs_attente_modele):
+            _jobs_attente_modele.append(job)
+    _log_error(f"[{job.id}] {modeles.LIBELLE_ATTENTE_MODELE} ({job.model_name})")
+    _set_status(modeles.LIBELLE_ATTENTE_MODELE)
+    _demander_modele(job.model_name)
+    _refresh_ui()
+    return True
+
+
+def _demarrer_modele_initial():
+    """Fixe le modèle au premier lancement (jamais d'écrasement d'un choix existant),
+    puis s'assure qu'il est présent. Thread Tk."""
+    enregistre = user_config.get(modeles.CLE_MODELE_CHOISI, "")
+    present = modeles.chemin_modele(config.WHISPER_MODEL)
+    a_ecrire = modeles.modele_a_enregistrer(
+        enregistre, modeles.ram_totale_gio(),
+        config.WHISPER_MODEL if present is not None else None)
+    if a_ecrire:
+        user_config.set(modeles.CLE_MODELE_CHOISI, a_ecrire)
+        _logger.info("Modèle Whisper choisi au premier lancement : %s", a_ecrire)
+        if _model_var is not None:
+            _model_var.set(a_ecrire)  # déclenche aussi _sur_choix_modele
+    global _choix_modele_courant
+    choix = _model_var.get() if _model_var is not None else a_ecrire
+    if choix:
+        _choix_modele_courant = choix
+        _demander_modele(choix)
+
+
+def _sur_choix_modele(*_):
+    """Choix dans la liste : enregistré, et téléchargé s'il est absent. Thread Tk."""
+    global _choix_modele_courant
+    nom = _model_var.get() if _model_var is not None else ""
+    if nom not in modeles.MODELES:
+        return
+    _choix_modele_courant = nom
+    if user_config.get(modeles.CLE_MODELE_CHOISI, "") != nom:
+        user_config.set(modeles.CLE_MODELE_CHOISI, nom)
+    _demander_modele(nom)
+    _dl_reveil.set()  # le fil purge sans attendre ce que ce choix rend inutile
+
+
 # ─── Worker ──────────────────────────────────────────────────────────────────
 def _worker_loop():
     global _worker_busy, _current_job
@@ -1588,6 +1891,8 @@ def _worker_loop():
                 if not _job_queue:
                     break
                 job = _job_queue.popleft()
+            if _job_attend_modele(job):
+                continue  # mis de côté : le worker reste libre pour les autres jobs
             _worker_busy = True
             _current_job = job
             _worker_cancel_event.clear()
@@ -1613,8 +1918,7 @@ def _requeue_transcribe(job: _Job):
     if job.output_mode != "fichier":
         job.status_notion = "pending"
     hist_mod.update(job)
-    with _queue_lock:
-        _job_queue.appendleft(job)  # priorité haute
+    _remettre_en_file(job, tete=True)  # priorité haute
     _work_event.set()
     _refresh_ui()
 
@@ -1773,8 +2077,7 @@ def _bulk_transcribe_all():
         if job.output_mode != "fichier":
             job.status_notion = "pending"
         hist_mod.update(job)
-        with _queue_lock:
-            _job_queue.append(job)
+        _remettre_en_file(job)
     _work_event.set()
     _refresh_ui()
     if _history_win and _history_win.winfo_exists():
@@ -1802,8 +2105,7 @@ def _check_pending_at_startup():
         if job.output_mode != "fichier":
             job.status_notion = "pending"
         hist_mod.update(job)
-        with _queue_lock:
-            _job_queue.append(job)
+        _remettre_en_file(job)
     _work_event.set()
     _refresh_ui()
     if _history_win and _history_win.winfo_exists():
@@ -1986,9 +2288,42 @@ _SOURCE_MAP = {
 }
 
 
+def _forcer_agenda():
+    """Demande un rechargement immédiat du cache d'agenda (le tick est déclenché tout de suite)."""
+    _cache_agenda.forcer()
+    if _outlook_poll_fn:
+        _outlook_poll_fn()
+
+
+def _reappliquer_preremplissage():
+    """Après un rechargement réussi pendant un enregistrement démarré sans réunion connue,
+    complète nom, heure de fin et invités (une seule fois, sans écraser un choix de
+    l'utilisateur : la règle est dans `source_agenda.completer_preremplissage`)."""
+    global _current_meeting_end, _invites_retenus, _preremplissage_en_attente
+    if not (_recording and _preremplissage_en_attente):
+        return
+    _preremplissage_en_attente = False
+    nom_saisi = _meeting_name_var.get() if _meeting_name_var else ""
+    dernier_nom_auto = getattr(_meeting_name_var, "_last_outlook", "")
+    a_faire = source_agenda.completer_preremplissage(
+        _cache_agenda.reunions_en_cours(datetime.datetime.now(), 30),
+        nom_saisi, dernier_nom_auto, _current_meeting_end, _invites_retenus)
+    if a_faire.nom is not None and _meeting_name_var:
+        _meeting_name_var.set(a_faire.nom)
+        _meeting_name_var._last_outlook = a_faire.nom
+    if a_faire.fin is not None:
+        _current_meeting_end = a_faire.fin
+    if a_faire.invites is not None:
+        _invites_retenus = a_faire.invites
+
+
 def _do_start():
     global _recording, _audio_chunks, _stream_mic, _loop_thread, _rec_start_time
     global _wav_stream, _wav_stream_path, _flush_frame_count, _end_warned_key
+    global _reunion_imposee, _invites_retenus, _preremplissage_en_attente
+
+    # La réunion imposée ne vaut que pour CE démarrage : consommée sur toutes les sorties
+    imposee, _reunion_imposee = _reunion_imposee, None
 
     if _recording:
         return
@@ -2008,23 +2343,30 @@ def _do_start():
         _teams_watcher.start(_rec_start_time)
 
     # Pré-remplir le nom de la réunion et définir l'heure de fin depuis Outlook
-    def _fetch_outlook():
-        global _current_meeting_end
-        try:
-            mtg = outlook_cal.get_current_or_next_meeting(window_minutes=30)
-            if mtg and _root:
-                def _apply(m=mtg):
-                    global _current_meeting_end
-                    if _meeting_name_var and not _meeting_name_var.get().strip():
-                        _meeting_name_var.set(m["subject"])
-                        _meeting_name_var._last_outlook = m["subject"]
-                    # Définir l'heure de fin seulement si pas déjà définie (auto-start l'a peut-être fixée)
-                    if _current_meeting_end is None and _recording:
-                        _current_meeting_end = m["end"]
-                _root.after(0, _apply)
-        except Exception:
-            pass
-    threading.Thread(target=_fetch_outlook, daemon=True).start()
+    # (lecture du cache d'agenda : aucun accès à Outlook, donc ni thread ni attente)
+    # La réunion est celle dont l'objet correspond au nom saisi (choix du conflit), sinon la première
+    mtg = source_agenda.choisir_reunion(
+        _cache_agenda.reunions_en_cours(datetime.datetime.now(), 30),
+        _meeting_name_var.get() if _meeting_name_var else "")
+    # Invités : réunion imposée par l'auto-start, sinon celle que propose le cache
+    retenue = imposee or mtg
+    _invites_retenus = ((retenue["subject"], source_agenda.invites_de_reunion(retenue))
+                        if retenue else None)
+    # Réunion absente du cache (jamais chargé, ou trop ancien) : on le recharge, et le
+    # résultat complétera l'enregistrement en cours
+    _preremplissage_en_attente = retenue is None
+    if _preremplissage_en_attente and _root:
+        _root.after(0, _forcer_agenda)
+    if mtg and _root:
+        def _apply(m=mtg):
+            global _current_meeting_end
+            if _meeting_name_var and not _meeting_name_var.get().strip():
+                _meeting_name_var.set(m["subject"])
+                _meeting_name_var._last_outlook = m["subject"]
+            # Définir l'heure de fin seulement si pas déjà définie (auto-start l'a peut-être fixée)
+            if _current_meeting_end is None and _recording:
+                _current_meeting_end = m["end"]
+        _root.after(0, _apply)
 
     os.makedirs(config.TEMP_DIR, exist_ok=True)
     ts = _rec_start_time.strftime("%Y%m%d_%H%M%S")
@@ -2105,6 +2447,7 @@ def _do_stop_transcribe():
         return
 
     meeting_name = (_meeting_name_var.get().strip() if _meeting_name_var else "") or ""
+    participants_invites = _consommer_invites(meeting_name)
     _ts_str = start_time.strftime("%Y-%m-%d %H:%M")
     if _ts_str not in meeting_name:
         meeting_name = f"{meeting_name} {_ts_str}".strip() if meeting_name else _ts_str
@@ -2120,6 +2463,7 @@ def _do_stop_transcribe():
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
         teams_participants=teams_participants,
+        participants_invites=participants_invites,
         notes=_collect_notes(),
     )
     _hide_notes_window()
@@ -2176,6 +2520,7 @@ def _do_stop_archive_only():
         return
 
     meeting_name = (_meeting_name_var.get().strip() if _meeting_name_var else "") or ""
+    participants_invites = _consommer_invites(meeting_name)
     _ts_str = start_time.strftime("%Y-%m-%d %H:%M")
     if _ts_str not in meeting_name:
         meeting_name = f"{meeting_name} {_ts_str}".strip() if meeting_name else _ts_str
@@ -2193,6 +2538,7 @@ def _do_stop_archive_only():
         output_mode=_output_var.get() if _output_var else "notion",
         meeting_name=meeting_name,
         teams_participants=teams_participants,
+        participants_invites=participants_invites,
         notes=_collect_notes(),
         status_transcript="queued",
         status_notion="pending",
@@ -2323,8 +2669,13 @@ def _update_window_state():
             _root._toggle_whisper(True)
         with _queue_lock:
             pending = len(_job_queue) + (1 if _worker_busy else 0)
+            en_attente = len(_jobs_attente_modele)
         if pending > 0:
             if _status_var: _status_var.set(f"Processing {pending} job(s)…")
+            if _status_dot: _status_dot.config(bg="#ffcc00")
+        elif en_attente > 0:
+            if _status_var:
+                _status_var.set(f"{modeles.LIBELLE_ATTENTE_MODELE} ({en_attente} job(s))")
             if _status_dot: _status_dot.config(bg="#ffcc00")
         else:
             if _status_var: _status_var.set("Idle: Start to record")
@@ -2365,8 +2716,8 @@ def _build_menu():
     # Statut dynamique
     if _recording:
         status_label = "● Enregistrement en cours…"
-    elif _job_queue or _worker_busy:
-        n = len(_job_queue) + (1 if _worker_busy else 0)
+    elif _job_queue or _worker_busy or _jobs_attente_modele:
+        n = len(_job_queue) + len(_jobs_attente_modele) + (1 if _worker_busy else 0)
         status_label = f"⏳ Traitement ({n} job(s))"
     else:
         status_label = "○ Prêt"
@@ -2430,15 +2781,23 @@ def _open_version_window():
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DIGEST_HOUR = 10  # déclenchement à 10h00
+_digest_en_cours = threading.Lock()  # un seul digest à la fois (sources parfois lentes)
 
 def _run_agenda_digest_bg(force: bool = False):
     """Lance le digest en thread de fond, crée un Job visible dans l'historique."""
     def _task():
-        # Vérification silencieuse avant de créer le job
-        if not force and calendar_digest.digest_already_run_today():
+        try:
+            _executer_digest(force)
+        finally:
+            _digest_en_cours.release()
+
+    def _executer_digest(force: bool):
+        now = datetime.datetime.now()
+        # Vérification silencieuse avant de créer le job : ni job ni lecture des sources
+        # si c'est déjà fait aujourd'hui ou pendant le délai de nouvel essai.
+        if not force and not calendar_digest.digest_a_tenter(now):
             return
 
-        now = datetime.datetime.now()
         job = _Job(
             id=now.strftime("%Y%m%d%H%M%S") + "_agenda",
             wav_path="",
@@ -2467,8 +2826,13 @@ def _run_agenda_digest_bg(force: bool = False):
                 _log_error("📅 Agenda 15 j envoyé dans Notion.")
             else:
                 job.status_notion = "error"
-                job.error_msg     = "Aucun RDV ou erreur Notion (voir logs)"
-                _log_error("📅 Agenda : aucun RDV ou erreur Notion.")
+                job.error_msg     = "Échec de l'envoi vers Notion (voir logs)"
+                _log_error("📅 Agenda : échec de l'envoi vers Notion.")
+        except calendar_digest.SourcesIndisponibles as e:
+            job.status_notion = "error"
+            job.error_msg     = ("Agenda injoignable (Outlook/EWS) — "
+                                 f"nouvel essai à {e.prochain_essai:%H:%M}")
+            _log_error(f"📅 {job.error_msg}")
         except Exception as e:
             job.status_notion = "error"
             job.error_msg     = str(e)
@@ -2480,6 +2844,10 @@ def _run_agenda_digest_bg(force: bool = False):
             if _history_win and _history_win.winfo_exists():
                 _root.after(0, _refresh_history_panel)
 
+    if not _digest_en_cours.acquire(blocking=False):
+        if force:
+            _log_error("📅 Agenda déjà en cours de génération.")
+        return
     threading.Thread(target=_task, daemon=True).start()
 
 
@@ -2496,6 +2864,8 @@ def _schedule_daily_digest():
       - Si pas encore fait aujourd'hui ET heure >= _DIGEST_HOUR → exécution immédiate.
       - Si pas encore fait aujourd'hui ET heure < _DIGEST_HOUR  → planifie pour _DIGEST_HOUR:00.
       - Si déjà fait aujourd'hui                                → planifie pour demain _DIGEST_HOUR:00.
+      - Si les sources étaient injoignables il y a moins de DELAI_NOUVEL_ESSAI
+        → rien n'est lancé, nouveau contrôle à la fin du délai.
     Se replanifie automatiquement après chaque exécution.
     """
     if not _root:
@@ -2504,7 +2874,13 @@ def _schedule_daily_digest():
     now   = datetime.datetime.now()
     today = now.date()
 
-    if not calendar_digest.digest_already_run_today():
+    reessai = calendar_digest.prochain_essai(now)
+    if reessai and not calendar_digest.digest_already_run_today(today):
+        delay_ms = max(1000, int((reessai - now).total_seconds() * 1000))
+        _root.after(delay_ms, _schedule_daily_digest)
+        return
+
+    if calendar_digest.digest_a_tenter(now):
         if now.hour >= _DIGEST_HOUR:
             # Rattrapage : on est passé 10h sans avoir tourné
             _run_agenda_digest_bg(force=False)
@@ -2538,6 +2914,7 @@ def _shutdown_app(quit_for_good: bool):
     le watchdog externe (watchdog.py) ne relance pas MeetNote après coup —
     sinon (ex: redémarrage suite à changement de périphérique audio) le
     process se termine normalement et le watchdog le relance tout seul."""
+    _arreter_telechargement()
     if _recording:
         _do_cancel()
     else:
@@ -2699,11 +3076,12 @@ def _refresh_history_panel():
                             bg=b_bg, fg=b_fg, padx=6, pady=2, relief="flat")
             pill.pack(side="left", padx=(0, 4))
 
-        # ── Participants Teams (si disponibles)
-        if job.teams_participants:
+        # ── Participants : invités de l'agenda + Teams (si disponibles)
+        participants = _participants_job(job)
+        if participants:
             teams_row = tk.Frame(card, bg=S_CARD)
             teams_row.pack(fill="x", padx=10, pady=(0, 4))
-            names_str = "  ·  ".join(job.teams_participants)
+            names_str = "  ·  ".join(participants)
             tk.Label(teams_row, text=f"👥 {names_str}",
                      font=("Segoe UI", 7), bg=S_CARD, fg="#9ab4e8",
                      anchor="w", wraplength=420, justify="left").pack(fill="x")
@@ -2756,7 +3134,7 @@ def _refresh_history_panel():
                     model_var_h = tk.StringVar(value=j.model_name)
                     model_combo_h = ttk.Combobox(btn_row, textvariable=model_var_h,
                                                  state="readonly", width=9,
-                                                 values=["tiny", "base", "small", "medium", "large-v3"],
+                                                 values=list(modeles.MODELES),
                                                  font=("Segoe UI", 7))
                     model_combo_h.pack(side="left", padx=(0, 4))
 
@@ -2969,7 +3347,8 @@ def _build_window():
     global _root, _status_var, _progress_var, _level_var, _source_var, _speaker_var
     global _btn_start, _btn_stop, _btn_stop_only, _btn_cancel, _source_combo, _log_text
     global _speaker_frame, _speaker_combo, _model_var, _lang_var, _output_var
-    global _meeting_name_var, _history_list_frame, _status_dot
+    global _choix_modele_courant
+    global _meeting_name_var, _history_list_frame, _status_dot, _dl_label
 
     _root = tk.Tk()
 
@@ -3258,13 +3637,10 @@ def _build_window():
     mtg_hdr = tk.Frame(rm, bg=S_MAIN)
     mtg_hdr.pack(fill="x")
     _lbl(mtg_hdr, "Meeting name (auto-filled from Outlook calendar)")
-    def _force_poll():
-        if _outlook_poll_fn:
-            _outlook_poll_fn()
     tk.Button(mtg_hdr, text="🔄", font=("Segoe UI", 9),
               bg=S_MAIN, fg=FG3, activebackground=S_HIGH, activeforeground=FG,
               relief="flat", bd=0, cursor="hand2",
-              command=_force_poll).pack(side="right", pady=(2, 0))
+              command=_forcer_agenda).pack(side="right", pady=(2, 0))
     mtg_entry = tk.Entry(rm, textvariable=_meeting_name_var,
                          font=("Segoe UI", 9), bg=S_HIGH, fg=FG,
                          insertbackground=FG, relief="flat", bd=0,
@@ -3288,8 +3664,11 @@ def _build_window():
     mc, lc = _row(sec_w, cols=2)
 
     _lbl(mc, "Whisper Model")
-    _model_var = tk.StringVar(value=config.WHISPER_MODEL)
-    model_combo = _combo(mc, _model_var, ["tiny", "base", "small", "medium", "large-v3"])
+    modele_initial = modeles.modele_affiche(
+        user_config.get(modeles.CLE_MODELE_CHOISI, ""), config.WHISPER_MODEL)
+    _model_var = tk.StringVar(value=modele_initial)
+    _choix_modele_courant = modele_initial
+    model_combo = _combo(mc, _model_var, list(modeles.MODELES))
     _MODEL_HINTS = {
         "tiny":    "Fastest — lower accuracy",
         "base":    "Fast — decent accuracy",
@@ -3297,9 +3676,10 @@ def _build_window():
         "medium":  "High quality — slower",
         "large-v3":"Best quality — needs GPU",
     }
-    _model_hint_var = tk.StringVar(value=_MODEL_HINTS.get(config.WHISPER_MODEL, ""))
+    _model_hint_var = tk.StringVar(value=_MODEL_HINTS.get(modele_initial, ""))
     _hint(mc, _model_hint_var)
     _model_var.trace_add("write", lambda *_: _model_hint_var.set(_MODEL_HINTS.get(_model_var.get(), "")))
+    _model_var.trace_add("write", _sur_choix_modele)
 
     _lbl(lc, "Language")
     _lang_var = tk.StringVar(value="auto")
@@ -3478,6 +3858,12 @@ def _build_window():
              bg=S_CARD, fg=FG2, anchor="w",
              wraplength=RIGHT_W - 50, justify="left").pack(side="left", fill="x", expand=True)
 
+    # ── Téléchargement du modèle Whisper (masqué tant qu'il n'y en a pas)
+    _dl_label = tk.Label(status_frame, text="", font=("Segoe UI", 8),
+                         bg=S_CARD, fg="#ffcc00", anchor="w",
+                         wraplength=RIGHT_W - 30, justify="left")
+    _root.after(_DL_ANIMATION_MS, _animer_telechargement)
+
     # ── System Console (log)
     console_hdr = tk.Frame(right_col, bg=S_BASE)
     console_hdr.pack(fill="x", pady=(0, 2))
@@ -3542,18 +3928,35 @@ def _build_window():
     _auto_started_keys: set = set()  # évite de relancer pour la même réunion
     _resolved_conflict_key: list = [None]  # frozenset des sujets du dernier conflit résolu
 
-    def _poll_outlook():
-        if _recording:
-            if _root:
-                _root.after(60_000, _poll_outlook)
+    _poll_after_id: list = [None]  # tick en attente : un seul à la fois, même après un clic sur 🔄
+
+    def _recharger_agenda(motif: str):
+        """Recharge le cache d'agenda (thread démon) puis relance l'évaluation.
+
+        Tourne aussi pendant un enregistrement : la fin de réunion lit ce cache.
+        `recharger` ne fait rien si un rechargement tient déjà la réservation.
+        """
+        try:
+            source = source_agenda.recharger(_cache_agenda, datetime.datetime.now(), motif)
+        except Exception as e:
+            source = None
+            _log_with_tags(f"[Outlook] Erreur: {e}")
+        # Un rechargement déjà en cours rend aussi None : ce n'est pas un échec
+        if (source is None and _cache_agenda.jamais_charge
+                and not _cache_agenda.rechargement_en_cours):
+            _log_with_tags("[Outlook] Agenda indisponible, nouvel essai au prochain tick.")
+        if _root:
+            if source is not None:
+                _root.after(0, _reappliquer_preremplissage)
+            _root.after(0, _evaluer_agenda)
+
+    def _evaluer_agenda():
+        """Auto-start, pré-remplissage et conflits, d'après le cache (aucun accès Outlook)."""
+        if _recording or _cache_agenda.jamais_charge:
             return
 
         def _fetch():
-            try:
-                meetings = outlook_cal.get_all_current_meetings(window_minutes=30)
-            except Exception as e:
-                _log_with_tags(f"[Outlook] Erreur: {e}")
-                return
+            meetings = _cache_agenda.reunions_en_cours(datetime.datetime.now(), 30)
             if not meetings:
                 _log_with_tags("[Outlook] Aucune réunion dans les 30 prochaines minutes.")
                 return
@@ -3571,7 +3974,7 @@ def _build_window():
                     _auto_started_keys.add(key)
                     _log_with_tags(f"[Outlook] Auto-start mixte : {mtg['subject']}")
                     def _do_auto(m=mtg):
-                        global _current_meeting_end, _end_warned_key
+                        global _current_meeting_end, _end_warned_key, _reunion_imposee
                         if _recording or _modal_dialog_open:
                             return
                         if _source_var:
@@ -3581,6 +3984,7 @@ def _build_window():
                             _meeting_name_var._last_outlook = m["subject"]
                         _current_meeting_end = m["end"]
                         _end_warned_key = None
+                        _reunion_imposee = m
                         _do_start()
                     _root.after(0, _do_auto)
                     return  # un seul auto-start à la fois
@@ -3649,9 +4053,24 @@ def _build_window():
                         win.geometry(f"+{x}+{y}")
                     _root.after(0, _show_conflict)
 
-        threading.Thread(target=_fetch, daemon=True).start()
-        if _root:
-            _root.after(60_000, _poll_outlook)
+        _fetch()
+
+    def _poll_outlook():
+        """Tick de 60 s : décide d'un rechargement du cache, puis évalue les réunions."""
+        if _root is None:
+            return
+        if _poll_after_id[0] is not None:
+            try:
+                _root.after_cancel(_poll_after_id[0])
+            except tk.TclError:
+                pass  # tick déjà échu (appel par le tick lui-même) : rien à annuler
+        _poll_after_id[0] = _root.after(60_000, _poll_outlook)
+
+        motif = _cache_agenda.doit_recharger(datetime.datetime.now())
+        if motif and not _cache_agenda.rechargement_en_cours:
+            threading.Thread(target=_recharger_agenda, args=(motif,), daemon=True).start()
+        else:
+            _evaluer_agenda()
 
     _meeting_name_var._last_outlook = ""
     global _outlook_poll_fn
@@ -3710,7 +4129,9 @@ def _build_window():
             _do_stop_transcribe()
             if m and _root:
                 def _restart():
-                    global _current_meeting_end, _end_warned_key
+                    global _current_meeting_end, _end_warned_key, _reunion_imposee
+                    if _recording:  # arrêt annulé (alerte batterie) : l'enregistrement continue tel quel
+                        return
                     if _source_var:
                         _source_var.set("🎤🔊  Mixte (micro + PC)")
                     if _meeting_name_var:
@@ -3718,6 +4139,7 @@ def _build_window():
                         _meeting_name_var._last_outlook = m["subject"]
                     _current_meeting_end = m["end"]
                     _end_warned_key = None
+                    _reunion_imposee = m
                     _do_start()
                 _root.after(500, _restart)
 
@@ -3759,22 +4181,12 @@ def _build_window():
             if -2 <= minutes_left <= 5 and warn_key != _end_warned_key:
                 _end_warned_key = warn_key
 
-                def _fetch_next():
-                    try:
-                        # Cherche une réunion démarrant dans les 15 min après la fin actuelle
-                        all_mtgs = outlook_cal.get_all_current_meetings(window_minutes=20)
-                        next_mtg = None
-                        for m in all_mtgs:
-                            gap = (m["start"] - _current_meeting_end).total_seconds() / 60
-                            if 0 <= gap <= 15 and m["subject"] != (_meeting_name_var.get() if _meeting_name_var else ""):
-                                next_mtg = m
-                                break
-                    except Exception:
-                        next_mtg = None
-                    if _root:
-                        _root.after(0, lambda: _show_end_warn_popup(minutes_left, next_mtg))
-
-                threading.Thread(target=_fetch_next, daemon=True).start()
+                # Réunion démarrant dans les 15 min après la fin actuelle, lue dans le
+                # cache d'agenda (aucun accès Outlook : pas de thread nécessaire).
+                nom_courant = _meeting_name_var.get() if _meeting_name_var else ""
+                next_mtg = _cache_agenda.suivante_apres(
+                    _current_meeting_end, 15, exclure_objet=nom_courant)
+                _show_end_warn_popup(minutes_left, next_mtg)
 
         _root.after(30_000, _poll_meeting_end)
 
@@ -4288,6 +4700,29 @@ def _set_startup_enabled(enabled: bool):
                 pass
 
 
+def _fin_assistant():
+    """À la fermeture de l'assistant : réglages recalés, agenda rechargé (EWS peut être
+    configuré), puis modèle Whisper fixé et récupéré s'il manque."""
+    _recaler_reglages()
+    _forcer_agenda()
+    _demarrer_modele_initial()
+
+
+def _ouvrir_assistant():
+    """Ouvre l'assistant de démarrage ; à son terme, les réglages enregistrés sont
+    recalés en mémoire. Le test audio y est refusé pendant un enregistrement."""
+    if _root is None:
+        return
+    assistant_fenetre.ouvrir_assistant(
+        _root,
+        # Fermé sans terminer : le modèle est quand même récupéré, sans attendre le
+        # lancement suivant (l'assistant se rouvrirait alors sans rien télécharger).
+        a_la_fermeture=_demarrer_modele_initial,
+        a_la_fin=_fin_assistant,
+        enregistrement_en_cours=lambda: _recording,
+    )
+
+
 def _open_settings():
     """Modal Settings — design Stitch 'Control Center'."""
     if _root is None:
@@ -4435,10 +4870,7 @@ def _open_settings():
             return
         try:
             user_config.save({"notion_token": new_token, "notion_database_id": new_db})
-            config.NOTION_TOKEN       = new_token
-            config.NOTION_DATABASE_ID = new_db
-            import notion_push as np_mod
-            np_mod.HEADERS["Authorization"] = f"Bearer {new_token}"
+            _recaler_reglages()
             status_lbl.config(text="✓ Configuration sauvegardée.", fg="#00cc66")
         except Exception as e:
             status_lbl.config(text=f"Erreur : {e}", fg=ERR)
@@ -4547,7 +4979,6 @@ def _open_settings():
         excl_text.insert("1.0", _excl_init)
 
     def _save_ews():
-        global _auto_start_exclusions
         new_email = ews_email_var.get().strip()
         new_user  = ews_user_var.get().strip()
         new_pw    = ews_pass_var.get()
@@ -4563,9 +4994,8 @@ def _open_settings():
                 "ews_url":               new_url,
                 "auto_start_exclusions": excl_raw,
             })
-            _auto_start_exclusions = [
-                s.strip().lower() for s in excl_raw.splitlines() if s.strip()
-            ]
+            _recaler_reglages()
+            _forcer_agenda()  # nouveaux identifiants EWS : l'agenda se recharge sans attendre
             ews_status_lbl.config(text="✓ Configuration EWS sauvegardée.", fg="#00cc66")
         except Exception as e:
             ews_status_lbl.config(text=f"Erreur : {e}", fg=ERR)
@@ -4606,6 +5036,22 @@ def _open_settings():
     tk.Label(tab_g,
              text="Note : le transcript est TOUJOURS sauvegardé en local,\nmême en mode Notion.",
              font=("Segoe UI", 8), bg=S_CARD, fg="#00cc66").pack(anchor="w", pady=(8, 0))
+
+    # ── Assistant de démarrage
+    tk.Frame(tab_g, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))
+    tk.Label(tab_g, text="Assistant de démarrage",
+             font=("Segoe UI", 10, "bold"), bg=S_CARD, fg=FG).pack(anchor="w", pady=(10, 4))
+
+    def _relancer_assistant():
+        """Ferme les paramètres (modaux) puis ouvre l'assistant."""
+        win.destroy()
+        _ouvrir_assistant()
+
+    tk.Button(tab_g, text="Relancer l'assistant",
+              font=("Segoe UI", 8), bg=S_HIGH, fg=FG,
+              activebackground=S_TOP, activeforeground=FG,
+              relief="flat", bd=0, pady=5, cursor="hand2",
+              command=_relancer_assistant).pack(anchor="w")
 
     # ── Puissance allouée à la transcription
     tk.Frame(tab_g, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))
@@ -4853,35 +5299,14 @@ def main():
     # Charger l'historique existant
     entries = hist_mod.load()
     with _all_jobs_lock:
-        for e in entries:
+        for rang, e in enumerate(entries):
             try:
-                st = e.get("start_time", "")
-                if isinstance(st, str) and st:
-                    start = datetime.datetime.fromisoformat(st)
-                else:
-                    start = datetime.datetime.now()
-                job = _Job(
-                    id=e.get("id", ""),
-                    wav_path=e.get("wav_path", ""),
-                    start_time=start,
-                    duration_min=e.get("duration_min", 0),
-                    model_name=e.get("model_name", "base"),
-                    language=e.get("language", "fr"),
-                    meeting_type=e.get("meeting_type", ""),
-                    output_mode=e.get("output_mode", "notion"),
-                    meeting_name=e.get("meeting_name", ""),
-                    status_audio=e.get("status_audio", "done"),
-                    status_transcript=e.get("status_transcript", "done"),
-                    status_notion=e.get("status_notion", "done"),
-                    transcript=e.get("transcript", ""),
-                    transcript_path=e.get("transcript_path", ""),
-                    notion_url=e.get("notion_url", ""),
-                    error_msg=e.get("error_msg", ""),
-                    attachments=e.get("attachments", []),
-                )
-                _all_jobs.append(job)
-            except Exception:
-                pass
+                _all_jobs.append(_Job(**hist_mod.champs_job(e)))
+            except (ValueError, TypeError) as exc:
+                # Ni contenu ni message de l'exception : l'entrée porte des
+                # notes et des transcriptions.
+                _logger.warning("Historique : entrée n°%d ignorée (%s)",
+                                rang, type(exc).__name__)
 
     # ── Reprise des jobs laissés en plan ────────────────────────────────────
     # La file de travail vit en mémoire : un job « queued » ou « running » au
@@ -4932,6 +5357,14 @@ def main():
     root = _build_window()
     if tray_only:
         root.withdraw()   # démarrage silencieux en tray uniquement
+
+    # L'assistant s'ouvre au premier lancement, y compris en --minimized :
+    # sans réglages, l'application ne ferait rien d'utile en tray seul.
+    if user_config.est_premier_lancement():
+        # Le modèle est fixé et téléchargé à la fin de l'assistant (_fin_assistant).
+        root.after(500, _ouvrir_assistant)
+    else:
+        root.after(1_000, _demarrer_modele_initial)
 
     # ── Planification du digest quotidien ────────────────────────────────────
     # Démarre 3 s après la fenêtre pour laisser tkinter s'initialiser
