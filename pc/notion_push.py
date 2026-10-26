@@ -77,6 +77,8 @@ def push_to_notion(
     }
 
     if participants:
+        # Jamais passe aujourd'hui par les appelants. L'assistant accepte une base
+        # dont Participants est en multi_select : ecrire en `select` y echouerait.
         props["Participants"] = {"select": {"name": participants[:100]}}
     if meeting_type:
         props["Type"] = {"select": {"name": meeting_type}}

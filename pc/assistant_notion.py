@@ -42,6 +42,14 @@ PROPRIETES_ATTENDUES = {
     "Files & media": "files",
 }
 
+# Types acceptes EN PLUS du type de creation ci-dessus, pour une propriete donnee.
+# « Participants » n'est jamais ecrit par l'application (voir notion_push) : une
+# base existante qui l'a en liste a choix multiples fonctionne tout aussi bien.
+# La creation d'une nouvelle base garde le type de PROPRIETES_ATTENDUES.
+TYPES_ACCEPTES_EN_PLUS = {
+    "Participants": ("multi_select",),
+}
+
 # Options pre-creees pour les listes de choix a valeurs connues. Les autres listes
 # (Participants, Type, Modele Whisper) restent ouvertes : Notion ajoute l'option
 # lors de l'ecriture d'une page.
@@ -174,8 +182,10 @@ def _message_propriete(nom: str, type_attendu: str, proprietes_lues: dict) -> li
     if definition is None:
         return [f"Propriété manquante : {nom} ({libelle_type(type_attendu)})"]
     type_lu = definition.get("type") if isinstance(definition, dict) else None
-    if type_lu != type_attendu:
-        lu, attendu = libelle_type(str(type_lu)), libelle_type(type_attendu)
+    acceptes = (type_attendu, *TYPES_ACCEPTES_EN_PLUS.get(nom, ()))
+    if type_lu not in acceptes:
+        lu = libelle_type(str(type_lu))
+        attendu = " ou ".join(libelle_type(t) for t in acceptes)
         return [f"Mauvais type pour {nom} : {lu} au lieu de {attendu}"]
     return []
 

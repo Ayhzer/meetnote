@@ -94,7 +94,7 @@ EWS credentials (password) are stored in the Windows Credential Manager via `key
 
 ## Notion database schema
 
-The target database needs these exact property names: `Titre` (title), `Date` (date), `Participants` (select), `Source` (select: PC/Mobile/Agenda), `Statut` (select: À traiter/Traité), `Type` (select), `Durée (min)` (number), `Modèle Whisper` (select).
+The target database needs these exact property names: `Titre` (title), `Date` (date), `Participants` (select or multi_select), `Source` (select: PC/Mobile/Agenda), `Statut` (select: À traiter/Traité), `Type` (select), `Durée (min)` (number), `Modèle Whisper` (select).
 
 # Regles de developpement (kit unique)
 @.claude/regles/regles-dev.md

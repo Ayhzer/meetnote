@@ -160,6 +160,42 @@ class TestComparerSchema(unittest.TestCase):
             ["Mauvais type pour Source : texte au lieu de liste de choix"],
         )
 
+    def test_participants_select_ou_multi_select_acceptes(self):
+        for type_notion in ("select", "multi_select"):
+            with self.subTest(type=type_notion):
+                lu = _schema_conforme()
+                lu["Participants"] = {"id": "p", "type": type_notion, type_notion: {}}
+                self.assertEqual(an.comparer_schema(lu), [])
+
+    def test_participants_mauvais_type_cite_les_types_acceptes(self):
+        lu = _schema_conforme()
+        lu["Participants"] = {"id": "p", "type": "rich_text", "rich_text": {}}
+        self.assertEqual(
+            an.comparer_schema(lu),
+            [
+                (
+                    "Mauvais type pour Participants : texte au lieu de "
+                    "liste de choix ou liste à choix multiples"
+                )
+            ],
+        )
+
+    def test_multi_select_refuse_pour_les_autres_listes(self):
+        lu = _schema_conforme()
+        lu["Source"]["type"] = "multi_select"
+        self.assertEqual(
+            an.comparer_schema(lu),
+            [
+                (
+                    "Mauvais type pour Source : liste à choix multiples "
+                    "au lieu de liste de choix"
+                )
+            ],
+        )
+
+    def test_creation_garde_select_pour_participants(self):
+        self.assertEqual(an.proprietes_creation()["Participants"], {"select": {}})
+
     def test_type_inconnu_affiche_brut(self):
         lu = _schema_conforme()
         lu["Date"]["type"] = "type_futur"
