@@ -572,8 +572,20 @@ class ScriptsDeBuildSansModeleTest(unittest.TestCase):
         complet = self._source("build_spec.py")
         self.assertIn("produire_archive(sortie_fraiche", complet)
         # La signature se fait dans la sortie fraîche, avant la copie livrée.
-        self.assertLess(complet.index("_sign_exe(os.path.join(sortie_fraiche"),
+        self.assertLess(complet.index("signer_fichier(os.path.join(sortie_fraiche"),
                         complet.index("copytree(sortie_fraiche"))
+
+    def test_installeur_produit_apres_le_zip_dans_les_deux_scripts(self):
+        for nom in self.SCRIPTS:
+            source = self._source(nom)
+            with self.subTest(script=nom):
+                self.assertIn("produire_installeur(", source)
+                self.assertLess(source.index("produire_archive("),
+                                source.index("produire_installeur("))
+                self.assertLess(source.index("produire_installeur("),
+                                source.index("composer_bilan(ALERTES)"))
+        appel_slim = self._source("build_spec_slim.py").split("produire_installeur(")[1]
+        self.assertIn("slim=True", appel_slim)
 
     def test_aucune_copie_de_modele(self):
         for nom in self.SCRIPTS:
@@ -643,6 +655,190 @@ class ScriptsDeBuildSansModeleTest(unittest.TestCase):
                 self._hidden_imports(nom))
             with self.subTest(script=nom):
                 self.assertEqual(communs, set())
+
+
+ENV_POSTE = {
+    "LOCALAPPDATA": r"U:\Profil\AppData\Local",
+    "ProgramFiles(x86)": r"P:\Programmes86",
+    "ProgramFiles": r"P:\Programmes",
+}
+ISCC_UTILISATEUR = os.path.join(ENV_POSTE["LOCALAPPDATA"], "Programs",
+                                "Inno Setup 6", "ISCC.exe")
+ISCC_MACHINE_X86 = os.path.join(ENV_POSTE["ProgramFiles(x86)"],
+                                "Inno Setup 6", "ISCC.exe")
+ISCC_MACHINE = os.path.join(ENV_POSTE["ProgramFiles"], "Inno Setup 6", "ISCC.exe")
+ISCC_VOULU = r"Z:\outils\ISCC.exe"
+
+
+def _existent(*chemins):
+    return lambda chemin: chemin in chemins
+
+
+class TrouverIsccTest(unittest.TestCase):
+    def test_emplacements_dans_l_ordre_utilisateur_puis_machine(self):
+        self.assertEqual(build_paths.emplacements_iscc(ENV_POSTE),
+                         [ISCC_UTILISATEUR, ISCC_MACHINE_X86, ISCC_MACHINE])
+
+    def test_variables_absentes_ne_donnent_aucun_emplacement(self):
+        self.assertEqual(build_paths.emplacements_iscc({}), [])
+
+    def test_variable_prime_si_le_fichier_existe(self):
+        env = {**ENV_POSTE, build_paths.ENV_ISCC: ISCC_VOULU}
+        trouve = build_paths.trouver_iscc(
+            env, _existent(ISCC_VOULU, ISCC_UTILISATEUR))
+        self.assertEqual(trouve, ISCC_VOULU)
+
+    def test_installation_par_utilisateur_avant_par_machine(self):
+        trouve = build_paths.trouver_iscc(
+            ENV_POSTE, _existent(ISCC_MACHINE, ISCC_UTILISATEUR))
+        self.assertEqual(trouve, ISCC_UTILISATEUR)
+
+    def test_repli_sur_la_machine(self):
+        trouve = build_paths.trouver_iscc(ENV_POSTE, _existent(ISCC_MACHINE))
+        self.assertEqual(trouve, ISCC_MACHINE)
+
+    def test_variable_invalide_signalee_puis_repli(self):
+        messages = []
+        env = {**ENV_POSTE, build_paths.ENV_ISCC: ISCC_VOULU}
+        trouve = build_paths.trouver_iscc(env, _existent(ISCC_MACHINE_X86),
+                                          messages.append)
+        self.assertEqual(trouve, ISCC_MACHINE_X86)
+        self.assertEqual(len(messages), 1)
+        self.assertIn(ISCC_VOULU, messages[0])
+
+    def test_introuvable(self):
+        self.assertIsNone(build_paths.trouver_iscc(ENV_POSTE, _existent()))
+
+
+class CommandeIsccTest(unittest.TestCase):
+    def test_macros_sortie_et_nom_de_l_installeur(self):
+        commande = build_paths.commande_iscc(
+            "ISCC.exe", "meetnote.iss", "3.4.0", r"C:\tmp\sortie", r"C:\dist")
+        self.assertEqual(commande, [
+            "ISCC.exe", "/DAppVersion=3.4.0", r"/DDossierSource=C:\tmp\sortie",
+            r"/OC:\dist", "/FMeetNote-3.4.0-installation", "meetnote.iss"])
+
+    def test_variante_slim_ne_reprend_pas_le_nom_du_paquet_complet(self):
+        commande = build_paths.commande_iscc(
+            "ISCC.exe", "m.iss", "3.4.0", "src", "dist", slim=True)
+        self.assertIn("/FMeetNote-slim-3.4.0-installation", commande)
+
+    def test_nom_de_l_installeur(self):
+        self.assertEqual(build_paths.nom_installeur(" 3.4.0 "),
+                         "MeetNote-3.4.0-installation.exe")
+
+    def test_le_nom_produit_est_celui_que_declare_le_script_iss(self):
+        iss = Path(build_paths.SCRIPT_ISS).read_text(encoding="utf-8-sig")
+        self.assertIn("OutputBaseFilename=MeetNote-{#AppVersion}-installation", iss)
+        self.assertEqual(build_paths.nom_installeur("{#AppVersion}"),
+                         "MeetNote-{#AppVersion}-installation.exe")
+
+
+class ProduireInstalleurTest(unittest.TestCase):
+    ISS = r"S:\installer\meetnote.iss"
+    SORTIE = r"S:\dist"
+    INSTALLEUR = os.path.join(SORTIE, "MeetNote-3.4.0-installation.exe")
+    REUSSI = mock.Mock(returncode=0, stdout="", stderr="")
+
+    def _produire(self, resultat=None, existants=(), environ=None, executer=None,
+                  **kwargs):
+        alertes, journal, signes = [], [], []
+        executer = executer or mock.Mock(return_value=resultat)
+        chemin = build_paths.produire_installeur(
+            r"S:\sortie", "3.4.0", self.SORTIE, journal=journal.append,
+            alertes=alertes, environ=ENV_POSTE if environ is None else environ,
+            iss=self.ISS, executer=executer, existe=_existent(*existants),
+            signer=lambda c, journal=None: signes.append(c), **kwargs)
+        return chemin, alertes, executer, signes
+
+    def test_compile_puis_signe(self):
+        chemin, alertes, executer, signes = self._produire(
+            self.REUSSI, existants=(self.ISS, ISCC_UTILISATEUR, self.INSTALLEUR))
+        self.assertEqual(chemin, self.INSTALLEUR)
+        self.assertEqual(alertes, [])
+        self.assertEqual(signes, [self.INSTALLEUR])
+        self.assertEqual(executer.call_args.args[0], build_paths.commande_iscc(
+            ISCC_UTILISATEUR, self.ISS, "3.4.0", r"S:\sortie", self.SORTIE))
+
+    def test_sans_inno_setup_alerte_claire_sans_echec(self):
+        chemin, alertes, executer, signes = self._produire(existants=(self.ISS,))
+        self.assertIsNone(chemin)
+        self.assertEqual(len(alertes), 1)
+        self.assertIn("Inno Setup 6 introuvable", alertes[0])
+        self.assertIn("zip portable", alertes[0])
+        executer.assert_not_called()
+        self.assertEqual(signes, [])
+
+    def test_variable_invalide_et_rien_ailleurs_est_dit_dans_le_bilan(self):
+        env = {**ENV_POSTE, build_paths.ENV_ISCC: ISCC_VOULU}
+        _chemin, alertes, _executer, _signes = self._produire(
+            existants=(self.ISS,), environ=env)
+        self.assertEqual(len(alertes), 2)
+        self.assertIn(ISCC_VOULU, alertes[0])
+
+    def test_compilation_en_echec_devient_une_alerte(self):
+        chemin, alertes, _executer, signes = self._produire(
+            mock.Mock(returncode=2, stdout="", stderr="Erreur ligne 12"),
+            existants=(self.ISS, ISCC_UTILISATEUR))
+        self.assertIsNone(chemin)
+        self.assertEqual(len(alertes), 1)
+        self.assertIn("code 2", alertes[0])
+        self.assertIn("Erreur ligne 12", alertes[0])
+        self.assertEqual(signes, [])
+
+    def test_succes_sans_fichier_produit_est_une_alerte(self):
+        chemin, alertes, _executer, signes = self._produire(
+            self.REUSSI, existants=(self.ISS, ISCC_UTILISATEUR))
+        self.assertIsNone(chemin)
+        self.assertEqual(len(alertes), 1)
+        self.assertEqual(signes, [])
+
+    def test_iscc_qui_ne_demarre_pas_est_une_alerte(self):
+        chemin, alertes, _executer, _signes = self._produire(
+            existants=(self.ISS, ISCC_UTILISATEUR),
+            executer=mock.Mock(side_effect=OSError("accès refusé")))
+        self.assertIsNone(chemin)
+        self.assertIn("accès refusé", alertes[0])
+
+    def test_script_iss_absent_est_une_alerte(self):
+        chemin, alertes, executer, _signes = self._produire(
+            existants=(ISCC_UTILISATEUR,))
+        self.assertIsNone(chemin)
+        self.assertIn(self.ISS, alertes[0])
+        executer.assert_not_called()
+
+    def test_variante_slim_nomme_son_installeur(self):
+        slim = os.path.join(self.SORTIE, "MeetNote-slim-3.4.0-installation.exe")
+        chemin, _alertes, _executer, signes = self._produire(
+            self.REUSSI, existants=(self.ISS, ISCC_UTILISATEUR, slim), slim=True)
+        self.assertEqual(chemin, slim)
+        self.assertEqual(signes, [slim])
+
+
+class SignerFichierTest(unittest.TestCase):
+    def test_signature_reussie(self):
+        executer = mock.Mock(return_value=mock.Mock(
+            returncode=0, stdout="Signe: Valid", stderr=""))
+        self.assertTrue(build_paths.signer_fichier(
+            r"S:\a.exe", executer, lambda _m: None))
+        self.assertIn(r"S:\a.exe", executer.call_args.args[0][-1])
+
+    def test_certificat_absent_previent_sans_echouer(self):
+        journal = []
+        executer = mock.Mock(return_value=mock.Mock(
+            returncode=1, stdout="", stderr="Certificat MeetNote introuvable"))
+        self.assertFalse(build_paths.signer_fichier(
+            r"S:\a.exe", executer, journal.append))
+        self.assertIn("introuvable", journal[0])
+
+    def test_powershell_indisponible_ne_fait_pas_echouer(self):
+        executer = mock.Mock(side_effect=OSError("introuvable"))
+        self.assertFalse(build_paths.signer_fichier(
+            r"S:\a.exe", executer, lambda _m: None))
+
+    def test_apostrophe_du_chemin_doublee(self):
+        commande = build_paths.commande_signature(r"S:\l'an\a.exe")
+        self.assertIn("l''an", commande[-1])
 
 
 if __name__ == "__main__":

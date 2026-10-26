@@ -7,6 +7,7 @@ build au niveau module, il ne peut donc pas être importé par un test.
 import math
 import os
 import shutil
+import subprocess
 import sys
 import zipfile
 
@@ -14,12 +15,24 @@ import zipfile
 ENV_PYTHON_HOME = "MEETNOTE_PYTHON_HOME"
 # Variable d'environnement désignant le ffmpeg.exe à embarquer (build « essentials »).
 ENV_FFMPEG = "MEETNOTE_FFMPEG"
+# Variable d'environnement désignant l'ISCC.exe d'Inno Setup 6 (installeur).
+ENV_ISCC = "MEETNOTE_ISCC"
 
 OCTETS_PAR_MO = 1024 * 1024  # même unité que modeles.py
 # Un ffmpeg « essentials » pèse ~80-100 Mo ; la build « full » dépasse 200 Mo.
 POIDS_MAX_FFMPEG_MO = 120
 # Au-delà, l'archive devient pénible à télécharger pour un utilisateur.
 POIDS_MAX_ARCHIVE_MO = 300
+# Une compilation de l'installeur (~1 Go de fichiers, compression lzma2) est longue.
+DELAI_MAX_ISCC_S = 1800
+DELAI_MAX_SIGNATURE_S = 30
+# Script Inno Setup, versionné à côté du build.
+SCRIPT_ISS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "installer", "meetnote.iss")
+# Certificat auto-signé MeetNote (CurrentUser\My), créé via setup_codesign.ps1.
+SERVEUR_HORODATAGE = "http://timestamp.digicert.com"  # TSA publique gratuite
+# Nombre de caractères de la sortie d'ISCC ou de PowerShell repris dans une alerte.
+LONGUEUR_MAX_DIAGNOSTIC = 300
 # Nombre de restes nommés dans l'avertissement (le reste est résumé par « … »).
 MAX_RESTES_NOMMES = 8
 
@@ -294,3 +307,153 @@ def produire_archive(dossier_source: str, version: str, dossier_sortie: str,
     if alerte:
         _signaler(alerte, journal, alertes)
     return chemin_zip
+
+
+def nom_installeur(version: str, slim: bool = False) -> str:
+    """Nom de l'installeur : `MeetNote-<version>-installation.exe` (slim cohérent)."""
+    return dist_dir_name(version, slim) + "-installation.exe"
+
+
+def emplacements_iscc(environ) -> list[str]:
+    """Emplacements habituels d'Inno Setup 6 : par utilisateur, puis par machine.
+
+    Les chemins viennent des variables d'environnement du poste ; une variable
+    absente ne produit aucun emplacement (jamais de lecteur écrit en dur).
+    """
+    local = environ.get("LOCALAPPDATA", "").strip()
+    racines = (
+        os.path.join(local, "Programs") if local else "",
+        environ.get("ProgramFiles(x86)", "").strip(),
+        environ.get("ProgramFiles", "").strip(),
+    )
+    return [os.path.join(racine, "Inno Setup 6", "ISCC.exe")
+            for racine in racines if racine]
+
+
+def trouver_iscc(environ, existe=os.path.isfile, journal=print) -> str | None:
+    """Chemin d'ISCC.exe, ou None si Inno Setup 6 est introuvable.
+
+    MEETNOTE_ISCC prime s'il désigne un fichier existant. Défini mais invalide,
+    il est signalé en clair et la recherche se replie sur les emplacements
+    habituels (même règle que MEETNOTE_FFMPEG).
+    """
+    voulu = environ.get(ENV_ISCC, "").strip()
+    if voulu:
+        if existe(voulu):
+            return voulu
+        journal(f"{ENV_ISCC}={voulu} ne désigne aucun fichier — "
+                "repli sur les emplacements habituels d'Inno Setup 6")
+    for chemin in emplacements_iscc(environ):
+        if existe(chemin):
+            return chemin
+    return None
+
+
+def commande_iscc(iscc: str, iss: str, version: str, dossier_source: str,
+                  dossier_sortie: str, slim: bool = False) -> list[str]:
+    """Ligne de commande ISCC (liste d'arguments, sans shell).
+
+    `/D` passe les deux macros qu'attend meetnote.iss, `/O` le dossier de sortie
+    (collé, sans espace) et `/F` le nom de l'installeur sans extension, pour que
+    la variante slim n'écrase pas celui du paquet complet.
+    """
+    base = nom_installeur(version, slim).removesuffix(".exe")
+    return [iscc,
+            f"/DAppVersion={version.strip()}",
+            f"/DDossierSource={dossier_source}",
+            f"/O{dossier_sortie}",
+            f"/F{base}",
+            iss]
+
+
+def commande_signature(chemin: str) -> list[str]:
+    """Commande PowerShell qui signe `chemin` avec le certificat MeetNote."""
+    cible = chemin.replace("'", "''")  # apostrophe doublée : littéral PowerShell
+    script = rf"""
+$cert = Get-ChildItem Cert:\CurrentUser\My |
+    Where-Object {{ $_.Subject -like '*MeetNote*' -and $_.HasPrivateKey }} |
+    Sort-Object NotAfter -Descending |
+    Select-Object -First 1
+if (-not $cert) {{
+    Write-Error 'Certificat MeetNote introuvable dans CurrentUser\My'
+    exit 1
+}}
+$r = Set-AuthenticodeSignature -FilePath '{cible}' -Certificate $cert `
+        -HashAlgorithm SHA256 -TimestampServer '{SERVEUR_HORODATAGE}'
+if ($r.Status -ne 'Valid') {{
+    Write-Error ("Signature echouee: " + $r.StatusMessage)
+    exit 1
+}}
+Write-Host ("Signe: " + $r.Status + " — " + $cert.Thumbprint)
+"""
+    return ["powershell", "-NonInteractive", "-Command", script]
+
+
+def signer_fichier(chemin: str, executer=subprocess.run, journal=print) -> bool:
+    """Signe `chemin` si le certificat est présent ; sinon le dit, sans échouer.
+
+    Retourne True si le fichier est signé. Le build n'échoue jamais pour une
+    signature : un exe non signé reste utilisable.
+    """
+    # Commande construite ici, sans entrée externe : S603/S607 non pertinents.
+    try:
+        r = executer(commande_signature(chemin), capture_output=True, text=True,
+                     timeout=DELAI_MAX_SIGNATURE_S)
+    except (OSError, subprocess.TimeoutExpired) as erreur:
+        journal(f"WARNING: signature de {chemin} impossible — {erreur}")
+        return False
+    if r.returncode != 0:
+        journal(f"WARNING: signature de {chemin} échouée — "
+                f"{r.stderr.strip()[:LONGUEUR_MAX_DIAGNOSTIC]}")
+        return False
+    journal(f"{os.path.basename(chemin)} : {r.stdout.strip()}")
+    return True
+
+
+def _diagnostic(resultat) -> str:
+    """Fin de la sortie d'ISCC, là où il écrit son erreur."""
+    texte = (resultat.stderr or resultat.stdout or "").strip()
+    return texte[-LONGUEUR_MAX_DIAGNOSTIC:]
+
+
+def produire_installeur(dossier_source: str, version: str, dossier_sortie: str,
+                        slim: bool = False, journal=print,
+                        alertes: list[str] | None = None, environ=None,
+                        iss: str = SCRIPT_ISS, executer=subprocess.run,
+                        existe=os.path.isfile, signer=signer_fichier) -> str | None:
+    """Compile l'installeur Inno Setup et le signe ; None s'il n'a pas été produit.
+
+    Sans Inno Setup, avec un script absent ou une compilation en échec, le build
+    ne tombe pas : l'alerte part au bilan et le zip portable reste le livrable.
+    """
+    environ = os.environ if environ is None else environ
+    if not existe(iss):
+        _signaler(f"installeur non produit : script {iss} introuvable",
+                  journal, alertes)
+        return None
+    iscc = trouver_iscc(environ, existe,
+                        lambda message: _signaler(message, journal, alertes))
+    if not iscc:
+        _signaler(f"Inno Setup 6 introuvable ({ENV_ISCC} ou emplacements "
+                  "habituels) : installeur non produit, le zip portable reste "
+                  "le livrable", journal, alertes)
+        return None
+    commande = commande_iscc(iscc, iss, version, dossier_source, dossier_sortie,
+                             slim)
+    journal(f"Compilation de l'installeur avec {iscc} ...")
+    try:
+        resultat = executer(commande, capture_output=True, text=True,
+                            timeout=DELAI_MAX_ISCC_S)
+    except (OSError, subprocess.TimeoutExpired) as erreur:
+        _signaler(f"installeur non produit : ISCC inutilisable ({erreur}), "
+                  "le zip portable reste le livrable", journal, alertes)
+        return None
+    chemin = os.path.join(dossier_sortie, nom_installeur(version, slim))
+    if resultat.returncode != 0 or not existe(chemin):
+        _signaler(f"installeur non produit : ISCC a échoué (code "
+                  f"{resultat.returncode}) — {_diagnostic(resultat)} — le zip "
+                  "portable reste le livrable", journal, alertes)
+        return None
+    signer(chemin, journal=journal)
+    journal(f"Installeur prêt : {chemin}")
+    return chemin

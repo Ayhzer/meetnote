@@ -18,48 +18,13 @@ from build_paths import (
     dist_dir_name,
     formater_datas,
     produire_archive,
+    produire_installeur,
     resolve_python_home,
     resolve_site_packages,
+    signer_fichier,
 )
 from build_version import build_version_resource
 from version import VERSION
-
-# ─── Signature numérique ─────────────────────────────────────────────────────
-# Certificat auto-signé MeetNote, installé dans CurrentUser\My + TrustedPublisher.
-# Créé une seule fois via New-SelfSignedCertificate (voir setup_codesign.ps1).
-_CODESIGN_SUBJECT = "CN=MeetNote"          # filtre pour retrouver le cert
-_TIMESTAMP_SERVER = "http://timestamp.digicert.com"  # TSA publique gratuite
-
-
-def _sign_exe(exe_path: str):
-    """Signe exe_path avec le certificat MeetNote trouvé dans CurrentUser\\My."""
-    ps = f"""
-$cert = Get-ChildItem Cert:\\CurrentUser\\My |
-    Where-Object {{ $_.Subject -like '*MeetNote*' -and $_.HasPrivateKey }} |
-    Sort-Object NotAfter -Descending |
-    Select-Object -First 1
-if (-not $cert) {{
-    Write-Error 'Certificat MeetNote introuvable dans CurrentUser\\My'
-    exit 1
-}}
-$ts = '{_TIMESTAMP_SERVER}'
-$r = Set-AuthenticodeSignature -FilePath '{exe_path}' -Certificate $cert `
-        -HashAlgorithm SHA256 -TimestampServer $ts
-if ($r.Status -ne 'Valid') {{
-    Write-Error ("Signature echouee: " + $r.StatusMessage)
-    exit 1
-}}
-Write-Host ("[build_spec] EXE signe: " + $r.Status + " — " + $cert.Thumbprint)
-"""
-    # Commande construite ici, sans entrée externe : S603/S607 non pertinents.
-    r = subprocess.run(
-        ["powershell", "-NonInteractive", "-Command", ps],
-        capture_output=True, text=True, timeout=30,
-    )
-    print(r.stdout.strip())
-    if r.returncode != 0:
-        print(f"[build_spec] WARNING: signature échouée — {r.stderr.strip()[:300]}")
-
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -312,7 +277,8 @@ if result.returncode == 0:
     time.sleep(1)
 
     # ── Signature numérique (certificat auto-signé, stocké dans CurrentUser\My) ──
-    _sign_exe(os.path.join(sortie_fraiche, "MeetNote.exe"))
+    signer_fichier(os.path.join(sortie_fraiche, "MeetNote.exe"),
+                   journal=lambda m: print(f"[build_spec] {m}"))
 
     # Report size
     total = 0
@@ -333,6 +299,10 @@ if result.returncode == 0:
     produire_archive(sortie_fraiche, VERSION, os.path.join(SCRIPT_DIR, "dist"),
                      journal=lambda m: print(f"[build_spec] {m}"),
                      alertes=ALERTES, dossier_livre=dist_dir_final)
+    # ── Installeur à côté du zip : sans Inno Setup, une alerte au bilan, pas un échec. ──
+    produire_installeur(sortie_fraiche, VERSION, os.path.join(SCRIPT_DIR, "dist"),
+                        journal=lambda m: print(f"[build_spec] {m}"),
+                        alertes=ALERTES)
     for ligne in composer_bilan(ALERTES):
         print(f"[build_spec] {ligne}")
 else:

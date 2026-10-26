@@ -15,6 +15,7 @@ from build_paths import (
     dist_dir_name,
     formater_datas,
     produire_archive,
+    produire_installeur,
 )
 from build_version import build_version_resource
 from version import VERSION
@@ -174,5 +175,8 @@ print(f"[build_slim] {count} files, {total / 1024 / 1024:.1f} MB")
 # ce dossier est déjà la sortie fraîche, il n'a pas de restes à comparer.
 produire_archive(dist_dir, VERSION, os.path.dirname(dist_dir), slim=True,
                  journal=lambda m: print(f"[build_slim] {m}"), alertes=ALERTES)
+# ─── Installeur à côté du zip : sans Inno Setup, une alerte au bilan, pas un échec ─
+produire_installeur(dist_dir, VERSION, os.path.dirname(dist_dir), slim=True,
+                    journal=lambda m: print(f"[build_slim] {m}"), alertes=ALERTES)
 for ligne in composer_bilan(ALERTES):
     print(f"[build_slim] {ligne}")
