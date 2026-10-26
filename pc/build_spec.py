@@ -140,6 +140,8 @@ hidden_imports = [
     "outlook_mail",
     "calendar_digest",
     "teams_roster",
+    "watchdog",
+    "demarrage_windows",
     "soundfile",
     "_soundfile",
     "wave",

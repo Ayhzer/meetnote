@@ -5,6 +5,17 @@ MeetNote Tray — icône systray Windows + fenêtre tkinter
 - Étapes séparées et relançables : audio → transcription → notion
 - Intégration Outlook via win32com (lecture du calendrier)
 """
+import sys
+
+# Aiguillage superviseur / travailleur — AVANT tout import lourd (tkinter, numpy,
+# sounddevice…). Le superviseur est un process léger : il ne charge que la stdlib,
+# ouvre ni fenêtre ni icône, et sort (sys.exit) quand MeetNote est quitté pour de bon.
+import watchdog as _watchdog
+
+if _watchdog.doit_superviser(getattr(sys, "frozen", False), sys.argv[1:]):
+    _watchdog.superviser_exe(sys.argv[1:])
+    sys.exit(0)
+
 import atexit
 import collections
 import ctypes
@@ -15,7 +26,6 @@ import queue
 import shutil
 import struct
 import subprocess
-import sys
 import threading
 import tkinter as tk
 import wave
@@ -46,6 +56,7 @@ import assistant_fenetre
 import calendar_digest
 import config
 import debruitage
+import demarrage_windows
 import history as hist_mod
 import journal_app
 import modeles
@@ -4668,52 +4679,27 @@ def _import_transcript():
               command=dlg.destroy).pack(side="left", padx=(8, 0))
 
 
-_STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_STARTUP_REG_NAME = "MeetNote"
-
 def _get_startup_cmd() -> str:
     """Retourne la commande de démarrage Windows attendue pour MeetNote."""
-    import sys
-    exe = sys.executable
-    # pythonw pour éviter la console ; --minimized pour démarrer en tray seul
-    pythonw = exe.replace("python.exe", "pythonw.exe")
-    if not os.path.isfile(pythonw):
-        pythonw = exe
-    if getattr(sys, "frozen", False):
-        script = os.path.abspath(__file__)
-        return f'"{pythonw}" "{script}" --minimized'
-    # En mode source : passer par le watchdog pour survivre à un crash natif
-    # (access violation WASAPI) que Python ne peut pas rattraper lui-même.
-    watchdog = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog.py")
-    return f'"{pythonw}" "{watchdog}" --minimized'
+    return demarrage_windows.commande_demarrage(
+        getattr(sys, "frozen", False), sys.executable,
+        os.path.dirname(os.path.abspath(__file__)))
 
 def _startup_value() -> str | None:
     """Retourne la commande de démarrage auto enregistrée, ou None si absente."""
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY) as k:
-            val, _ = winreg.QueryValueEx(k, _STARTUP_REG_NAME)
-            return val
-    except Exception:
-        return None
+    import winreg
+    return demarrage_windows.lire_valeur(winreg)
 
 
 def _startup_is_enabled() -> bool:
-    """Retourne True si la clé de démarrage automatique est configurée."""
-    return _startup_value() == _get_startup_cmd()
+    """Retourne True si la clé de démarrage automatique existe."""
+    import winreg
+    return demarrage_windows.est_active(winreg)
 
 def _set_startup_enabled(enabled: bool):
     """Active ou désactive le démarrage automatique de MeetNote avec Windows."""
     import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
-                        0, winreg.KEY_SET_VALUE) as k:
-        if enabled:
-            winreg.SetValueEx(k, _STARTUP_REG_NAME, 0, winreg.REG_SZ, _get_startup_cmd())
-        else:
-            try:
-                winreg.DeleteValue(k, _STARTUP_REG_NAME)
-            except FileNotFoundError:
-                pass
+    demarrage_windows.definir_active(winreg, enabled, _get_startup_cmd())
 
 
 def _fin_assistant():
@@ -5284,7 +5270,9 @@ def _acquire_single_instance():
     if os.path.isfile(_LOCK_FILE):
         try:
             old_pid = int(open(_LOCK_FILE).read().strip())
-            if psutil.pid_exists(old_pid):
+            # Jamais notre propre superviseur (EXE figé) : le tuer priverait
+            # l'enfant de sa relance, et il porte lui aussi le nom MeetNote.exe.
+            if old_pid != os.getppid() and psutil.pid_exists(old_pid):
                 proc = psutil.Process(old_pid)
                 # Vérifier que c'est bien meetnote
                 if "python" in proc.name().lower() or "meetnote" in proc.name().lower():
@@ -5357,18 +5345,19 @@ def main():
     _start_audio_device_monitor()
 
     # ── Démarrage automatique avec Windows (registre HKCU\Run) ──────────────
-    # Garantit que MeetNote redémarre à chaque ouverture de session.
-    # L'EXE figé n'écrase JAMAIS une clé existante : elle pointe peut-être sur
-    # watchdog.py, seul filet de relance après une access violation WASAPI, que
-    # le bundle n'embarque pas. Lancer l'EXE une fois suffirait sinon à
-    # supprimer la relance automatique sans que personne ne le voie.
+    # Mode source : la clé est réenregistrée si elle diffère. EXE figé : le choix
+    # appartient à l'installeur et aux paramètres, donc jamais de création ; la
+    # clé du poste de développement (watchdog.py) n'est jamais écrasée ; une clé
+    # sur un autre MeetNote.exe (ancien emplacement) est recalée sur celui-ci.
     try:
-        enregistree = _startup_value()
-        if enregistree != _get_startup_cmd() and not (
-                getattr(sys, "frozen", False) and enregistree):
+        decision = demarrage_windows.decision_au_demarrage(
+            getattr(sys, "frozen", False), _startup_value(), _get_startup_cmd())
+        if decision != demarrage_windows.RIEN:
+            _logger.info("Démarrage avec Windows : clé %s", decision)
             _set_startup_enabled(True)
-    except Exception:
-        pass  # droit refusé ou registre verrouillé → silencieux
+    except OSError as e:
+        # droit refusé ou registre verrouillé : l'application démarre quand même
+        _logger.warning("Démarrage avec Windows : clé non mise à jour (%s)", e)
 
     root = _build_window()
     if tray_only:

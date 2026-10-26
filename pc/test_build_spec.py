@@ -604,6 +604,19 @@ class ScriptsDeBuildSansModeleTest(unittest.TestCase):
             with self.subTest(script=nom):
                 self.assertIn("debruitage", self._hidden_imports(nom))
 
+    def test_watchdog_embarque_comme_module(self):
+        # L'EXE se supervise lui-même : sans ce module dans le bundle, il ne
+        # pourrait ni se relancer après un plantage ni remplacer une instance.
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("watchdog", self._hidden_imports(nom))
+
+    def test_demarrage_windows_embarque_comme_module(self):
+        # Le tray importe ce module au démarrage : absent du bundle, pas d'EXE.
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("demarrage_windows", self._hidden_imports(nom))
+
     def _liste_litterale(self, nom, variable):
         for noeud in ast.walk(ast.parse(self._source(nom))):
             if not isinstance(noeud, ast.Assign):
