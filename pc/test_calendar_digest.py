@@ -261,5 +261,24 @@ class TestReunionPrivee(unittest.TestCase):
         self.assertNotIn("Cachée", texte)
 
 
+class TestNotionConfigure(unittest.TestCase):
+    """Le digest ne part que si jeton ET identifiant de base sont renseignés."""
+
+    def test_les_deux_renseignes(self):
+        self.assertTrue(calendar_digest.notion_configure("secret_x", "db123"))
+
+    def test_une_valeur_manquante_ou_blanche(self):
+        for token, base in (("", "db"), ("tok", ""), ("", ""), (None, "db"), ("tok", None), ("  ", "db"), ("tok", " ")):
+            with self.subTest(token=token, base=base):
+                self.assertFalse(calendar_digest.notion_configure(token, base))
+
+    def test_ne_memorise_aucun_echec_de_sources(self):
+        """Pas de délai de 30 min : le contrôle est pur et n'écrit rien dans l'état."""
+        with tempfile.TemporaryDirectory() as dossier,                 mock.patch.object(calendar_digest, "_STATE_FILE", os.path.join(dossier, "etat.json")):
+            calendar_digest.notion_configure("", "")
+            self.assertIsNone(calendar_digest.dernier_echec_sources())
+            self.assertFalse(os.path.exists(calendar_digest._STATE_FILE))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -108,7 +108,7 @@ class TestEvenementsCom(unittest.TestCase):
         self.assertEqual(evt["optional"], ["Dan", "Eve"])
         self.assertTrue(evt["is_recurring"])
         liste.Restrict.assert_called_once_with(
-            "[Start] <= '10/26/2026 18:00' AND [End] >= '10/26/2026 09:00'")
+            "[Start] <= '26/10/2026 18:00' AND [End] >= '26/10/2026 09:00'")
 
     def test_filtres_communs(self):
         items = [
@@ -133,6 +133,57 @@ class TestEvenementsCom(unittest.TestCase):
         win32com, _ = _faux_win32com(items=[item])
         res = self._lire(win32com)
         self.assertEqual(res[0]["required"], ["Martin, Alice", "Durand, Bob"])
+
+
+class TestMotifDateWindows(unittest.TestCase):
+    """Conversion du motif de date courte Windows en motif strftime (fonction pure)."""
+
+    def test_motifs_de_locales_courantes(self):
+        cas = {
+            "dd/MM/yyyy": "%d/%m/%Y",   # fr-FR
+            "M/d/yyyy": "%m/%d/%Y",     # en-US
+            "dd.MM.yyyy": "%d.%m.%Y",   # de-DE
+            "yyyy/MM/dd": "%Y/%m/%d",   # ja-JP
+            "d-M-yy": "%d-%m-%Y",
+            "yyyy'年'M'月'd'日'": "%Y年%m月%d日",
+        }
+        for windows, attendu in cas.items():
+            with self.subTest(motif=windows):
+                self.assertEqual(outlook_cal.motif_strftime_depuis_windows(windows), attendu)
+
+    def test_motifs_non_pris_en_charge_levent(self):
+        for motif in ("ddd dd/MM/yyyy", "dd MMM yyyy", "dd/MM/yyyy g", "dd/MM", "", "dd/dd/MM/yyyy"):
+            with self.subTest(motif=motif), self.assertRaises(ValueError):
+                outlook_cal.motif_strftime_depuis_windows(motif)
+
+
+class TestFiltreRestrictionCom(unittest.TestCase):
+    DU_26 = datetime.datetime.fromisoformat("2026-10-26T10:06")
+    AU_10_NOV = datetime.datetime.fromisoformat("2026-11-10T10:06")
+
+    def _filtre(self, **patch_lecture):
+        with patch.object(outlook_cal, "_lire_format_date_courte", **patch_lecture):
+            return outlook_cal.filtre_restriction_com(self.DU_26, self.AU_10_NOV)
+
+    def test_fr_fr_borne_de_fin_en_jour_puis_mois(self):
+        filtre = self._filtre(return_value="dd/MM/yyyy")
+        self.assertIn("'10/11/2026 10:06'", filtre)
+        self.assertEqual(filtre, "[Start] <= '10/11/2026 10:06' AND [End] >= '26/10/2026 10:06'")
+
+    def test_en_us_borne_de_fin_en_mois_puis_jour(self):
+        self.assertIn("'11/10/2026 10:06'", self._filtre(return_value="M/d/yyyy"))
+
+    def test_repli_si_lecture_en_echec_avertit_une_fois(self):
+        outlook_cal._repli_signale = False
+        with self.assertLogs(outlook_cal.log, level="WARNING") as journal:
+            filtre = self._filtre(side_effect=OSError("API en échec"))
+            self._filtre(side_effect=OSError("API en échec"))
+        self.assertIn("'11/10/2026 10:06'", filtre)
+        self.assertEqual(len(journal.records), 1)
+
+    def test_repli_si_motif_inexploitable(self):
+        outlook_cal._repli_signale = True  # avertissement déjà émis : pas de journal attendu
+        self.assertIn("'11/10/2026 10:06'", self._filtre(return_value="ddd d MMM yyyy"))
 
 
 class _ItemSensibiliteIllisible(SimpleNamespace):

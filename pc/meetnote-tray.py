@@ -2782,6 +2782,13 @@ def _open_version_window():
 
 _DIGEST_HOUR = 10  # déclenchement à 10h00
 _digest_en_cours = threading.Lock()  # un seul digest à la fois (sources parfois lentes)
+_MSG_NOTION_A_CONFIGURER = "Configurez Notion d'abord (jeton et identifiant de base, dans les réglages)."
+
+
+def _notion_configure() -> bool:
+    """Jeton Notion et identifiant de base présents en mémoire (recalés par _recaler_reglages)."""
+    return calendar_digest.notion_configure(config.NOTION_TOKEN, config.NOTION_DATABASE_ID)
+
 
 def _run_agenda_digest_bg(force: bool = False):
     """Lance le digest en thread de fond, crée un Job visible dans l'historique."""
@@ -2844,6 +2851,10 @@ def _run_agenda_digest_bg(force: bool = False):
             if _history_win and _history_win.winfo_exists():
                 _root.after(0, _refresh_history_panel)
 
+    # Notion non configuré (premier lancement, assistant ouvert) : ni job ni lecture des
+    # sources, et rien n'est mémorisé — le digest partira dès que les réglages seront saisis.
+    if not _notion_configure():
+        return
     if not _digest_en_cours.acquire(blocking=False):
         if force:
             _log_error("📅 Agenda déjà en cours de génération.")
@@ -2853,6 +2864,11 @@ def _run_agenda_digest_bg(force: bool = False):
 
 def _trigger_agenda_digest_manual():
     """Déclenchement manuel depuis le menu tray (force=True)."""
+    if not _notion_configure():
+        import tkinter.messagebox as mb
+        _log_error(f"📅 {_MSG_NOTION_A_CONFIGURER}")
+        mb.showinfo("Agenda Notion", _MSG_NOTION_A_CONFIGURER)
+        return
     _log_error("📅 Génération de l'agenda en cours…")
     _run_agenda_digest_bg(force=True)
 

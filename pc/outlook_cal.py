@@ -10,6 +10,7 @@ Silencieux si aucune méthode n'est disponible.
 import contextlib
 import datetime
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
@@ -49,13 +50,84 @@ def _get_ews_credentials():
 
 
 _IGNORE = {"off", "absent", "busy", "ooo", "out of office", "hors bureau"}
-_FORMAT_RESTRICTION_COM = "%m/%d/%Y %H:%M"
+# Outlook lit les dates d'un filtre Restrict selon le format de date courte de Windows
+# (dd/MM/yyyy en fr-FR) : un format américain fixe fait lire « 11/10/2026 » comme le
+# 11 octobre. L'heure, elle, est acceptée en %H:%M quel que soit le poste.
+_FORMAT_HEURE_COM = "%H:%M"
+# Dernier recours si le format du poste est illisible. Mesuré sur le poste fr-FR : Outlook
+# n'accepte pas l'ISO (yyyy-mm-dd, yyyy/mm/dd → 0 résultat), seul le format de date courte
+# du poste fonctionne ; le format américain n'est donc qu'un pari, d'où l'avertissement.
+_MOTIF_DATE_REPLI_COM = "%m/%d/%Y"
+_LOCALE_SSHORTDATE = 0x1F  # LOCALE_SSHORTDATE : motif de date courte de l'utilisateur
+_LOCALE_TAILLE_TAMPON = 80
+# Jetons d'un motif de date Windows : littéral entre apostrophes, d/M/y répétés, ou un caractère.
+_JETON_DATE_WINDOWS = re.compile(r"'[^']*'|d+|M+|y+|g+|.", re.DOTALL)
+_repli_signale = False
 _COM_DOSSIER_CALENDRIER = 9  # olFolderCalendar
 _COM_CORPS_MAX = 600
 _DUREE_MAX_H = 12
 # Sensibilité Outlook (OlSensitivity) : seul « Privé » masque la réunion dans l'agenda envoyé
 # à Notion. « Confidentiel » (3) est une simple étiquette, Outlook ne la cache pas aux délégués.
 _COM_SENSIBILITE_PRIVE = 2  # olPrivate
+
+
+def motif_strftime_depuis_windows(motif: str) -> str:
+    """Convertit un motif de date courte Windows (« dd/MM/yyyy », « M/d/yyyy »,
+    « yyyy/MM/dd »…) en motif strftime ; les séparateurs sont conservés.
+
+    Lève ValueError si le motif ne contient pas exactement jour, mois et année, ou s'il
+    utilise des noms (ddd, MMM) ou une ère (g), que strftime n'écrirait pas comme Outlook.
+    """
+    sortie, vus = [], []
+    for jeton in _JETON_DATE_WINDOWS.findall(motif):
+        if jeton[0] == "'":
+            sortie.append(jeton.strip("'").replace("%", "%%"))
+        elif jeton[0] in "dMy" and len(jeton) <= (2 if jeton[0] != "y" else 4):
+            code = {"d": "%d", "M": "%m", "y": "%Y"}[jeton[0]]
+            vus.append(code)
+            sortie.append(code)
+        elif jeton[0] in "dMyg":
+            raise ValueError(f"jeton de date non pris en charge : {jeton!r}")
+        else:
+            sortie.append(jeton.replace("%", "%%"))
+    if sorted(vus) != ["%Y", "%d", "%m"]:
+        raise ValueError(f"motif de date incomplet : {motif!r}")
+    return "".join(sortie)
+
+
+def _lire_format_date_courte() -> str:
+    """Motif de date courte de l'utilisateur Windows (ex. « dd/MM/yyyy »).
+    Lève OSError si l'API est absente (hors Windows) ou échoue."""
+    import ctypes
+    tampon = ctypes.create_unicode_buffer(_LOCALE_TAILLE_TAMPON)
+    try:
+        lire = ctypes.windll.kernel32.GetLocaleInfoEx
+    except AttributeError as e:
+        raise OSError("GetLocaleInfoEx indisponible") from e
+    if not lire(None, _LOCALE_SSHORTDATE, tampon, _LOCALE_TAILLE_TAMPON):
+        raise OSError("GetLocaleInfoEx a échoué")
+    return tampon.value
+
+
+def format_restriction_com() -> str:
+    """Motif strftime des bornes d'un filtre Restrict, aligné sur le poste (date courte
+    Windows + %H:%M). Repli sur le format américain, avec un avertissement unique."""
+    global _repli_signale
+    try:
+        date = motif_strftime_depuis_windows(_lire_format_date_courte())
+    except (OSError, ValueError) as e:
+        if not _repli_signale:
+            _repli_signale = True
+            log.warning("outlook_cal: format de date du poste illisible (%s), repli sur %s : "
+                        "les filtres COM peuvent être faux", e, _MOTIF_DATE_REPLI_COM)
+        date = _MOTIF_DATE_REPLI_COM
+    return f"{date} {_FORMAT_HEURE_COM}"
+
+
+def filtre_restriction_com(debut: datetime.datetime, fin: datetime.datetime) -> str:
+    """Filtre Items.Restrict des réunions qui chevauchent [debut, fin]."""
+    fmt = format_restriction_com()
+    return f"[Start] <= '{fin.strftime(fmt)}' AND [End] >= '{debut.strftime(fmt)}'"
 
 
 def _split_recipients(raw: str) -> list:
@@ -171,10 +243,7 @@ def _lire_calendrier_com(debut: datetime.datetime, fin: datetime.datetime) -> li
     items.IncludeRecurrences = True
     items.Sort("[Start]")
 
-    fmt = _FORMAT_RESTRICTION_COM
-    restricted = items.Restrict(
-        f"[Start] <= '{fin.strftime(fmt)}' AND [End] >= '{debut.strftime(fmt)}'"
-    )
+    restricted = items.Restrict(filtre_restriction_com(debut, fin))
 
     results = []
     for item in restricted:

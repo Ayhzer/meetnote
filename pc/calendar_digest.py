@@ -98,6 +98,16 @@ def digest_already_run_today(aujourdhui: datetime.date | None = None) -> bool:
     return get_last_run_date() == (aujourdhui or datetime.date.today())
 
 
+def notion_configure(token: str | None, database_id: str | None) -> bool:
+    """Vrai si le jeton Notion ET l'identifiant de base sont renseignés (non vides).
+
+    Sans eux le push échoue en 401 et laisse un job « Agenda 15 j » en erreur dans
+    l'historique : le digest ne doit alors ni partir ni créer de job. Ce n'est pas un
+    échec de sources, donc aucun délai de nouvel essai n'est mémorisé.
+    """
+    return bool((token or "").strip()) and bool((database_id or "").strip())
+
+
 def digest_a_tenter(maintenant: datetime.datetime | None = None) -> bool:
     """Vrai si le digest n'est pas fait aujourd'hui et qu'aucun échec récent n'impose d'attendre."""
     maintenant = maintenant or datetime.datetime.now()
