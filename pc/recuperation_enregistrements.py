@@ -27,9 +27,18 @@ _MOTIF_NOM = re.compile(r"^rec_(\d{8}_\d{6})\.wav$", re.IGNORECASE)
 TAILLE_ENTETE_WAV = 44
 # Un fichier modifié plus récemment est peut-être encore écrit par une autre instance.
 AGE_MINIMUM_S = 10
+# Au-delà, un `rec_*.wav` n'est plus un arrêt brutal récent mais un reliquat de tmp
+# (arrêt « sans transcription », versions anciennes) : il est ignoré, sans bruit, et
+# reste en place — l'utilisateur peut toujours l'importer à la main. Sans cette
+# borne, vider le dossier d'archives faisait reprendre des centaines de reliquats,
+# qui chassaient à leur tour l'historique réel de ses 100 entrées (27/10/2026).
+AGE_MAXIMUM_S = 7 * 24 * 3600
 # Préfixe des archives définitives (voir `_archive_audio`) :
 # `meetnote_<horodatage>[_titre].<ext>`.
 PREFIXE_ARCHIVE = "meetnote_"
+# Transcriptions locales (voir `_save_transcript_local`) :
+# `transcript_<horodatage>.txt`.
+PREFIXE_TRANSCRIPT = "transcript_"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -85,18 +94,25 @@ def lire_duree(chemin: str) -> tuple[float | None, str]:
     return frames / cadence, ""
 
 
-def _est_deja_archive(debut: datetime.datetime, noms_archives) -> bool:
-    prefixe = f"{PREFIXE_ARCHIVE}{debut.strftime(FORMAT_HORODATAGE)}".lower()
-    return any(nom.lower().startswith(prefixe) for nom in noms_archives)
+def _porte_horodatage(debut: datetime.datetime, prefixe: str, noms) -> bool:
+    attendu = f"{prefixe}{debut.strftime(FORMAT_HORODATAGE)}".lower()
+    return any(nom.lower().startswith(attendu) for nom in noms)
+
+
+def _deja_traite(debut, debuts_references, noms_archives, noms_transcripts) -> bool:
+    """Un job, une archive ou une transcription existe déjà pour cet horodatage."""
+    return (debut in debuts_references
+            or _porte_horodatage(debut, PREFIXE_ARCHIVE, noms_archives)
+            or _porte_horodatage(debut, PREFIXE_TRANSCRIPT, noms_transcripts))
 
 
 def _examiner(chemin, debut, maintenant, references, debuts_references,
-              noms_archives):
-    """Candidat, Ecarte, ou None si le fichier est déjà pris en charge."""
+              noms_archives, noms_transcripts=()):
+    """Candidat, Ecarte, ou None si le fichier est déjà pris en charge ou périmé."""
     if normaliser_chemin(chemin) in references:
         return None
-    if debut is not None and (debut in debuts_references
-                              or _est_deja_archive(debut, noms_archives)):
+    if debut is not None and _deja_traite(debut, debuts_references,
+                                          noms_archives, noms_transcripts):
         # Un job (ou son archive) existe déjà pour cet enregistrement : le WAV de tmp
         # n'est qu'un reliquat, pas une nouvelle réunion.
         return None
@@ -107,6 +123,8 @@ def _examiner(chemin, debut, maintenant, references, debuts_references,
         age_s = maintenant - os.path.getmtime(chemin)
     except OSError as exc:
         return Ecarte(chemin, f"fichier inaccessible ({type(exc).__name__})")
+    if age_s > AGE_MAXIMUM_S:
+        return None
     if taille <= TAILLE_ENTETE_WAV:
         return Ecarte(chemin, f"fichier vide ({taille} octets)")
     if age_s < AGE_MINIMUM_S:
@@ -119,16 +137,19 @@ def _examiner(chemin, debut, maintenant, references, debuts_references,
 
 def chercher(dossier: str, chemins_references=(), debuts_references=(),
              noms_archives=(), maintenant=time.time,
-             lister=os.listdir) -> tuple[list[Candidat], list[Ecarte]]:
+             lister=os.listdir,
+             noms_transcripts=()) -> tuple[list[Candidat], list[Ecarte]]:
     """Cherche dans `dossier` les `rec_*.wav` orphelins.
 
     chemins_references : `wav_path` de tous les jobs de l'historique.
     debuts_references  : `start_time` des jobs (un job existe pour cet enregistrement
                          même si son `wav_path` pointe désormais vers l'archive).
     noms_archives      : noms de fichiers du dossier d'archives audio.
+    noms_transcripts   : noms de fichiers du dossier des transcriptions locales.
     Retourne (candidats du plus ancien au plus récent, fichiers écartés avec raison).
     Un dossier absent ou illisible donne deux listes vides. Les autres fichiers
-    (`whisper_*.wav`, etc.) sont ignorés sans bruit.
+    (`whisper_*.wav`, etc.) et les reliquats de plus de `AGE_MAXIMUM_S` sont
+    ignorés sans bruit.
     """
     try:
         noms = lister(dossier)
@@ -137,6 +158,7 @@ def chercher(dossier: str, chemins_references=(), debuts_references=(),
     references = {normaliser_chemin(c) for c in chemins_references if c}
     debuts = {d.replace(microsecond=0) for d in debuts_references}
     archives = list(noms_archives)
+    transcripts = list(noms_transcripts)
     instant = maintenant()
     candidats: list[Candidat] = []
     ecartes: list[Ecarte] = []
@@ -145,7 +167,7 @@ def chercher(dossier: str, chemins_references=(), debuts_references=(),
         if not (bas.startswith(PREFIXE_ENREGISTREMENT) and bas.endswith(".wav")):
             continue
         resultat = _examiner(os.path.join(dossier, nom), extraire_date(nom),
-                             instant, references, debuts, archives)
+                             instant, references, debuts, archives, transcripts)
         if isinstance(resultat, Candidat):
             candidats.append(resultat)
         elif isinstance(resultat, Ecarte):

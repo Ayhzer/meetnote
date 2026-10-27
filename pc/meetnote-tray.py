@@ -5331,6 +5331,14 @@ def _release_single_instance():
         pass
 
 
+def _lister_ou_vide(dossier: str) -> list[str]:
+    """Noms des fichiers de `dossier`, ou liste vide s'il est absent ou illisible."""
+    try:
+        return os.listdir(dossier)
+    except OSError:
+        return []
+
+
 def _recuperer_enregistrements_interrompus():
     """Remet en file les `rec_*.wav` de tmp laissés par un arrêt brutal.
 
@@ -5345,11 +5353,10 @@ def _recuperer_enregistrements_interrompus():
         debuts = [j.start_time for j in _all_jobs]
     if _wav_stream_path:
         chemins.append(_wav_stream_path)  # enregistrement en cours : jamais repris
-    try:
-        archives = os.listdir(config.AUDIO_ARCHIVE_DIR)
-    except OSError:
-        archives = []
-    candidats, ecartes = recup_mod.chercher(config.TEMP_DIR, chemins, debuts, archives)
+    archives = _lister_ou_vide(config.AUDIO_ARCHIVE_DIR)
+    transcripts = _lister_ou_vide(config.TRANSCRIPT_DIR)
+    candidats, ecartes = recup_mod.chercher(config.TEMP_DIR, chemins, debuts, archives,
+                                            noms_transcripts=transcripts)
     for ecarte in ecartes:
         _logger.warning("Enregistrement non récupéré, laissé en place : %s (%s)",
                         os.path.basename(ecarte.chemin), ecarte.raison)

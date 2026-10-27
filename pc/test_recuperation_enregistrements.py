@@ -117,6 +117,27 @@ class TestChercher(_Base):
         candidats, _ = self.chercher(noms_archives=["meetnote_20261026_140510.opus"])
         self.assertEqual(len(candidats), 1)
 
+    def test_transcription_existante_pour_le_meme_horodatage(self):
+        # Archive supprimée et job sorti de l'historique : la transcription suffit.
+        self.ecrire_wav()
+        self.assertEqual(
+            self.chercher(noms_transcripts=["transcript_20261026_140509.txt"]),
+            ([], []))
+
+    def test_reliquat_plus_ancien_que_la_borne_ignore_sans_bruit(self):
+        chemin = self.ecrire_wav(age_s=recup.AGE_MAXIMUM_S + 1)
+        vide = os.path.join(self.dossier, "rec_20260404_185706.wav")
+        with open(vide, "wb") as f:
+            f.write(b"\x00" * recup.TAILLE_ENTETE_WAV)
+        self.dater(vide, recup.AGE_MAXIMUM_S + 1)
+        self.assertEqual(self.chercher(), ([], []))
+        self.assertTrue(os.path.exists(chemin))  # laissé en place
+
+    def test_juste_sous_la_borne_reste_candidat(self):
+        self.ecrire_wav(age_s=recup.AGE_MAXIMUM_S - 60)
+        candidats, _ = self.chercher()
+        self.assertEqual(len(candidats), 1)
+
     def test_intermediaires_whisper_et_autres_fichiers_ignores(self):
         self.ecrire_wav("whisper_rec_20261026_140509.wav")
         self.ecrire_wav("autre.wav")
