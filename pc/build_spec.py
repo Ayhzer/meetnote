@@ -108,6 +108,7 @@ hidden_imports = [
     "watchdog",
     "demarrage_windows",
     "recuperation_enregistrements",
+    "conversion_audio",
     "soundfile",
     "_soundfile",
     "wave",

@@ -636,6 +636,12 @@ class ScriptsDeBuildSansModeleTest(unittest.TestCase):
                 self.assertIn("recuperation_enregistrements",
                               self._hidden_imports(nom))
 
+    def test_conversion_audio_embarque_comme_module(self):
+        # Le tray l'importe au démarrage pour borner les conversions ffmpeg.
+        for nom in self.SCRIPTS:
+            with self.subTest(script=nom):
+                self.assertIn("conversion_audio", self._hidden_imports(nom))
+
     def _liste_litterale(self, nom, variable):
         for noeud in ast.walk(ast.parse(self._source(nom))):
             if not isinstance(noeud, ast.Assign):

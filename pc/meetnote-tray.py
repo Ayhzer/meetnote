@@ -55,6 +55,7 @@ import traceback
 import assistant_fenetre
 import calendar_digest
 import config
+import conversion_audio
 import debruitage
 import demarrage_windows
 import history as hist_mod
@@ -897,6 +898,31 @@ def _save_audio_to_tempfile() -> str | None:
 
 
 # ─── Archive audio locale ────────────────────────────────────────────────────
+def _encoder_opus(ffmpeg: str, source: str, dest: str) -> bool:
+    """Encode `source` en Opus 24 kb/s ; True si `dest` est complet.
+
+    En cas d'échec ou de délai dépassé, l'Opus partiel est retiré : l'appelant
+    se replie sur une copie WAV intègre.
+    """
+    delai = conversion_audio.delai_conversion_s(conversion_audio.duree_estimee_s(source))
+    cmd = [ffmpeg, "-y", "-i", source,
+           "-c:a", "libopus", "-b:a", "24k", "-ac", "1", "-ar", "16000", dest]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=delai,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        _logger.warning("Archive Opus abandonnée après %.0f s, repli sur une copie "
+                        "WAV : %s", delai, os.path.basename(source))
+        conversion_audio.retirer_sortie_partielle(dest)
+        return False
+    if result.returncode != 0:
+        _logger.warning("Archive Opus en échec (code %s), repli sur une copie WAV : %s",
+                        result.returncode, os.path.basename(source))
+        conversion_audio.retirer_sortie_partielle(dest)
+        return False
+    return True
+
+
 def _archive_audio(wav_path: str, start_time: datetime.datetime,
                    meeting_name: str = "") -> str | None:
     import re
@@ -921,11 +947,7 @@ def _archive_audio(wav_path: str, start_time: datetime.datetime,
         ffmpeg = _find_ffmpeg()
         if ffmpeg:
             dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"{basename}.opus")
-            cmd = [ffmpeg, "-y", "-i", wav_path,
-                   "-c:a", "libopus", "-b:a", "24k", "-ac", "1", "-ar", "16000", dest]
-            result = subprocess.run(cmd, capture_output=True, timeout=300,
-                                    creationflags=subprocess.CREATE_NO_WINDOW)
-            if result.returncode == 0:
+            if _encoder_opus(ffmpeg, wav_path, dest):
                 return dest
         dest = os.path.join(config.AUDIO_ARCHIVE_DIR, f"{basename}.wav")
         shutil.copy2(wav_path, dest)
@@ -1273,7 +1295,9 @@ def _do_step_transcribe(job: _Job) -> bool:
                 result = subprocess.run(
                     [ffmpeg, "-y", "-i", path,
                      "-ar", "16000", "-ac", "1", "-f", "wav", tmp_wav_for_whisper],
-                    capture_output=True, timeout=300,
+                    capture_output=True,
+                    timeout=conversion_audio.delai_conversion_s(
+                        conversion_audio.duree_estimee_s(path)),
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 if result.returncode == 0 and os.path.isfile(tmp_wav_for_whisper):
