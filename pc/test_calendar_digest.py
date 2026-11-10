@@ -261,6 +261,20 @@ class TestReunionPrivee(unittest.TestCase):
         self.assertNotIn("Cachée", texte)
 
 
+class TestUrlTeamsNonAffichee(unittest.TestCase):
+
+    URL = "https://teams.microsoft.com/meet/123456789012?p=CodeFictif"
+
+    def test_join_url_absente_du_digest(self):
+        texte = calendar_digest.build_transcript(
+            [reunion("Comité", join_url=self.URL, body="Ordre du jour")],
+            days=1, generated_at=T0)
+        self.assertIn("Comité", texte)
+        self.assertNotIn(self.URL, texte)
+        self.assertNotIn("teams.microsoft.com", texte)
+        self.assertNotIn("join_url", texte)
+
+
 class TestNotionConfigure(unittest.TestCase):
     """Le digest ne part que si jeton ET identifiant de base sont renseignés."""
 

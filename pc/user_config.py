@@ -8,6 +8,7 @@ import fichier_json
 
 _APPDATA  = os.environ.get("APPDATA", os.path.expanduser("~"))
 _DIR      = os.path.join(_APPDATA, "MeetNote")
+DOSSIER   = _DIR  # public : autres fichiers de MeetNote (cache Graph...)
 _PATH     = os.path.join(_DIR, "settings.json")
 
 # Motifs du cahier : une reunion dont le titre en contient un n'est pas enregistree
@@ -32,6 +33,9 @@ _DEFAULTS = {
     "dossier_modeles":    "",
     # Modele Whisper choisi (vide = jamais choisi : fixe au premier lancement)
     "whisper_model":      "",
+    # Microsoft Graph (transcripts Teams) : identifiants de l'application Entra ID
+    "graph_client_id":    "",
+    "graph_tenant_id":    "",
 }
 
 def load() -> dict:

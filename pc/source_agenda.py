@@ -26,7 +26,6 @@ Le chargement depuis la chaîne de sources (`recharger`) est journalisé dans le
 import copy
 import datetime
 import logging
-import re
 import threading
 import time
 import unicodedata
@@ -34,6 +33,7 @@ from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import outlook_cal
+from nom_affichable import sans_adresse
 
 log = logging.getLogger("meetnote.agenda")
 
@@ -302,20 +302,6 @@ def _cle_nom(nom: str) -> str:
     return sans_accents.casefold()
 
 
-_RE_ADRESSE_ENTRE_CHEVRONS = re.compile(r"<[^>]*>")
-
-
-def _sans_adresse(nom: str) -> str:
-    """Nom aux espaces normalisés, sans adresse e-mail ; chaîne vide s'il n'en reste rien.
-
-    « Nom <a@b.fr> » devient « Nom » ; une entrée qui n'est qu'une adresse (EWS ou COM
-    sans nom résolu) devient vide. Une adresse est toute chaîne contenant « @ ».
-    """
-    sans_chevrons = _RE_ADRESSE_ENTRE_CHEVRONS.sub(" ", nom)
-    propre = " ".join(sans_chevrons.split())
-    return "" if "@" in propre else propre
-
-
 def fusionner_participants(*listes: Sequence | None) -> list[str]:
     """Fusionne des listes de noms, dans l'ordre donné, sans doublon.
 
@@ -330,7 +316,7 @@ def fusionner_participants(*listes: Sequence | None) -> list[str]:
         for nom in liste or ():
             if not isinstance(nom, str):
                 continue
-            propre = _sans_adresse(nom)
+            propre = sans_adresse(nom)
             cle = _cle_nom(propre)
             if cle and cle not in vus:
                 vus.add(cle)

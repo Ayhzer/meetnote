@@ -49,7 +49,7 @@ hidden_imports = [
     "numpy", "av", "onnxruntime", "onnxruntime.capi", "cffi",
     "notion_push", "notion_api", "assistant_agenda", "assistant_audio",
     "assistant_fenetre", "assistant_notion", "config", "user_config", "fichier_json", "perf_profile", "modeles", "version", "history", "journal_app", "outlook_cal",
-    "source_agenda", "teams_roster", "watchdog", "demarrage_windows", "recuperation_enregistrements", "conversion_audio", "soundfile", "_soundfile",
+    "source_agenda", "nom_affichable", "lien_teams", "transcript_teams", "graph_auth", "graph_teams", "import_teams", "msal", "teams_roster", "watchdog", "demarrage_windows", "recuperation_enregistrements", "conversion_audio", "chemin_transcript", "soundfile", "_soundfile",
     "wave", "glob", "json", "collections", "dataclasses", "shutil",
     "scipy", "scipy.signal", "noisereduce", "debruitage",
     "pycaw", "pycaw.pycaw", "comtypes", "psutil",

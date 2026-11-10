@@ -6,6 +6,8 @@ Silencieux si exchangelib non installé ou serveur inaccessible.
 import datetime
 import logging
 
+from lien_teams import url_participation
+
 log = logging.getLogger(__name__)
 
 try:
@@ -198,6 +200,8 @@ def _evenement_depuis_item(item) -> dict | None:
     # Corps du message — nettoyage basique
     raw_body = str(getattr(item, "text_body", "") or
                    getattr(item, "body", "") or "").strip()
+    # Lien Teams lu sur le corps complet : il peut dépasser le 600e caractère.
+    join_url = url_participation(raw_body)
     body = " ".join(raw_body.split())[:600]
 
     return {
@@ -212,6 +216,7 @@ def _evenement_depuis_item(item) -> dict | None:
         "optional":     _names(getattr(item, "optional_attendees", None)),
         "is_recurring": bool(getattr(item, "is_recurring", False)),
         "prive":        _est_prive(item),
+        "join_url":     join_url,
     }
 
 
@@ -277,6 +282,7 @@ def get_events_range(
         "location", "body", "organizer",
         "required": [str], "optional": [str],
         "is_recurring": bool, "prive": bool,
+        "join_url": str (URL de participation Teams, "" si absente),
     }
     [] si exchangelib ou les identifiants manquent ; None si la connexion EWS
     échoue (le caller tente alors COM/MAPI).

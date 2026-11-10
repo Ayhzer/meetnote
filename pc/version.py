@@ -5,4 +5,4 @@ Lue par l'application (fenêtre « À propos », entrée de menu) et par build_s
 `## [x.y.z]` dans CHANGELOG.md (vérifié par test_version.py).
 """
 
-VERSION = "3.4.0"
+VERSION = "3.5.0"

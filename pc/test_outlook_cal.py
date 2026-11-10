@@ -28,6 +28,7 @@ DEBUT = _le_26(9)
 FIN = _le_26(18)
 IDENTIFIANTS = ("a@exemple.test", "a", "secret", "https://ews.exemple.test/ews")
 SANS_IDENTIFIANTS = (None, None, None, None)
+LIEN_TEAMS = "https://teams.microsoft.com/meet/123456789012?p=CodeFictif"
 
 
 def _evt(sujet, heure, duree_min=60, **extra):
@@ -109,6 +110,16 @@ class TestEvenementsCom(unittest.TestCase):
         self.assertTrue(evt["is_recurring"])
         liste.Restrict.assert_called_once_with(
             "[Start] <= '26/10/2026 18:00' AND [End] >= '26/10/2026 09:00'")
+
+    def test_join_url_lue_sur_le_corps_complet(self):
+        corps = "x " * 500 + LIEN_TEAMS
+        res = self._lire(_faux_win32com(items=[_item_com(Body=corps)])[0])
+        self.assertEqual(res[0]["join_url"], LIEN_TEAMS)
+        self.assertNotIn("teams.microsoft.com", res[0]["body"])
+
+    def test_join_url_vide_sans_lien(self):
+        res = self._lire(_faux_win32com(items=[_item_com()])[0])
+        self.assertEqual(res[0]["join_url"], "")
 
     def test_filtres_communs(self):
         items = [
@@ -405,16 +416,17 @@ def _participant(nom):
 
 def _item_ews(sujet="Point", heure=10, duree_min=60, journee=False, **extra):
     debut = _le_26(heure).astimezone()
-    return SimpleNamespace(
-        **extra,
-        subject=sujet, is_all_day=journee,
-        start=debut, end=debut + datetime.timedelta(minutes=duree_min),
-        text_body=" ordre  du jour ", location="Salle 2",
-        organizer=SimpleNamespace(name="Alice"),
-        required_attendees=[_participant("Bob")],
-        optional_attendees=[_participant("Dan")],
-        is_recurring=False,
-    )
+    attrs = {
+        "subject": sujet, "is_all_day": journee,
+        "start": debut, "end": debut + datetime.timedelta(minutes=duree_min),
+        "text_body": " ordre  du jour ", "location": "Salle 2",
+        "organizer": SimpleNamespace(name="Alice"),
+        "required_attendees": [_participant("Bob")],
+        "optional_attendees": [_participant("Dan")],
+        "is_recurring": False,
+    }
+    attrs.update(extra)
+    return SimpleNamespace(**attrs)
 
 
 class TestEwsCalEvenements(unittest.TestCase):
@@ -470,6 +482,16 @@ class TestEwsCalEvenements(unittest.TestCase):
         self.assertEqual(evt["required"], ["Bob"])
         self.assertEqual(evt["optional"], ["Dan"])
         self.assertFalse(evt["is_recurring"])
+
+    def test_join_url_lue_sur_le_corps_complet(self):
+        corps = "x " * 500 + LIEN_TEAMS
+        res, _ = self._lire(items=[_item_ews(text_body=corps)])
+        self.assertEqual(res[0]["join_url"], LIEN_TEAMS)
+        self.assertNotIn("teams.microsoft.com", res[0]["body"])
+
+    def test_join_url_vide_sans_lien(self):
+        res, _ = self._lire(items=[_item_ews()])
+        self.assertEqual(res[0]["join_url"], "")
 
     def test_sensibilite_private_donne_prive(self):
         res, _ = self._lire(items=[_item_ews(sensitivity="Private")])

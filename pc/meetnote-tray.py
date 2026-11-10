@@ -54,11 +54,14 @@ import traceback
 
 import assistant_fenetre
 import calendar_digest
+import chemin_transcript
 import config
 import conversion_audio
 import debruitage
 import demarrage_windows
+import graph_auth
 import history as hist_mod
+import import_teams
 import journal_app
 import modeles
 import perf_profile
@@ -1102,9 +1105,8 @@ def _save_transcript_local(job: _Job) -> str | None:
     """Sauvegarde le transcript dans Documents/MeetNote/transcripts/."""
     try:
         os.makedirs(config.TRANSCRIPT_DIR, exist_ok=True)
-        ts = job.start_time.strftime("%Y%m%d_%H%M%S")
-        fname = f"transcript_{ts}.txt"
-        path = os.path.join(config.TRANSCRIPT_DIR, fname)
+        path = chemin_transcript.choisir_chemin_transcript(
+            config.TRANSCRIPT_DIR, job.start_time, job.transcript_path)
         title = job.meeting_name or f"Réunion {job.start_time.strftime('%Y-%m-%d %H:%M')}"
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"Titre    : {title}\n")
@@ -3363,6 +3365,10 @@ def _toggle_history_window():
               bg="#1a3a5c", fg="#88ccff", activebackground="#22456e",
               activeforeground="white", relief="flat", bd=0, cursor="hand2",
               command=_import_outlook_mails).pack(side="left", padx=(0, 4))
+    tk.Button(btn_row2, text="🎙 Transcripts TEAMS", font=("Segoe UI", 8),
+              bg="#1a3a5c", fg="#88ccff", activebackground="#22456e",
+              activeforeground="white", relief="flat", bd=0, cursor="hand2",
+              command=_import_teams_transcripts).pack(side="left", padx=(0, 4))
     tk.Button(btn_row2, text="↺ Refresh", font=("Segoe UI", 8),
               bg=S_MAIN, fg=FG3, activebackground=S_CARD,
               activeforeground=FG, relief="flat", bd=0, cursor="hand2",
@@ -4526,6 +4532,211 @@ def _import_outlook_mails():
     threading.Thread(target=_load_mails, daemon=True).start()
 
 
+def _import_teams_transcripts():
+    """
+    Fenêtre listant les réunions Teams récentes qui ont un transcript (Graph).
+    Les réunions disponibles et pas encore importées sont cochables ; « Importer »
+    crée pour chacune un job « transcript seul » qui part vers Notion (ou en fichier).
+    """
+    import tkinter.messagebox as mb
+
+    dlg = tk.Toplevel(_root)
+    dlg.title("Transcripts Teams")
+    dlg.configure(bg="#1a1a2e")
+    dlg.resizable(True, True)
+    dlg.grab_set()
+
+    _root.update_idletasks()
+    x = _root.winfo_x() + (_root.winfo_width()  - 620) // 2
+    y = _root.winfo_y() + (_root.winfo_height() - 520) // 2
+    dlg.geometry(f"620x520+{x}+{y}")
+
+    DLG_BG   = "#1a1a2e"
+    DLG_BG2  = "#16213e"
+    DLG_BG3  = "#0f3460"
+    DLG_FG   = "#e0e0e0"
+    DLG_FG2  = "#888888"
+    couleurs_etat = {import_teams.ETAT_DISPONIBLE: "#88ee88",
+                     import_teams.ETAT_ABSENT: "#888888",
+                     import_teams.ETAT_IMPORTE: "#ffcc66"}
+
+    tk.Label(dlg, text="🎙  Transcripts des réunions Teams",
+             font=("Segoe UI", 11, "bold"), bg=DLG_BG, fg=DLG_FG).pack(pady=(14, 2))
+    tk.Label(dlg, text=f"Réunions terminées des {import_teams.JOURS_RECUL} derniers "
+                       "jours. Seules celles qui ont un transcript et ne sont pas "
+                       "déjà importées peuvent être cochées ; les réunions privées "
+                       "ou exclues ne le sont pas d'office.",
+             font=("Segoe UI", 8), bg=DLG_BG, fg=DLG_FG2, wraplength=560
+             ).pack(pady=(0, 8))
+
+    list_frame_outer = tk.Frame(dlg, bg=DLG_BG2, bd=0)
+    list_frame_outer.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+    canvas = tk.Canvas(list_frame_outer, bg=DLG_BG2, highlightthickness=0)
+    scrollbar = tk.Scrollbar(list_frame_outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    list_frame = tk.Frame(canvas, bg=DLG_BG2)
+    cw = canvas.create_window((0, 0), window=list_frame, anchor="nw")
+    list_frame.bind("<Configure>",
+                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(cw, width=e.width))
+    canvas.bind("<MouseWheel>",
+                lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+    status_lbl = tk.Label(dlg, text="Lecture de l'agenda et de Microsoft Graph…",
+                          font=("Segoe UI", 8, "italic"), bg=DLG_BG, fg=DLG_FG2,
+                          wraplength=560, justify="left")
+    status_lbl.pack(pady=(0, 4))
+
+    btn_frame = tk.Frame(dlg, bg=DLG_BG)
+    btn_frame.pack(fill="x", padx=14, pady=(0, 14))
+    tk.Button(btn_frame, text="Fermer",
+              font=("Segoe UI", 9), bg="#333355", fg="#aaaacc",
+              relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
+              command=dlg.destroy).pack(side="right")
+    btn_importer = tk.Button(btn_frame, text="✓ Importer",
+                             font=("Segoe UI", 9, "bold"), bg="#2e7d32", fg="white",
+                             relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
+                             command=lambda: _importer())
+    btn_importer.pack(side="right", padx=(0, 8))
+
+    check_vars: list[tuple[tk.BooleanVar, import_teams.LigneReunion]] = []
+
+    def _cochees() -> list[import_teams.LigneReunion]:
+        """Réunions cochées."""
+        return [ligne for var, ligne in check_vars if var.get()]
+
+    def _creer_jobs(resultat: import_teams.ResultatImport):
+        """Thread tkinter : jobs → historique et file, comme l'import des mails."""
+        for parametres in resultat.jobs:
+            job = _Job(**parametres)
+            with _all_jobs_lock:
+                _all_jobs.insert(0, job)
+            hist_mod.add(job)
+            with _queue_lock:  # en mode fichier aussi : le worker écrit le .txt
+                _job_queue.appendleft(job)
+        if resultat.jobs:
+            _work_event.set()
+            _refresh_ui()
+            if _history_win and _history_win.winfo_exists():
+                _refresh_history_panel()
+            _log_error(f"{len(resultat.jobs)} transcript(s) Teams importé(s) → "
+                       "envoi en cours…")
+        for erreur in resultat.erreurs:
+            _log_error(f"Import Teams : {erreur}")
+        if not dlg.winfo_exists():
+            return
+        if resultat.erreurs:
+            mb.showwarning("Import Teams incomplet",
+                           "Non importé(s) :\n" + "\n".join(resultat.erreurs),
+                           parent=dlg)
+        if resultat.jobs:
+            dlg.destroy()
+        else:
+            btn_importer.configure(state="normal")
+
+    def _telecharger(lignes: list[import_teams.LigneReunion], sortie: str):
+        """Thread de fond : jeton silencieux puis lecture des transcripts."""
+        try:
+            jeton = graph_auth.obtenir_jeton()
+            if jeton.jeton:
+                resultat = import_teams.preparer_imports(lignes, jeton.jeton, sortie)
+            else:
+                resultat = import_teams.ResultatImport(
+                    [], [graph_auth.message_connexion(jeton)
+                         + "." + import_teams.MSG_CONNEXION_REQUISE])
+        except Exception as exc:  # l'utilisateur doit voir la panne, pas un blocage
+            _logger.exception("[Import Teams] import en échec")
+            resultat = import_teams.ResultatImport(
+                [], [f"Import impossible : {type(exc).__name__}"])
+        _root.after(0, lambda: _creer_jobs(resultat))
+
+    def _importer():
+        lignes = _cochees()
+        if not lignes:
+            mb.showwarning("Aucune réunion cochée",
+                           "Cochez au moins une réunion.", parent=dlg)
+            return
+        btn_importer.configure(state="disabled")
+        status_lbl.configure(text=f"Lecture de {len(lignes)} transcript(s)…",
+                             fg=DLG_FG2)
+        sortie = _output_var.get() if _output_var else import_teams.SORTIE_NOTION
+        threading.Thread(target=_telecharger, args=(lignes, sortie),
+                         daemon=True).start()
+
+    def _ajouter_ligne(ligne: import_teams.LigneReunion):
+        cochable = ligne.cochable
+        coche = ligne.pre_cochee  # privée ou exclue : cochable, mais pas d'office
+        var = tk.BooleanVar(value=coche)
+        row = tk.Frame(list_frame, bg=DLG_BG3, bd=0)
+        row.pack(fill="x", padx=6, pady=3)
+        chk_box = tk.Label(row, text="✓" if coche else " ",
+                           font=("Segoe UI", 10, "bold"), width=2, relief="flat",
+                           bg=("#2e7d32" if coche
+                               else "#333355" if cochable else "#222233"),
+                           fg="white",
+                           cursor="hand2" if cochable else "arrow")
+        chk_box.pack(side="left", padx=(8, 4), pady=6)
+
+        def _toggle(v=var, lbl=chk_box):
+            v.set(not v.get())
+            lbl.configure(bg="#2e7d32" if v.get() else "#333355",
+                          text="✓" if v.get() else " ")
+
+        info = tk.Frame(row, bg=DLG_BG3)
+        info.pack(side="left", fill="x", expand=True, padx=(4, 8), pady=6)
+        titre = tk.Label(info, text=ligne.objet, font=("Segoe UI", 9, "bold"),
+                         bg=DLG_BG3, fg=DLG_FG if cochable else DLG_FG2,
+                         anchor="w", wraplength=440)
+        titre.pack(fill="x")
+        meta = import_teams.libelle_creneau(ligne.debut, ligne.fin)
+        if ligne.organisateur:
+            meta += f"  ·  {ligne.organisateur}"
+        tk.Label(info, text=meta, font=("Segoe UI", 7), bg=DLG_BG3, fg=DLG_FG2,
+                 anchor="w").pack(fill="x")
+        tk.Label(info, text=ligne.libelle_etat, font=("Segoe UI", 7, "bold"),
+                 bg=DLG_BG3, fg=couleurs_etat[ligne.etat], anchor="w").pack(fill="x")
+        if cochable:
+            for widget in (chk_box, info, titre):
+                widget.bind("<Button-1>", lambda e, fn=_toggle: fn())
+                widget.configure(cursor="hand2")
+        check_vars.append((var, ligne))
+
+    def _afficher(resultat: import_teams.ResultatListe):
+        if not dlg.winfo_exists():
+            return
+        for ligne in resultat.lignes:
+            _ajouter_ligne(ligne)
+        if resultat.message:  # liste vide ou partielle : la cause, en clair
+            status_lbl.configure(text=resultat.message, fg="#ff9966")
+        else:
+            dispo = sum(1 for ligne in resultat.lignes if ligne.cochable)
+            status_lbl.configure(
+                text=f"{len(resultat.lignes)} réunion(s) Teams, {dispo} avec un "
+                     "transcript à importer", fg=DLG_FG2)
+
+    def _progression(fait: int, total: int):
+        def _maj():
+            if dlg.winfo_exists():
+                status_lbl.configure(text=f"Interrogation de Graph : {fait}/{total}…")
+        dlg.after(0, _maj)
+
+    def _charger():
+        try:
+            resultat = import_teams.charger(
+                datetime.datetime.now(),
+                import_teams.identifiants_importes(hist_mod.load()),
+                progression=_progression)
+        except Exception as exc:  # la fenêtre doit afficher la panne
+            _logger.exception("[Import Teams] chargement en échec")
+            resultat = import_teams.ResultatListe(
+                [], f"Lecture impossible : {type(exc).__name__}")
+        dlg.after(0, lambda: _afficher(resultat))
+
+    threading.Thread(target=_charger, daemon=True).start()
+
+
 def _import_transcript():
     """Dialogue pour importer un transcript : fichier texte ou copier-coller."""
     import tkinter.messagebox as mb
@@ -5151,6 +5362,62 @@ def _open_settings():
         command=_toggle_startup,
     ).pack(anchor="w", padx=10, pady=8)
 
+    # ── Microsoft 365 (transcripts Teams via Graph)
+    tk.Frame(tab_g, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))
+    tk.Label(tab_g, text="Microsoft 365 (transcripts Teams)",
+             font=("Segoe UI", 10, "bold"), bg=S_CARD, fg=FG).pack(anchor="w", pady=(10, 0))
+    graph_client_var = _field(tab_g, "Application Entra (ID client)",
+                              user_config.get("graph_client_id", ""))
+    graph_tenant_var = _field(tab_g, "ID de locataire",
+                              user_config.get("graph_tenant_id", ""))
+    graph_btn = tk.Button(
+        tab_g, text="Se connecter à Microsoft 365", font=("Segoe UI", 8),
+        bg=S_HIGH, fg=FG, activebackground=S_TOP, activeforeground=FG,
+        disabledforeground=FG3, relief="flat", bd=0, pady=5, cursor="hand2")
+    graph_btn.pack(anchor="w", pady=(8, 0))
+    graph_status_lbl = tk.Label(tab_g, text="", font=("Segoe UI", 8),
+                                bg=S_CARD, fg=FG3, wraplength=360, justify="left")
+    graph_status_lbl.pack(anchor="w", pady=(4, 0))
+
+    def _maj_bouton_graph(*_):
+        """Bouton inactif tant qu'un des deux identifiants est vide."""
+        saisis = graph_auth.identifiants_saisis(
+            graph_client_var.get(), graph_tenant_var.get())
+        graph_btn.config(state="normal" if saisis else "disabled")
+
+    def _sauver_graph():
+        user_config.save({"graph_client_id": graph_client_var.get().strip(),
+                          "graph_tenant_id": graph_tenant_var.get().strip()})
+
+    def _afficher_resultat_graph(resultat):
+        if not win.winfo_exists():  # fenêtre fermée pendant la connexion
+            return
+        ok = bool(resultat.jeton)
+        graph_status_lbl.config(text=graph_auth.message_connexion(resultat),
+                                fg="#00cc66" if ok else ERR)
+        _maj_bouton_graph()
+
+    def _connecter_graph():
+        """Enregistre les identifiants, puis connecte hors du thread tkinter."""
+        try:
+            _sauver_graph()
+        except OSError as e:
+            graph_status_lbl.config(text=f"Erreur : {e}", fg=ERR)
+            return
+        graph_btn.config(state="disabled")
+        graph_status_lbl.config(text="Connexion en cours dans le navigateur…", fg=FG3)
+
+        def _travail():
+            resultat = graph_auth.obtenir_jeton(interactif=True)
+            _root.after(0, lambda: _afficher_resultat_graph(resultat))
+
+        threading.Thread(target=_travail, daemon=True).start()
+
+    graph_btn.config(command=_connecter_graph)
+    graph_client_var.trace_add("write", _maj_bouton_graph)
+    graph_tenant_var.trace_add("write", _maj_bouton_graph)
+    _maj_bouton_graph()
+
     # ── Footer boutons
     footer = tk.Frame(win, bg=S_MAIN)
     footer.pack(fill="x", side="bottom")
@@ -5164,6 +5431,10 @@ def _open_settings():
             _save_notion()
         elif tab == "outlook":
             _save_ews()
+        elif tab == "general":
+            _sauver_graph()
+            graph_status_lbl.config(text="✓ Identifiants Microsoft 365 enregistrés.",
+                                    fg="#00cc66")
 
     tk.Button(footer, text="SAVE CONFIGURATION", font=("Segoe UI", 9, "bold"),
               bg=RED_DIM, fg="white", activebackground=RED, activeforeground="white",

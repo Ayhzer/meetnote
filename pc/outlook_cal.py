@@ -12,6 +12,8 @@ import datetime
 import logging
 import re
 
+from lien_teams import url_participation
+
 log = logging.getLogger(__name__)
 
 try:
@@ -184,6 +186,8 @@ def _evenement_com(item) -> dict | None:
         raw_body = str(item.Body or "").strip()
     except Exception:
         raw_body = ""
+    # Lien Teams lu sur le corps complet : il peut dépasser la troncature.
+    join_url = url_participation(raw_body)
     body = " ".join(raw_body.split())[:_COM_CORPS_MAX]
 
     return {
@@ -197,6 +201,7 @@ def _evenement_com(item) -> dict | None:
         "optional":     _split_recipients(str(getattr(item, "OptionalAttendees", "") or "")),
         "is_recurring": bool(getattr(item, "IsRecurring", False)),
         "prive":        _est_prive_com(item),
+        "join_url":     join_url,
     }
 
 
@@ -302,6 +307,7 @@ def get_events_range(days: int = 15) -> list:
         "location", "body", "organizer",
         "required": [str], "optional": [str],
         "is_recurring": bool, "prive": bool,
+        "join_url": str (URL de participation Teams, "" si absente),
     }
     Essaie EWS en priorité, sinon COM/MAPI ; [] si aucune source ne répond.
     """

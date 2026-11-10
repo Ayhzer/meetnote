@@ -1,5 +1,35 @@
 # MeetNote PC — Changelog
 
+## [3.5.0] — 2026-11-10
+
+### Import des transcripts Teams
+- **Nouveau bouton « 🎙 Transcripts TEAMS »** dans le panneau historique, à côté de
+  « 📧 Import mails ». Il liste les **réunions Teams terminées des 15 derniers jours**, lues
+  dans votre agenda Outlook, chacune avec son état : « transcript disponible », « pas de
+  transcript » ou « déjà importé ».
+- Vous cochez les réunions voulues puis cliquez sur **« Importer »** : chaque transcription
+  part vers Notion (type `Teams`) ou dans un fichier, selon votre mode de sortie. Un transcript
+  déjà importé **n'est plus proposé**.
+- La ligne « Participants » reprend les invités de la réunion, **sans adresse e-mail**.
+
+### Connexion Microsoft 365
+- **Paramètres → Général, section « Microsoft 365 »** : saisissez l'ID client de l'application
+  et l'ID de locataire (fournis par votre administrateur), puis cliquez sur
+  **« Se connecter à Microsoft 365 »**. La connexion se fait **une seule fois**, dans le
+  navigateur.
+- La session est ensuite **conservée chiffrée sur le poste** (protection Windows DPAPI) et se
+  rouvre silencieusement au redémarrage de MeetNote.
+
+### Prérequis et limites connues
+- **Prérequis côté administrateur** : l'application doit être inscrite dans Entra ID avec les
+  permissions déléguées `OnlineMeetings.Read` et `OnlineMeetingTranscript.Read.All`, et
+  l'administrateur Teams doit avoir ouvert l'accès aux transcriptions.
+- **Pas de transcript si la transcription n'a pas été lancée pendant la réunion** : MeetNote
+  ne peut importer que ce que Teams a produit.
+- **Pas de nom d'intervenant** dans le texte importé.
+
+---
+
 ## [3.4.0] — 2026-10-26
 
 ### Installation

@@ -95,7 +95,7 @@ class TestSauvegardeAtomique(_BaseTemporaire):
             self._lire(),
             {"ews_email": "a@b.fr", "notion_token": "nouveau",
              "notion_database_id": "", "dossier_modeles": "", "whisper_model": "",
-             "mode": "fichier"},
+             "graph_client_id": "", "graph_tenant_id": "", "mode": "fichier"},
         )
         self.assertEqual(self._residus(), [])
 

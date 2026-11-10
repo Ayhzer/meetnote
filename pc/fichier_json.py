@@ -13,19 +13,15 @@ from datetime import datetime
 _log = logging.getLogger("meetnote")
 
 
-def ecrire_atomique(chemin: str, data, **options_json) -> None:
-    """Ecrit `data` en JSON dans `chemin` de facon atomique.
-
-    Leve l'exception d'origine en cas d'echec ; l'ancien fichier reste alors intact
-    et le temporaire est supprime.
-    """
+def _ecrire_fichier_atomique(chemin: str, ecrire, mode: str, **options_open) -> None:
+    """Temporaire du meme dossier + os.replace ; `ecrire(f)` produit le contenu."""
     dossier = os.path.dirname(chemin)
     os.makedirs(dossier, exist_ok=True)
     nom = os.path.splitext(os.path.basename(chemin))[0]
     fd, tmp_path = tempfile.mkstemp(dir=dossier, prefix=f"{nom}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, **options_json)
+        with os.fdopen(fd, mode, **options_open) as f:
+            ecrire(f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, chemin)
@@ -37,7 +33,22 @@ def ecrire_atomique(chemin: str, data, **options_json) -> None:
         raise
 
 
-def _ecarter(chemin: str) -> None:
+def ecrire_atomique(chemin: str, data, **options_json) -> None:
+    """Ecrit `data` en JSON dans `chemin` de facon atomique.
+
+    Leve l'exception d'origine en cas d'echec ; l'ancien fichier reste alors intact
+    et le temporaire est supprime.
+    """
+    _ecrire_fichier_atomique(chemin, lambda f: json.dump(data, f, **options_json),
+                             "w", encoding="utf-8")
+
+
+def ecrire_octets_atomique(chemin: str, octets: bytes) -> None:
+    """Meme garantie qu'`ecrire_atomique`, pour un contenu binaire (cache chiffre)."""
+    _ecrire_fichier_atomique(chemin, lambda f: f.write(octets), "wb")
+
+
+def ecarter(chemin: str) -> None:
     """Renomme un fichier illisible en .corrompu-AAAAMMJJ-HHMMSS.
 
     Le contenu n'est pas journalise : il peut contenir un secret.
@@ -67,6 +78,6 @@ def lire_ou_ecarter(chemin: str, type_attendu: type):
     except FileNotFoundError:
         return None
     except (ValueError, TypeError):  # JSONDecodeError et UnicodeDecodeError : ValueError
-        _ecarter(chemin)
+        ecarter(chemin)
         return None
     return data
