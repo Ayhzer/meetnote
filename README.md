@@ -5,7 +5,6 @@ Enregistrement de réunions → Transcription Whisper → Notion
 ## Architecture
 
 - **PC** : Icône systray Windows, enregistrement audio via sounddevice, transcription faster-whisper locale, push Notion
-- **PWA** : Application web installable (Android/iOS/PC), enregistrement via MediaRecorder, transcription Whisper WASM via Transformers.js, push Notion
 
 ## Setup
 
@@ -59,7 +58,7 @@ L'application s'ouvre dans une fenêtre tkinter avec une icône systray. L'inter
 
 Les trois étapes sont découplées et chacune est relançable indépendamment depuis l'historique :
 1. **Enregistrement audio** → archivé dans `Documents\MeetNote\audio\` (opus via ffmpeg ou wav en fallback)
-2. **Transcription** (faster-whisper, local) → sauvegardée dans `Documents\MeetNote\transcripts\` avec timestamps `[HH:MM:SS]` par segment. Diarisation automatique (MFCC + DBSCAN) : identification des locuteurs `SPKR_1 (H)` / `SPKR_2 (F)` avec détection H/F via pitch F0.
+2. **Transcription** (faster-whisper, local) → sauvegardée dans `Documents\MeetNote\transcripts\` avec timestamps `[HH:MM:SS]` par segment. Diarisation automatique (MFCC + DBSCAN) : identification des locuteurs `SPKR_1`, `SPKR_2`… (ou leur nom Teams quand il est connu), sans aucune détection de sexe.
 3. **Upload Notion** → ou export fichier local selon le mode choisi dans les paramètres
 
 #### Fenêtre Historique
@@ -86,17 +85,7 @@ Au démarrage, l'instance précédente est automatiquement terminée via un fich
 - Débruitage via `noisereduce` (prop_decrease=0.75, stationary)
 - Mix Mixte : 60 % mic / 40 % loopback
 
-### 2. PWA
-
-Ouvrir `pwa/index.html` dans Chrome (ou via Live Server VS Code).
-
-Sur Android : Chrome → "Ajouter à l'écran d'accueil"
-
-Renseigner dans les Paramètres de l'appli :
-- Notion Token
-- Database ID
-
-### 3. Notion
+### 2. Notion
 
 Créer la database **Transcripts** avec ces propriétés :
 
@@ -113,7 +102,7 @@ Créer la database **Transcripts** avec ces propriétés :
 
 Créer une intégration sur [notion.so/my-integrations](https://www.notion.so/my-integrations) et partager la database avec elle.
 
-### 4. Agent Claude (traitement automatique)
+### 3. Agent Claude (traitement automatique)
 
 Claude Desktop + MCP Notion → coller le contenu de `shared/prompt_agent_claude.md`
 
@@ -129,11 +118,3 @@ Claude Desktop + MCP Notion → coller le contenu de `shared/prompt_agent_claude
    - **Stop without transcribing** : archive l'audio uniquement, transcription à relancer plus tard depuis l'historique
 7. Après transcription, cliquer **→ Notion** depuis la carte historique pour uploader
 8. Lancer l'agent Claude pour le traitement
-
-## Utilisation Mobile (PWA)
-
-1. Ouvrir l'appli
-2. Appuyer sur le bouton rouge pour démarrer
-3. Appuyer à nouveau pour arrêter
-4. Vérifier/éditer le transcript
-5. **Envoyer vers Notion**

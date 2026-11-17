@@ -6,8 +6,8 @@
 # constats que le defaut (263 sur pc/ au 2026-10-15), line-length 88, pas de
 # target-version impose.
 
-# Hors perimetre du lint : kit local, archives du kit, PWA (JavaScript).
-extend-exclude = [".claude", "_archive-*", "pwa"]
+# Hors perimetre du lint : kit local, archives du kit.
+extend-exclude = [".claude", "_archive-*"]
 
 [lint]
 select = [

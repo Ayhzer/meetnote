@@ -1,5 +1,50 @@
 # MeetNote PC — Changelog
 
+## [3.6.0] — 2026-11-17
+
+### Information des participants
+- **Nouvelle case « J'ai informé les participants »**, visible pendant tout enregistrement
+  (manuel ou démarré automatiquement). Elle est en couleur d'alerte tant qu'elle n'est pas
+  cochée, et **ne bloque ni ne retarde jamais** l'enregistrement. La cocher retient l'heure ;
+  la décocher l'efface. Elle est remise à zéro à l'enregistrement suivant.
+- **Trace datée** : la confirmation (« ✓ Participants informés le … » ou
+  « ⚠ Information non confirmée ») apparaît sur la carte de l'enregistrement dans l'historique,
+  et en **première ligne du transcript enregistré sur votre poste**. Elle n'est **jamais**
+  envoyée dans Notion : la page Notion reste inchangée.
+
+### Suppression automatique des enregistrements
+- **L'audio conservé sur le poste est supprimé 30 jours après sa transcription** et **les
+  transcriptions 6 mois après la réunion**. Les fichiers partent **dans la Corbeille de
+  Windows** : vous pouvez les restaurer. Un fichier trop gros pour la Corbeille est supprimé
+  définitivement par Windows.
+- **Durées réglables** dans Paramètres → Général (« Conserver l'audio » et « Conserver la
+  transcription », en jours, valeur entière d'au moins 1). Une valeur invalide est refusée et
+  l'ancienne est conservée.
+- **Historique allégé** à l'échéance des 6 mois : le texte de la transcription, les notes et
+  les participants sont effacés ; **le titre, la date, la durée et le lien Notion sont
+  conservés**. La carte indique « Audio supprimé le … » et « Transcription purgée le … ».
+  « ▶ Play » et « Retranscrire » ne s'affichent plus quand l'audio n'existe plus.
+- **Nettoyage complet** : les fichiers qui n'ont plus d'entrée dans l'historique suivent la même
+  règle d'après la date de leur nom, et les enregistrements interrompus laissés dans le
+  dossier `tmp` sont aussi supprimés après 30 jours.
+- La passe s'exécute au démarrage, après chaque traitement, puis toutes les 6 heures. Chaque
+  suppression est notée dans le journal (nom du fichier et règle appliquée, jamais le contenu).
+
+### Notion
+- **L'audio n'est plus envoyé vers Notion** : seul le texte part. Les pages déjà créées ne
+  sont pas modifiées.
+
+### Transcription
+- **La détection homme/femme des locuteurs est retirée.** Les intervenants restent distingués
+  (`SPKR_1`, `SPKR_2`…, ou leur nom Teams quand il est connu) sans mention de leur sexe.
+
+### Application mobile
+- **L'application web mobile (PWA) est retirée** de MeetNote. L'application PC est désormais
+  la seule interface. L'option « Mobile » de la propriété Notion `Source` reste disponible :
+  rien ne change dans votre base Notion.
+
+---
+
 ## [3.5.0] — 2026-11-10
 
 ### Import des transcripts Teams

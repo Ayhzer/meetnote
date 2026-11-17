@@ -6,6 +6,7 @@ import dataclasses
 import datetime
 import logging
 import os
+import threading
 
 import fichier_json
 
@@ -14,6 +15,10 @@ _log = logging.getLogger("meetnote")
 HISTORY_PATH = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
                              "MeetNote", "history.json")
 MAX_ENTRIES = 100
+
+# Lecture-modification-écriture de `add`/`update` : sans verrou, deux fils (worker,
+# interface, passe de conservation) s'écraseraient mutuellement leurs mises à jour.
+_verrou_ecriture = threading.Lock()
 
 
 def _job_to_dict(job) -> dict:
@@ -41,6 +46,9 @@ def _dict_to_job_dict(d: dict) -> dict:
         "notion_url": "",
         "error_msg": "",
         "attachments": [],
+        "participants_informes_le": "",
+        "audio_supprime_le": "",
+        "transcript_purge_le": "",
     }
     for k, v in defaults.items():
         if k not in d:
@@ -53,7 +61,8 @@ def champs_job(entree: dict) -> dict:
 
     Tous les champs du `_Job` sont persistés par `_job_to_dict` ; ils doivent
     donc tous être relus ici, sinon la reprise au démarrage les réécrit vides
-    dans history.json (notes manuelles et transcriptions perdues).
+    dans history.json (notes manuelles, transcriptions et dates de traçabilité
+    perdues). Tout nouveau champ de `_Job` doit donc être ajouté ici.
     `start_time` absent ou non textuel : maintenant. Texte invalide : ValueError.
     """
     st = entree.get("start_time", "")
@@ -84,6 +93,9 @@ def champs_job(entree: dict) -> dict:
         "notion_url": entree.get("notion_url", ""),
         "error_msg": entree.get("error_msg", ""),
         "attachments": entree.get("attachments", []),
+        "participants_informes_le": entree.get("participants_informes_le", ""),
+        "audio_supprime_le": entree.get("audio_supprime_le", ""),
+        "transcript_purge_le": entree.get("transcript_purge_le", ""),
     }
 
 
@@ -108,24 +120,26 @@ def save(entries: list) -> None:
 
 def add(job) -> None:
     """Ajoute un job en tête de l'historique et sauvegarde."""
-    entries = load()
-    d = _job_to_dict(job)
-    # Supprimer entrée existante avec même id si elle existe
-    entries = [e for e in entries if e.get("id") != d["id"]]
-    entries.insert(0, d)
-    save(entries)
+    with _verrou_ecriture:
+        entries = load()
+        d = _job_to_dict(job)
+        # Supprimer entrée existante avec même id si elle existe
+        entries = [e for e in entries if e.get("id") != d["id"]]
+        entries.insert(0, d)
+        save(entries)
 
 
 def update(job) -> None:
     """Met à jour un job existant dans l'historique et sauvegarde."""
-    entries = load()
-    d = _job_to_dict(job)
-    updated = False
-    for i, e in enumerate(entries):
-        if e.get("id") == d["id"]:
-            entries[i] = d
-            updated = True
-            break
-    if not updated:
-        entries.insert(0, d)
-    save(entries)
+    with _verrou_ecriture:
+        entries = load()
+        d = _job_to_dict(job)
+        updated = False
+        for i, e in enumerate(entries):
+            if e.get("id") == d["id"]:
+                entries[i] = d
+                updated = True
+                break
+        if not updated:
+            entries.insert(0, d)
+        save(entries)

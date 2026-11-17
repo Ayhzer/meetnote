@@ -95,7 +95,8 @@ class TestSauvegardeAtomique(_BaseTemporaire):
             self._lire(),
             {"ews_email": "a@b.fr", "notion_token": "nouveau",
              "notion_database_id": "", "dossier_modeles": "", "whisper_model": "",
-             "graph_client_id": "", "graph_tenant_id": "", "mode": "fichier"},
+             "graph_client_id": "", "graph_tenant_id": "", "mode": "fichier",
+             "retention_audio_jours": 30, "retention_transcript_jours": 180},
         )
         self.assertEqual(self._residus(), [])
 
@@ -134,6 +135,38 @@ class TestSauvegardeAtomique(_BaseTemporaire):
         os.makedirs(self.dossier, exist_ok=True)
         self.assertEqual(uc.load(), dict(uc._DEFAULTS))
         self.assertEqual(os.listdir(self.dossier), [])
+
+
+class TestJoursDeConservation(_BaseTemporaire):
+    def test_defauts_30_et_180(self):
+        self.assertEqual(uc.jours_de_conservation("retention_audio_jours", {}), 30)
+        self.assertEqual(uc.jours_de_conservation("retention_transcript_jours", {}), 180)
+
+    def test_valeur_valide_conservee(self):
+        reglages = {"retention_audio_jours": 7, "retention_transcript_jours": "365"}
+        self.assertEqual(uc.jours_de_conservation("retention_audio_jours", reglages), 7)
+        self.assertEqual(uc.jours_de_conservation("retention_transcript_jours", reglages), 365)
+
+    def test_valeurs_invalides_rendent_le_defaut(self):
+        for invalide in (None, True, False, 0, -5, 2.5, "", "abc", "1.5", "-3", "0", [], {}):
+            with self.subTest(valeur=invalide):
+                reglages = {"retention_audio_jours": invalide}
+                self.assertEqual(uc.jours_de_conservation("retention_audio_jours", reglages), 30)
+
+    def test_cle_inconnue_refusee(self):
+        with self.assertRaises(KeyError):
+            uc.jours_de_conservation("autre_cle", {})
+
+    def test_lecture_depuis_le_fichier(self):
+        self.assertEqual(uc.jours_de_conservation("retention_audio_jours"), 30)
+        self._ecrire({"retention_audio_jours": 12, "retention_transcript_jours": 0})
+        self.assertEqual(uc.jours_de_conservation("retention_audio_jours"), 12)
+        self.assertEqual(uc.jours_de_conservation("retention_transcript_jours"), 180)
+
+    def test_valeur_jours(self):
+        self.assertEqual(uc.valeur_jours(" 45 "), 45)
+        self.assertIsNone(uc.valeur_jours("4 5"))
+        self.assertIsNone(uc.valeur_jours("²"))
 
 
 if __name__ == "__main__":

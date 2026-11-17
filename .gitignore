@@ -14,7 +14,6 @@ build/
 # Audio temp files
 /tmp/
 pc/tmp/
-pwa/tmp/
 
 # Whisper model cache
 pc/.cache/

@@ -29,7 +29,7 @@ NOM_TITRE = "Titre"
 
 # Propriete -> type Notion, dans l'ordre de creation. Doit rester aligne sur le
 # dictionnaire `props` de notion_push.py : « Files & media » n'y est ecrit que
-# lorsqu'un audio ou une piece jointe est envoye, mais la colonne doit exister.
+# lorsqu'une piece jointe est envoyee, mais la colonne doit exister.
 PROPRIETES_ATTENDUES = {
     "Titre": "title",
     "Date": "date",

@@ -112,6 +112,13 @@ class TestHistoryLoad(_BaseTemporaire):
         self.assertEqual(entree["status_transcript"], "queued")
         self.assertEqual(entree["attachments"], [])
 
+    def test_ancien_historique_sans_champs_de_tracabilite(self):
+        self._ecrire_brut(b'[{"id": "a"}]')
+        entree = history.load()[0]
+        for cle in ("participants_informes_le", "audio_supprime_le",
+                    "transcript_purge_le"):
+            self.assertEqual(entree[cle], "", cle)
+
     def test_ancien_historique_sans_participants_invites(self):
         self._ecrire_brut(b'[{"id": "a", "teams_participants": ["Ana"]}]')
         entree = history.load()[0]
@@ -148,6 +155,9 @@ class TestChampsJob(_BaseTemporaire):
         "teams_transcript": "collé Teams", "notes": "note manuelle é",
         "transcript_path": "t.txt", "notion_url": "https://n", "error_msg": "x",
         "attachments": ["p.pdf"],
+        "participants_informes_le": "2026-10-25T09:31:00",
+        "audio_supprime_le": "2026-11-24",
+        "transcript_purge_le": "2027-10-25",
     }
 
     def test_couvre_tous_les_champs_du_job(self):
@@ -156,7 +166,9 @@ class TestChampsJob(_BaseTemporaire):
     def test_entree_complete_relue_a_l_identique(self):
         champs = history.champs_job(self.ENTREE_COMPLETE)
         for cle in ("notes", "whisper_transcript", "teams_transcript",
-                    "participants_invites", "teams_participants"):
+                    "participants_invites", "teams_participants",
+                    "participants_informes_le", "audio_supprime_le",
+                    "transcript_purge_le"):
             self.assertEqual(champs[cle], self.ENTREE_COMPLETE[cle], cle)
 
     def test_entree_ancienne_donne_les_defauts(self):
@@ -166,6 +178,9 @@ class TestChampsJob(_BaseTemporaire):
         self.assertEqual(champs["teams_transcript"], "")
         self.assertEqual(champs["participants_invites"], [])
         self.assertEqual(champs["teams_participants"], [])
+        for cle in ("participants_informes_le", "audio_supprime_le",
+                    "transcript_purge_le"):
+            self.assertEqual(champs[cle], "", cle)
         self.assertEqual(champs["model_name"], "base")
         self.assertEqual(champs["status_transcript"], "done")
 

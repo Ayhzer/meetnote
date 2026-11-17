@@ -26,14 +26,14 @@ Output lands in `pc\dist\MeetNote-<VERSION>\` (version from `pc/version.py`, als
 
 ## Architecture
 
-Two independent frontends share a Notion database as the backend:
+The PC app pushes to a Notion database used as the backend:
 
 **PC app (`pc/`)** — Windows tray application (Python 3.12, tkinter):
 - `meetnote-tray.py` — monolithic entry point (~4400 lines). Contains: UI, recording engine, job queue, transcription pipeline, history panel. All UI state is module-level globals.
 - `config.py` — **gitignored**, must be created manually before first run (see README). Contains audio/path/Whisper/Notion settings.
 - `user_config.py` — runtime settings persisted to `%APPDATA%/MeetNote/settings.json` (Notion token, database ID, EWS credentials, exclusion lists). Loaded at startup and overrides `config.py`.
 - `history.py` — JSON persistence of job history at `%APPDATA%/MeetNote/history.json` (100 entries max).
-- `notion_push.py` — Notion REST API (v2026-03-11): creates pages, uploads audio via 2-step file_uploads API, handles batching (100-block limit).
+- `notion_push.py` — Notion REST API (v2026-03-11): creates pages, uploads mail attachments via 2-step file_uploads API (audio is no longer sent), handles batching (100-block limit).
 - `outlook_cal.py` — Calendar integration: tries EWS via `exchangelib` first, falls back to COM/MAPI via `win32com`. Filters OOO, all-day, and >12h events.
 - `ews_cal.py` — EWS-specific calendar access (Nouvel Outlook / Exchange on-premise via NTLM).
 - `calendar_digest.py` — Builds a 15-day agenda from Outlook and pushes it to Notion once per day.
@@ -41,13 +41,6 @@ Two independent frontends share a Notion database as the backend:
 - `outlook_mail.py` — Outlook mail reading (for attachments feature).
 - `whisper_local.py` — Standalone Whisper helper (used outside the tray context).
 - `perf_profile.py` — Decides how much of the machine transcription may use: `(streams, threads)` from cores, free RAM, AC/battery, CPU load, recording in progress. Unit tests in `test_perf_profile.py`; `test_transcription_parallele.py` is the slow integration test proving parallel output matches serial.
-
-**PWA (`pwa/`)** — Installable web app (no build step):
-- `app.js` — Main application logic
-- `recorder.js` — MediaRecorder-based audio capture
-- `whisper.js` / `whisper_local.py` — Whisper WASM transcription via Transformers.js
-- `notion.js` — Notion push from browser
-- `sw.js` — Service worker for offline/PWA install
 
 **Shared:**
 - `shared/prompt_agent_claude.md` — Claude Desktop prompt for automated Notion processing
@@ -58,7 +51,7 @@ Jobs flow through these states: `queued → running → done / error` for each o
 
 Pipeline steps in order:
 1. Archive audio: WAV → Opus 24 kbps via ffmpeg (fallback: copy as WAV) → `Documents/MeetNote/audio/`
-2. Transcribe: faster-whisper (CPU, int8). Splits audio at 10-min segments, transcribed **in parallel** when the machine allows — `perf_profile.py` decides `(streams, threads)` from physical cores, free RAM, AC/battery, CPU load and whether a recording is running. Measured on 8 cores: 2 streams × 4 threads = 26 % faster than serial; raising `cpu_threads` alone gains nothing (Whisper decoding is autoregressive). User setting in Settings → Général. Applies MFCC+DBSCAN diarization (no external deps) with H/F gender detection via pitch F0.
+2. Transcribe: faster-whisper (CPU, int8). Splits audio at 10-min segments, transcribed **in parallel** when the machine allows — `perf_profile.py` decides `(streams, threads)` from physical cores, free RAM, AC/battery, CPU load and whether a recording is running. Measured on 8 cores: 2 streams × 4 threads = 26 % faster than serial; raising `cpu_threads` alone gains nothing (Whisper decoding is autoregressive). User setting in Settings → Général. Applies MFCC+DBSCAN diarization (no external deps). Speakers are labelled `SPKR_1`, `SPKR_2`… (or the Teams name when known), with no voice-based gender detection (labelling logic in `diarisation_etiquettes.py`).
 3. Save transcript: `Documents/MeetNote/transcripts/transcript_YYYYMMDD_HHMMSS.txt`
 4. Push to Notion (or save to file if output_mode = "fichier")
 

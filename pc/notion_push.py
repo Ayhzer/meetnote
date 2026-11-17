@@ -1,13 +1,11 @@
 """
-Pousse le transcript + l'enregistrement audio dans Notion.
-Upload audio : wav -> opus (via ffmpeg) -> POST /v1/file_uploads -> attach a la page.
+Pousse le transcript dans Notion (page + blocs), avec les pieces jointes eventuelles.
+L'audio n'est plus envoye : il reste archive en local (Documents/MeetNote/audio/).
+Pieces jointes : POST /v1/file_uploads -> attach a la page (propriete « Files & media »).
 """
 import datetime
 import os
-import re
-import subprocess
 import sys
-import tempfile
 
 import requests
 
@@ -21,11 +19,6 @@ HEADERS = {
     "Notion-Version": NOTION_VERSION,
 }
 
-# Bitrate opus cible : 24 kbps mono → ~10.8 Mo/heure → 2h = ~21.6 Mo
-# Sur plan payant Notion (5 GiB) c'est OK.
-# Sur plan gratuit (5 MiB) : max ~27 min — on l'indique dans le nom du fichier.
-AUDIO_BITRATE = "24k"
-
 
 def push_to_notion(
     transcript: str,
@@ -35,7 +28,6 @@ def push_to_notion(
     duration_min: float = 0,
     whisper_model: str = "",
     start_time: datetime.datetime = None,
-    audio_path: str = None,
     title_override: str = "",
     attachments: list = None,
     notes: str = "",
@@ -87,32 +79,8 @@ def push_to_notion(
     if whisper_model:
         props["Modèle Whisper"] = {"select": {"name": whisper_model}}
 
-    # ── Upload audio si fourni ────────────────────────────────────────────────
-    file_objects = []
-    if audio_path and os.path.isfile(audio_path):
-        try:
-            compressed = _compress_audio(audio_path, now)
-            segments   = _split_audio_for_upload(compressed, segment_min=config.NOTION_UPLOAD_SEGMENT_MIN)
-
-            for seg_path in segments:
-                fid, fname = _upload_file(seg_path)
-                file_objects.append({
-                    "type": "file_upload",
-                    "file_upload": {"id": fid},
-                    "name": fname,
-                })
-                if seg_path != compressed and seg_path != audio_path:
-                    try: os.remove(seg_path)
-                    except OSError: pass
-
-            if compressed != audio_path:
-                try: os.remove(compressed)
-                except OSError: pass
-
-        except Exception as e:
-            print(f"[notion_push] Warning: audio upload failed: {e}", file=sys.stderr)
-
     # ── Upload pièces jointes si fournies ─────────────────────────────────────
+    file_objects = []
     for att_path in (attachments or []):
         if not os.path.isfile(att_path):
             continue
@@ -174,30 +142,6 @@ def push_to_notion(
     return page
 
 
-def _compress_audio(wav_path: str, dt: datetime.datetime) -> str:
-    """Compresse wav -> opus via ffmpeg. Retourne le chemin du fichier compressé."""
-    ffmpeg = _find_ffmpeg()
-    if not ffmpeg:
-        return wav_path  # pas de ffmpeg → wav brut
-
-    fname = f"meetnote_{dt.strftime('%Y%m%d_%H%M%S')}.opus"
-    out   = os.path.join(tempfile.gettempdir(), fname)
-
-    cmd = [
-        ffmpeg, "-y", "-i", wav_path,
-        "-c:a", "libopus",
-        "-b:a", AUDIO_BITRATE,
-        "-ac", "1",       # mono
-        "-ar", "16000",   # 16 kHz (déjà le cas, mais on force)
-        out,
-    ]
-    result = subprocess.run(cmd, capture_output=True, timeout=120,
-                            creationflags=subprocess.CREATE_NO_WINDOW)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg error: {result.stderr.decode(errors='replace')[-300:]}")
-    return out
-
-
 def _find_ffmpeg() -> str | None:
     """Cherche ffmpeg : dans le bundle PyInstaller, puis dans PATH."""
     import shutil
@@ -207,84 +151,6 @@ def _find_ffmpeg() -> str | None:
         if os.path.isfile(candidate):
             return candidate
     return shutil.which("ffmpeg")
-
-
-# Délai maximal de la lecture de durée (ffmpeg -i), en secondes.
-DELAI_LECTURE_DUREE_S = 15
-
-# « Duration: 01:02:03.45, start: … » — les heures peuvent dépasser 24, les
-# centièmes peuvent manquer ; « Duration: N/A » ne correspond pas (durée inconnue).
-_RE_DUREE_FFMPEG = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2})(?:\.(\d+))?")
-
-
-def duree_depuis_sortie_ffmpeg(texte: str) -> float | None:
-    """Durée en secondes lue dans la sortie de `ffmpeg -i`, ou None si absente."""
-    m = _RE_DUREE_FFMPEG.search(texte or "")
-    if not m:
-        return None
-    heures, minutes, secondes, fraction = m.groups()
-    total = int(heures) * 3600 + int(minutes) * 60 + int(secondes)
-    return total + (float(f"0.{fraction}") if fraction else 0.0)
-
-
-def _lire_duree_s(ffmpeg: str, chemin: str) -> float | None:
-    """Durée d'un fichier audio via `ffmpeg -i` (None si illisible).
-
-    ffmpeg sans fichier de sortie rend un code non nul : seul stderr compte.
-    """
-    try:
-        r = subprocess.run(
-            [ffmpeg, "-hide_banner", "-i", chemin],
-            capture_output=True, timeout=DELAI_LECTURE_DUREE_S,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return duree_depuis_sortie_ffmpeg(r.stderr.decode(errors="replace"))
-
-
-def _split_audio_for_upload(opus_path: str, segment_min: int = 10) -> list:
-    """
-    Découpe un fichier opus en segments de N minutes via ffmpeg.
-    Retourne la liste des chemins de segments.
-    Si le fichier est assez court, retourne [opus_path] sans modification.
-    """
-    import glob as _glob
-
-    ffmpeg = _find_ffmpeg()
-
-    if not ffmpeg:
-        return [opus_path]
-
-    duration_s = _lire_duree_s(ffmpeg, opus_path)
-
-    # Si on n'a pas pu mesurer la durée, on découpe si le fichier > 50 Mo
-    if duration_s is None:
-        size_mb = os.path.getsize(opus_path) / (1024 * 1024)
-        if size_mb <= segment_min * 0.3:   # ~0.3 Mo/min à 24 kbps
-            return [opus_path]
-        # durée estimée
-        duration_s = size_mb / 0.3 * 60
-
-    if duration_s <= segment_min * 60:
-        return [opus_path]
-
-    base    = os.path.splitext(opus_path)[0]
-    pattern = f"{base}_part%03d.opus"
-    cmd = [
-        ffmpeg, "-y", "-i", opus_path,
-        "-f", "segment",
-        "-segment_time", str(segment_min * 60),
-        "-c", "copy",
-        pattern,
-    ]
-    result = subprocess.run(cmd, capture_output=True, timeout=600,
-                            creationflags=subprocess.CREATE_NO_WINDOW)
-    if result.returncode != 0:
-        return [opus_path]   # échec silencieux → envoyer le fichier entier
-
-    parts = sorted(_glob.glob(f"{base}_part*.opus"))
-    return parts if parts else [opus_path]
 
 
 def _upload_file(path: str) -> tuple[str, str]:

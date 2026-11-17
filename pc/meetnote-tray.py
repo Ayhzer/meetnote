@@ -57,13 +57,17 @@ import calendar_digest
 import chemin_transcript
 import config
 import conversion_audio
+import corbeille
 import debruitage
 import demarrage_windows
+import diarisation_etiquettes
 import graph_auth
 import history as hist_mod
 import import_teams
+import information_participants
 import journal_app
 import modeles
+import passe_conservation
 import perf_profile
 import recuperation_enregistrements as recup_mod
 import source_agenda
@@ -295,6 +299,10 @@ _source_combo    = None
 _speaker_frame   = None
 _speaker_combo   = None
 _rec_start_time  = None
+# Confirmation « participants informés » de l'enregistrement en cours (ISO, "" = non cochée)
+_participants_informes_le = ""
+_case_informes     = None   # case à cocher de la fenêtre principale
+_case_informes_var = None
 _audio_device_monitor_started = False  # un seul thread de surveillance
 _modal_dialog_open = False             # True pendant wait_window() d'un dialog modal
 
@@ -354,8 +362,12 @@ class _Job:
     notion_url:      str = ""
     error_msg:       str = ""
     attachments:     list = dataclasses.field(default_factory=list)  # chemins fichiers joints (mails)
+    # Traçabilité (chaînes ISO, "" = jamais renseigné)
+    participants_informes_le: str = ""  # horodatage de la confirmation « participants informés »
+    audio_supprime_le:        str = ""  # date de suppression automatique de l'audio local
+    transcript_purge_le:      str = ""  # date de purge de la transcription à l'échéance de conservation
 
-_job_queue            = collections.deque()
+_job_queue           = collections.deque()
 _queue_lock           = threading.Lock()
 _work_event           = threading.Event()
 _worker_busy          = False
@@ -1115,6 +1127,11 @@ def _save_transcript_local(job: _Job) -> str | None:
             f.write(f"Modèle   : {job.model_name}\n")
             if job.meeting_type:
                 f.write(f"Type     : {job.meeting_type}\n")
+            # Information des participants : traçabilité locale, jamais envoyée à Notion
+            ligne_info = information_participants.ligne_pour_enregistrement(
+                job.wav_path, job.participants_informes_le)
+            if ligne_info:
+                f.write(ligne_info + "\n")
             f.write("-" * 60 + "\n\n")
             if job.notes and job.notes.strip():
                 f.write("=== NOTES MANUELLES ===\n")
@@ -1131,8 +1148,8 @@ def _save_transcript_local(job: _Job) -> str | None:
 def _diarize(audio_path: str, segments: list) -> dict:
     """
     Identifie les locuteurs sur chaque segment Whisper via embeddings MFCC + DBSCAN.
-    Distinction H/F via pitch moyen (F0 autocorrélation).
-    Retourne {segment_idx: "SPKR_X (H|F)"} ou {} en cas d'échec.
+    Aucune caractéristique de la voix autre que le timbre de regroupement n'est calculée.
+    Retourne {segment_idx: "SPKR_N"} ou {} en cas d'échec.
     Dépendances : numpy, scipy, sklearn, soundfile — toutes déjà présentes.
     """
     if len(segments) < 2:
@@ -1194,21 +1211,8 @@ def _diarize(audio_path: str, segments: list) -> dict:
             mfcc         = dct(filter_banks, type=2, axis=1, norm="ortho")[:, 1:n_mfcc+1]
             return mfcc.mean(axis=0)
 
-        # ── Pitch F0 par autocorrélation ──────────────────────────────────────
-        def _mean_pitch(chunk):
-            if len(chunk) < 512:
-                return 0.0
-            frame = chunk[:2048]
-            corr  = np_d.correlate(frame, frame, mode="full")[len(frame)-1:]
-            corr[0] = 0
-            lo, hi = int(SR / 300), int(SR / 80)
-            if hi >= len(corr):
-                return 0.0
-            peak = np_d.argmax(corr[lo:hi]) + lo
-            return SR / peak if peak > 0 else 0.0
-
         # ── Embeddings par segment ────────────────────────────────────────────
-        embeds, valid_idx, pitches = [], [], []
+        embeds, valid_idx = [], []
         for i, (start, end, _) in enumerate(segments):
             s, e = int(start * SR), int(end * SR)
             chunk = wav[s:e]
@@ -1217,7 +1221,6 @@ def _diarize(audio_path: str, segments: list) -> dict:
                 continue
             embeds.append(feat)
             valid_idx.append(i)
-            pitches.append(_mean_pitch(chunk))
 
         if len(embeds) < 2:
             return {}
@@ -1228,35 +1231,9 @@ def _diarize(audio_path: str, segments: list) -> dict:
         db     = DBSCAN(eps=0.35, min_samples=1, metric="cosine").fit(X)
         labels = db.labels_
 
-        # ── Pitch moyen par locuteur → genre ──────────────────────────────────
-        pitch_by_lbl = {}
-        for ei, lbl in enumerate(labels):
-            pitch_by_lbl.setdefault(lbl, []).append(pitches[ei])
-        pitch_mean = {lbl: np_d.mean([v for v in ps if v > 0] or [0])
-                      for lbl, ps in pitch_by_lbl.items()}
-
-        def _genre(lbl):
-            f0 = pitch_mean.get(lbl, 0)
-            if f0 < 10:
-                return ""
-            return " (F)" if f0 >= 165 else " (H)"
-
         # ── Numérotation par ordre d'apparition ───────────────────────────────
-        seen, counter = {}, [0]
-        def _name(lbl):
-            if lbl == -1:
-                return ""
-            if lbl not in seen:
-                counter[0] += 1
-                seen[lbl] = counter[0]
-            return f"SPKR_{seen[lbl]}{_genre(lbl)}"
-
-        result = {}
-        for ei, seg_i in enumerate(valid_idx):
-            n = _name(labels[ei])
-            if n:
-                result[seg_i] = n
-        return result
+        etiquettes = diarisation_etiquettes.etiqueter_par_ordre_apparition(labels)
+        return {seg_i: etiq for seg_i, etiq in zip(valid_idx, etiquettes) if etiq}
 
     except ModuleNotFoundError as e:
         _log_error(f"Diarisation ignorée : {e} — installez le module manquant (pip install soundfile scikit-learn scipy)")
@@ -1459,36 +1436,11 @@ def _do_step_transcribe(job: _Job) -> bool:
         for trouves in par_segment:
             raw_segments.extend(trouves)
 
-        # ── Diarisation (resemblyzer + DBSCAN) ────────────────────────────────
-        speaker_map = _diarize(path, raw_segments)  # {idx: "SPKR_X (H/F)"} ou {}
-
-        # ── Substitution des labels SPKR_X par les vrais noms Teams ──────────
+        # ── Diarisation (MFCC + DBSCAN), puis noms Teams quand ils sont connus ─
+        speaker_map = _diarize(path, raw_segments)  # {idx: "SPKR_N"} ou {}
         if speaker_map and job.teams_participants:
-            # Collecter les speakers uniques dans leur ordre d'apparition
-            seen_spkr: list[str] = []
-            for idx_s in range(len(raw_segments)):
-                raw_lbl = speaker_map.get(idx_s, "")
-                if raw_lbl:
-                    # Extraire "SPKR_X" sans le suffixe genre
-                    base = raw_lbl.split(" ")[0]  # ex: "SPKR_0"
-                    if base not in seen_spkr:
-                        seen_spkr.append(base)
-            # Mapper chaque SPKR_X → nom Teams (dans l'ordre)
-            teams_names = list(job.teams_participants)
-            spkr_name_map: dict[str, str] = {}
-            for i, base in enumerate(seen_spkr):
-                if i < len(teams_names):
-                    spkr_name_map[base] = teams_names[i]
-            # Reconstruire speaker_map avec vrais noms
-            new_speaker_map: dict[int, str] = {}
-            for idx_s, raw_lbl in speaker_map.items():
-                base = raw_lbl.split(" ")[0]
-                gender_suffix = " ".join(raw_lbl.split(" ")[1:])  # ex: "(H)"
-                if base in spkr_name_map:
-                    new_speaker_map[idx_s] = f"{spkr_name_map[base]} {gender_suffix}".strip()
-                else:
-                    new_speaker_map[idx_s] = raw_lbl
-            speaker_map = new_speaker_map
+            speaker_map = diarisation_etiquettes.renommer_par_noms(
+                speaker_map, job.teams_participants)
 
         for idx, (start_abs, end_abs, text) in enumerate(raw_segments):
             t  = int(start_abs)
@@ -1539,7 +1491,6 @@ def _do_step_notion(job: _Job) -> bool:
             whisper_model=job.model_name,
             meeting_type=notion_type,
             start_time=job.start_time,
-            audio_path=job.wav_path,
             title_override=title,
             attachments=job.attachments if job.attachments else None,
             notes=job.notes,
@@ -1941,6 +1892,7 @@ def _worker_loop():
                 _allow_sleep()
                 _worker_busy = False
                 _current_job = None
+                _lancer_passe_conservation()  # après chaque job, quelle qu'en soit l'issue
         # Queue vide — forcer le retour à Idle
         _refresh_ui()
 
@@ -2355,6 +2307,38 @@ def _reappliquer_preremplissage():
         _invites_retenus = a_faire.invites
 
 
+def _maj_case_informes():
+    """Couleur de la case : orange d'alerte tant qu'elle n'est pas cochée, vert ensuite."""
+    if _case_informes is None:
+        return
+    if _participants_informes_le:
+        fond, texte = "#1e1e32", "#88d982"
+    else:
+        fond, texte = "#3a2410", "#ffb066"
+    _case_informes.config(bg=fond, fg=texte, activebackground=fond,
+                          activeforeground=texte, selectcolor="#28283d")
+
+
+def _basculer_participants_informes():
+    """Cocher retient l'heure (locale, ISO à la seconde), décocher l'efface. Thread Tk."""
+    global _participants_informes_le
+    if _case_informes_var is not None and _case_informes_var.get():
+        _participants_informes_le = information_participants.horodatage_iso(
+            datetime.datetime.now())
+    else:
+        _participants_informes_le = ""
+    _maj_case_informes()
+
+
+def _reinitialiser_participants_informes():
+    """Case décochée et heure effacée au démarrage d'un enregistrement. Thread Tk."""
+    global _participants_informes_le
+    _participants_informes_le = ""
+    if _case_informes_var is not None:
+        _case_informes_var.set(False)
+    _maj_case_informes()
+
+
 def _do_start():
     global _recording, _audio_chunks, _stream_mic, _loop_thread, _rec_start_time
     global _wav_stream, _wav_stream_path, _flush_frame_count, _end_warned_key
@@ -2367,6 +2351,7 @@ def _do_start():
         return
 
     _end_warned_key = None
+    _reinitialiser_participants_informes()
 
     source = _SOURCE_MAP.get(_source_var.get(), "micro")
     _recording       = True
@@ -2503,6 +2488,7 @@ def _do_stop_transcribe():
         teams_participants=teams_participants,
         participants_invites=participants_invites,
         notes=_collect_notes(),
+        participants_informes_le=_participants_informes_le,
     )
     _hide_notes_window()
 
@@ -2578,6 +2564,7 @@ def _do_stop_archive_only():
         teams_participants=teams_participants,
         participants_invites=participants_invites,
         notes=_collect_notes(),
+        participants_informes_le=_participants_informes_le,
         status_transcript="queued",
         status_notion="pending",
     )
@@ -2692,6 +2679,8 @@ def _update_window_state():
                               bg="#1a6b1a", activebackground="#2e7d32")
         if _source_combo: _source_combo.config(state="disabled")
         if _speaker_combo: _speaker_combo.config(state="disabled")
+        if _case_informes and not _case_informes.winfo_ismapped():
+            _case_informes.pack(fill="x", pady=(0, 4))
         if _status_var: _status_var.set("Recording in progress…")
         if _status_dot:
             _status_dot.config(bg="#88d982")
@@ -2703,6 +2692,7 @@ def _update_window_state():
                               bg="#b81c1c", activebackground="#dc3232")
         if _source_combo: _source_combo.config(state="readonly")
         if _speaker_combo: _speaker_combo.config(state="readonly")
+        if _case_informes: _case_informes.pack_forget()
         if _root and hasattr(_root, "_toggle_whisper"):
             _root._toggle_whisper(True)
         with _queue_lock:
@@ -3140,6 +3130,16 @@ def _refresh_history_panel():
                      font=("Segoe UI", 7), bg=S_CARD, fg="#9ab4e8",
                      anchor="w", wraplength=420, justify="left").pack(fill="x")
 
+        # ── Information des participants, suppressions automatiques (RGPD)
+        teintes_rgpd = {information_participants.COULEUR_OK: "#88d982",
+                        information_participants.COULEUR_ALERTE: "#ffb74d",
+                        information_participants.COULEUR_INFO: FG2}
+        for texte, cle in information_participants.libelles_historique(
+                job.wav_path, job.participants_informes_le,
+                job.audio_supprime_le, job.transcript_purge_le):
+            tk.Label(card, text=texte, font=("Segoe UI", 7), bg=S_CARD,
+                     fg=teintes_rgpd[cle], anchor="w").pack(fill="x", padx=10, pady=(0, 2))
+
         # ── Boutons d'action contextuels
         j = job
         can_transcribe    = os.path.isfile(j.wav_path)
@@ -3407,6 +3407,7 @@ def _build_window():
     global _speaker_frame, _speaker_combo, _model_var, _lang_var, _output_var
     global _choix_modele_courant
     global _meeting_name_var, _history_list_frame, _status_dot, _dl_label
+    global _case_informes, _case_informes_var
 
     _root = tk.Tk()
 
@@ -3895,6 +3896,17 @@ def _build_window():
         command=_toggle_recording,
     )
     _btn_start.pack(fill="x", pady=(0, 4))
+
+    # ── Case « participants informés » : non bloquante, visible pendant l'enregistrement
+    # seulement (affichée par _update_window_state, juste sous le bouton)
+    _case_informes_var = tk.BooleanVar(value=False)
+    _case_informes = tk.Checkbutton(
+        btns_frame, text=information_participants.LIBELLE_CASE,
+        variable=_case_informes_var, command=_basculer_participants_informes,
+        font=("Segoe UI", 9, "bold"), anchor="w", relief="flat", bd=0,
+        padx=10, pady=6, cursor="hand2", highlightthickness=0,
+    )
+    _maj_case_informes()
 
     _btn_stop        = None
     _btn_stop_only   = None
@@ -5362,6 +5374,52 @@ def _open_settings():
         command=_toggle_startup,
     ).pack(anchor="w", padx=10, pady=8)
 
+    # ── Durées de conservation (suppression automatique vers la Corbeille)
+    tk.Frame(tab_g, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))
+    tk.Label(tab_g, text="Conservation des fichiers",
+             font=("Segoe UI", 10, "bold"), bg=S_CARD, fg=FG).pack(anchor="w", pady=(10, 0))
+    _LIBELLES_CONSERVATION = {
+        "retention_audio_jours": "Conserver l'audio (jours après transcription)",
+        "retention_transcript_jours": "Conserver la transcription (jours après la réunion)",
+    }
+    conservation_vars = {
+        cle: _field(tab_g, libelle, str(user_config.jours_de_conservation(cle)))
+        for cle, libelle in _LIBELLES_CONSERVATION.items()
+    }
+    tk.Label(tab_g,
+             text="Passé ce délai, les fichiers sont supprimés automatiquement "
+                  "vers la Corbeille de Windows.",
+             font=("Segoe UI", 8), bg=S_CARD, fg=FG2, wraplength=360,
+             justify="left").pack(anchor="w", pady=(4, 0))
+    conservation_status_lbl = tk.Label(tab_g, text="", font=("Segoe UI", 8),
+                                       bg=S_CARD, fg=FG3, wraplength=360, justify="left")
+    conservation_status_lbl.pack(anchor="w", pady=(4, 0))
+
+    def _sauver_conservation():
+        """Enregistre les durées valides (entier >= 1) ; une saisie invalide
+        laisse la valeur précédente en place et le dit."""
+        refusees, modifie = [], {}
+        for cle, var in conservation_vars.items():
+            jours = user_config.valeur_jours(var.get())
+            if jours is None:
+                refusees.append(_LIBELLES_CONSERVATION[cle])
+                var.set(str(user_config.jours_de_conservation(cle)))
+            else:
+                modifie[cle] = jours
+        try:
+            user_config.save(modifie)
+        except OSError as e:
+            conservation_status_lbl.config(text=f"Erreur : {e}", fg=ERR)
+            return
+        if refusees:
+            conservation_status_lbl.config(
+                text="Valeur refusée (entier d'au moins 1 jour attendu), "
+                     "valeur précédente conservée : " + " ; ".join(refusees),
+                fg=ERR)
+        else:
+            conservation_status_lbl.config(text="✓ Durées de conservation enregistrées.",
+                                           fg="#00cc66")
+
     # ── Microsoft 365 (transcripts Teams via Graph)
     tk.Frame(tab_g, bg=S_HIGH, height=1).pack(fill="x", pady=(14, 0))
     tk.Label(tab_g, text="Microsoft 365 (transcripts Teams)",
@@ -5433,6 +5491,7 @@ def _open_settings():
             _save_ews()
         elif tab == "general":
             _sauver_graph()
+            _sauver_conservation()
             graph_status_lbl.config(text="✓ Identifiants Microsoft 365 enregistrés.",
                                     fg="#00cc66")
 
@@ -5681,6 +5740,61 @@ def _recuperer_enregistrements_interrompus():
         _work_event.set()
 
 
+# ─── Conservation bornée : suppression automatique vers la Corbeille ─────────
+# Une passe tourne au démarrage, après chaque job et toutes les
+# _CONSERVATION_PERIODE_H heures. Toujours dans un thread daemon, jamais deux de
+# front. Le calcul est dans retention.py, l'exécution dans passe_conservation.py.
+_CONSERVATION_PERIODE_H = 6
+_conservation_lock = threading.Lock()
+
+
+def _ids_jobs_occupes() -> list[str]:
+    """Jobs à ne pas toucher : en file, en attente de modèle, en cours, en lecture."""
+    with _queue_lock:
+        ids = [j.id for j in _job_queue] + [j.id for j in _jobs_attente_modele]
+    courant = _current_job
+    if courant is not None:
+        ids.append(courant.id)
+    if _playback_job_id:
+        ids.append(_playback_job_id)
+    return ids
+
+
+def _executer_passe_conservation():
+    """Corps d'une passe (thread daemon) ; sans effet si une autre est en cours."""
+    if not _conservation_lock.acquire(blocking=False):
+        return
+    try:
+        with _all_jobs_lock:
+            jobs = list(_all_jobs)
+        bilan = passe_conservation.executer_passe(
+            jobs, datetime.datetime.now(),
+            user_config.jours_de_conservation("retention_audio_jours"),
+            user_config.jours_de_conservation("retention_transcript_jours"),
+            config.AUDIO_ARCHIVE_DIR, config.TRANSCRIPT_DIR, config.TEMP_DIR,
+            _lister_ou_vide, corbeille.envoyer_a_la_corbeille, hist_mod.update, _logger,
+            ids_occupes=_ids_jobs_occupes(), enregistrement_en_cours=_recording)
+        if bilan.a_change and _root:
+            _root.after(0, _refresh_history_panel)
+    except Exception:  # la conservation ne doit jamais faire tomber l'app
+        _logger.exception("Passe de conservation interrompue")
+    finally:
+        _conservation_lock.release()
+
+
+def _lancer_passe_conservation():
+    """Lance une passe dans un thread daemon : ne bloque ni le démarrage ni le worker."""
+    threading.Thread(target=_executer_passe_conservation, daemon=True,
+                     name="conservation").start()
+
+
+def _planifier_passe_conservation():
+    """Passe périodique, relancée par la boucle Tk (thread Tk uniquement)."""
+    _lancer_passe_conservation()
+    if _root:
+        _root.after(_CONSERVATION_PERIODE_H * 3_600_000, _planifier_passe_conservation)
+
+
 def main():
     global _icon, _all_jobs
 
@@ -5720,6 +5834,8 @@ def main():
                      ", ".join(j.id for j in orphelins))
 
     _recuperer_enregistrements_interrompus()
+    # Après la reprise : les jobs remis en file sont exclus de la suppression.
+    _lancer_passe_conservation()
 
     import sys
     tray_only = "--minimized" in sys.argv
@@ -5763,6 +5879,8 @@ def main():
     # Démarre 3 s après la fenêtre pour laisser tkinter s'initialiser
     root.after(3_000, _schedule_daily_digest)
     root.after(5_000, _check_pending_at_startup)
+    # Première passe périodique une période après celle du démarrage
+    root.after(_CONSERVATION_PERIODE_H * 3_600_000, _planifier_passe_conservation)
     root.after(_AFFICHAGE_SONDAGE_MS, _sonder_demande_affichage)
 
     root.mainloop()
