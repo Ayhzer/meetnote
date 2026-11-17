@@ -1,5 +1,14 @@
 # MeetNote PC — Changelog
 
+## [3.6.1] — 2026-11-17
+
+### Correctif
+- **Les enregistrements repris au démarrage sont de nouveau transcrits.** Quand MeetNote
+  redémarrait avec des enregistrements en attente, la file de traitement pouvait s'arrêter
+  dès le lancement, et plus rien n'était transcrit jusqu'au redémarrage suivant. Elle démarre
+  désormais une fois la fenêtre prête, et un enregistrement qui échoue n'arrête plus les
+  suivants.
+
 ## [3.6.0] — 2026-11-17
 
 ### Information des participants

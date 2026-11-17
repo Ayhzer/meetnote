@@ -1888,6 +1888,11 @@ def _worker_loop():
             _prevent_sleep()
             try:
                 _process_job(job)
+            except Exception:
+                # Un job qui plante ne doit pas tuer la file : sans worker, plus
+                # rien n'est transcrit jusqu'au redémarrage. Le job reste dans son
+                # état courant et sera repris au prochain lancement.
+                _logger.exception("Job %s interrompu par une exception", job.id)
             finally:
                 _allow_sleep()
                 _worker_busy = False
@@ -5795,6 +5800,11 @@ def _planifier_passe_conservation():
         _root.after(_CONSERVATION_PERIODE_H * 3_600_000, _planifier_passe_conservation)
 
 
+def _demarrer_worker():
+    """Lance le thread de la file de jobs. Thread Tk, boucle Tk déjà en marche."""
+    threading.Thread(target=_worker_loop, daemon=True, name="worker").start()
+
+
 def main():
     global _icon, _all_jobs
 
@@ -5845,7 +5855,6 @@ def main():
     )
     _icon.default_action = lambda i, it: _show_window()
     threading.Thread(target=_icon.run, daemon=True).start()
-    threading.Thread(target=_worker_loop, daemon=True).start()
     _start_audio_device_monitor()
 
     # ── Démarrage automatique avec Windows (registre HKCU\Run) ──────────────
@@ -5866,6 +5875,11 @@ def main():
     root = _build_window()
     if tray_only:
         root.withdraw()   # démarrage silencieux en tray uniquement
+
+    # Le worker ne démarre qu'une fois la boucle Tk lancée : un job repris au
+    # démarrage appelle _refresh_ui → _root.after, qui lève « main thread is not
+    # in main loop » si mainloop() n'a pas encore commencé (vécu en 3.6.0).
+    root.after(0, _demarrer_worker)
 
     # L'assistant s'ouvre au premier lancement, y compris en --minimized :
     # sans réglages, l'application ne ferait rien d'utile en tray seul.
