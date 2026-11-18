@@ -192,6 +192,27 @@ class TestTranscriptionsAPurger(unittest.TestCase):
     def test_job_sans_date_ignore(self):
         self.assertEqual(self._purger([_job(start_time="hier")]), [])
 
+    def test_envoi_notion_non_abouti_jamais_purge(self):
+        for statut in ("pending", "running", "error"):
+            job = _job(_debut(400), status_notion=statut)
+            self.assertEqual(self._purger([job]), [], statut)
+
+    def test_envoi_reussi_ou_mode_fichier_purge(self):
+        for statut in ("done", "skipped"):
+            job = _job(_debut(400), status_notion=statut)
+            self.assertEqual(len(self._purger([job])), 1, statut)
+
+    def test_differees_liste_les_echus_non_transmis_seulement(self):
+        attente = _job(_debut(400), id="a", status_notion="error")
+        envoye = _job(_debut(400), id="b", status_notion="done")
+        recent = _job(_debut(10), id="c", status_notion="error")
+        occupe = _job(_debut(400), id="d", status_notion="pending")
+        purge = _job(_debut(400), id="e", status_notion="error",
+                     transcript_purge_le="2026-12-01")
+        resultat = retention.transcriptions_differees(
+            [attente, envoye, recent, occupe, purge], MAINTENANT, TRANSCRIPT_J, ["d"])
+        self.assertEqual(resultat, [attente])
+
     def test_champs_a_vider(self):
         self.assertEqual(
             retention.champs_a_vider_purge(),
@@ -254,16 +275,38 @@ class TestOrphelins(unittest.TestCase):
         self.assertEqual(_orphelins(transcripts=[f"transcript_{_horodatage(179)}.txt"]),
                          [])
 
-    def test_enregistrement_tmp_a_30_jours(self):
+    def test_enregistrement_tmp_transcrit_a_30_jours(self):
         h = _horodatage(31)
-        res = _orphelins(tmp=[f"rec_{h}.wav", f"rec_{_horodatage(29)}.wav"])
+        res = _orphelins(tmp=[f"rec_{h}.wav", f"rec_{_horodatage(29)}.wav"],
+                         transcripts=[f"transcript_{h}.txt",
+                                      f"transcript_{_horodatage(29)}.txt"])
+        rec = [o for o in res if os.path.dirname(o.chemin) == TMP]
+        self.assertEqual(self._chemins(rec), [f"rec_{h}.wav"])
+        self.assertIn("30 j", rec[0].regle)
+        self.assertIn("transcription présente", rec[0].regle)
+
+    def test_enregistrement_tmp_jamais_transcrit_garde_180_jours(self):
+        h = _horodatage(31)
+        self.assertEqual(_orphelins(tmp=[f"rec_{h}.wav"]), [])
+        h = _horodatage(179)
+        self.assertEqual(_orphelins(tmp=[f"rec_{h}.wav"]), [])
+        h = _horodatage(181)
+        res = _orphelins(tmp=[f"rec_{h}.wav"])
         self.assertEqual(self._chemins(res), [f"rec_{h}.wav"])
         self.assertEqual(os.path.dirname(res[0].chemin), TMP)
-        self.assertIn("30", res[0].regle)
+        self.assertIn("180 j", res[0].regle)
+        self.assertIn("sans transcription", res[0].regle)
+
+    def test_transcription_d_un_autre_horodatage_ne_raccourcit_pas_le_tmp(self):
+        h = _horodatage(40)
+        res = _orphelins(tmp=[f"rec_{h}.wav"],
+                         transcripts=[f"transcript_{_horodatage(41)}.txt"])
+        self.assertEqual([o for o in res if os.path.dirname(o.chemin) == TMP], [])
 
     def test_limite_exacte_orphelin(self):
         h = _horodatage(30)
-        self.assertEqual(_orphelins(tmp=[f"rec_{h}.wav"]), [])
+        self.assertEqual(_orphelins(tmp=[f"rec_{h}.wav"],
+                                    transcripts=[f"transcript_{h}.txt"]), [])
 
     def test_nom_sans_date_jamais_retenu(self):
         res = _orphelins(

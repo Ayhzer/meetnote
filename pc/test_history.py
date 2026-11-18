@@ -212,13 +212,47 @@ class TestChampsJob(_BaseTemporaire):
 
 class _JobFactice:
     """Imite un job dataclass pour history.add (asdict exige une dataclass)."""
-    def __new__(cls, ident):
+    def __new__(cls, ident, notes=""):
         import dataclasses
 
         @dataclasses.dataclass
         class Job:
             id: str
-        return Job(ident)
+            notes: str = ""
+        return Job(ident, notes)
+
+
+class TestMettreAJourSiPresent(_BaseTemporaire):
+    def _historique_plein(self):
+        history.save([{"id": f"j{i}", "notes": f"n{i}"}
+                      for i in range(history.MAX_ENTRIES)])
+
+    def test_job_present_est_mis_a_jour(self):
+        self._historique_plein()
+        self.assertTrue(history.mettre_a_jour_si_present(_JobFactice("j5", "neuf")))
+        entrees = {e["id"]: e for e in history.load()}
+        self.assertEqual(entrees["j5"]["notes"], "neuf")
+        self.assertEqual(len(entrees), history.MAX_ENTRIES)
+
+    def test_job_absent_ne_reinsere_rien_et_garde_la_plus_ancienne(self):
+        self._historique_plein()
+        avant = self._octets()
+        self.assertFalse(history.mettre_a_jour_si_present(_JobFactice("sorti")))
+        self.assertEqual(self._octets(), avant)
+        derniere = history.load()[-1]
+        self.assertEqual(derniere["id"], f"j{history.MAX_ENTRIES - 1}")
+        self.assertEqual(derniere["notes"], f"n{history.MAX_ENTRIES - 1}")
+
+    def test_update_inchange_reinsere_en_tete_et_borne(self):
+        self._historique_plein()
+        history.update(_JobFactice("nouveau"))
+        entrees = history.load()
+        self.assertEqual(entrees[0]["id"], "nouveau")
+        self.assertEqual(len(entrees), history.MAX_ENTRIES)
+
+    def test_historique_absent_rend_false_sans_creer_de_fichier(self):
+        self.assertFalse(history.mettre_a_jour_si_present(_JobFactice("x")))
+        self.assertFalse(os.path.exists(self.chemin))
 
 
 class TestFichierJson(unittest.TestCase):

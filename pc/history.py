@@ -143,3 +143,22 @@ def update(job) -> None:
         if not updated:
             entries.insert(0, d)
         save(entries)
+
+
+def mettre_a_jour_si_present(job) -> bool:
+    """Met à jour un job déjà dans l'historique ; sinon ne fait rien (rend False).
+
+    Contrairement à `update`, un job absent n'est jamais réinséré : `_all_jobs` en
+    mémoire n'est pas borné alors que le fichier l'est à MAX_ENTRIES, et réinsérer
+    un job sorti de l'historique éjecterait l'entrée la plus ancienne (notes et
+    lien Notion compris). Utilisé par la passe de conservation.
+    """
+    with _verrou_ecriture:
+        entries = load()
+        d = _job_to_dict(job)
+        for i, e in enumerate(entries):
+            if e.get("id") == d["id"]:
+                entries[i] = d
+                save(entries)
+                return True
+        return False

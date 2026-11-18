@@ -16,7 +16,8 @@ Règles (« plus de N jours » = strictement au-delà : à N jours pile, rien n'
 supprimé) :
   1. audio d'un job transcrit : N = `retention_audio_jours` après la fin de la
      transcription ;
-  2. transcription d'un job : N = `retention_transcript_jours` après la réunion ;
+  2. transcription d'un job : N = `retention_transcript_jours` après la réunion, et
+     seulement si elle est arrivée dans Notion (ou n'y était pas destinée) ;
   3. fichiers sans job (sortis des 100 entrées de l'historique), d'après la date
      de leur nom.
 """
@@ -173,18 +174,32 @@ def audios_a_supprimer(jobs: Iterable, maintenant: datetime.datetime,
     return retenus
 
 
-def transcriptions_a_purger(jobs: Iterable, maintenant: datetime.datetime,
-                            retention_transcript_jours: int,
-                            dossier_transcripts: str,
-                            ids_occupes: Iterable[str] = ()
-                            ) -> list[TranscriptionAPurger]:
-    """Jobs dont la réunion a plus de `retention_transcript_jours` jours.
+# Statuts Notion pour lesquels la transcription n'attend plus rien de Notion :
+# `done` (page créée) et `skipped` (mode de sortie « fichier », jamais destinée à
+# Notion). Tout autre statut — pending, running, error — signifie que le contenu n'est
+# peut-être arrivé nulle part ailleurs que dans l'historique local.
+STATUTS_NOTION_TRANSMIS = ("done", "skipped")
+
+
+def transcription_transmise(job) -> bool:
+    """La transcription du job n'a-t-elle plus rien à envoyer à Notion ?
+
+    Un job sans attribut `status_notion` est traité comme transmis, comme le fait
+    `history.py` pour les anciennes entrées d'historique.
+    """
+    return getattr(job, "status_notion", "done") in STATUTS_NOTION_TRANSMIS
+
+
+def _transcriptions_echues(jobs: Iterable, maintenant: datetime.datetime,
+                           retention_transcript_jours: int,
+                           ids_occupes: Iterable[str]) -> list:
+    """Jobs dont la réunion a dépassé la durée de conservation, transmis ou non.
 
     Exclus : un job déjà purgé (`transcript_purge_le`) et un job en file ou en cours
     (`ids_occupes`) — on ne vide pas ce que le worker est en train d'écrire.
     """
     occupes = set(ids_occupes)
-    retenus = []
+    echus = []
     for job in jobs:
         if getattr(job, "id", None) in occupes:
             continue
@@ -193,6 +208,27 @@ def transcriptions_a_purger(jobs: Iterable, maintenant: datetime.datetime,
         debut = _debut(job)
         if debut is None or not _ecoule(debut, maintenant, retention_transcript_jours):
             continue
+        echus.append(job)
+    return echus
+
+
+def transcriptions_a_purger(jobs: Iterable, maintenant: datetime.datetime,
+                            retention_transcript_jours: int,
+                            dossier_transcripts: str,
+                            ids_occupes: Iterable[str] = ()
+                            ) -> list[TranscriptionAPurger]:
+    """Jobs dont la réunion a plus de `retention_transcript_jours` jours.
+
+    Exclus : un job déjà purgé (`transcript_purge_le`), un job en file ou en cours
+    (`ids_occupes`) et un job dont la transcription n'est pas arrivée dans Notion
+    (`transcription_transmise`) : jamais de purge d'un contenu sans autre copie. Ces
+    derniers sont listés par `transcriptions_differees`.
+    """
+    retenus = []
+    for job in _transcriptions_echues(jobs, maintenant, retention_transcript_jours,
+                                      ids_occupes):
+        if not transcription_transmise(job):
+            continue
         chemin = getattr(job, "transcript_path", "")
         if not est_sous_dossier(chemin, dossier_transcripts):
             chemin = ""
@@ -200,6 +236,18 @@ def transcriptions_a_purger(jobs: Iterable, maintenant: datetime.datetime,
             job, chemin, f"transcription de plus de {retention_transcript_jours} j "
                          "après la réunion"))
     return retenus
+
+
+def transcriptions_differees(jobs: Iterable, maintenant: datetime.datetime,
+                             retention_transcript_jours: int,
+                             ids_occupes: Iterable[str] = ()) -> list:
+    """Jobs échus mais épargnés car leur transcription n'est pas arrivée dans Notion.
+
+    Ils seront repris à une passe suivante, une fois l'envoi réussi.
+    """
+    return [job for job in _transcriptions_echues(
+                jobs, maintenant, retention_transcript_jours, ids_occupes)
+            if not transcription_transmise(job)]
 
 
 def _horodatage_du_nom(nom: str, prefixe: str,
@@ -280,24 +328,28 @@ def orphelins(jobs: Iterable, maintenant: datetime.datetime,
 
     Durées : audio d'archives à `retention_audio_jours` si une transcription de même
     horodatage est présente, sinon à `retention_transcript_jours` ; `rec_*.wav` de
-    `tmp/` à `retention_audio_jours` ; transcription à `retention_transcript_jours`.
+    `tmp/` suit la même règle que les archives (un enregistrement interrompu jamais
+    transcrit est la seule copie de la réunion) ; transcription à
+    `retention_transcript_jours`.
     """
     liste_jobs = list(jobs)
     chemins, horodatages = _references(liste_jobs)
     transcripts = list(noms_transcripts)
 
-    def jours_archive(horodatage: str) -> tuple[int, str]:
-        if _transcription_presente(horodatage, transcripts):
-            regle = (f"audio sans job de plus de {retention_audio_jours} j "
-                     "(transcription présente)")
-            return retention_audio_jours, regle
-        regle = (f"audio sans job de plus de {retention_transcript_jours} j "
-                 "(sans transcription)")
-        return retention_transcript_jours, regle
+    def jours_audio(libelle: str) -> Callable[[str], tuple[int, str]]:
+        """Durée d'un audio sans job : courte si transcrit, longue sinon."""
+        def jours(horodatage: str) -> tuple[int, str]:
+            if _transcription_presente(horodatage, transcripts):
+                regle = (f"{libelle} de plus de {retention_audio_jours} j "
+                         "(transcription présente)")
+                return retention_audio_jours, regle
+            regle = (f"{libelle} de plus de {retention_transcript_jours} j "
+                     "(sans transcription)")
+            return retention_transcript_jours, regle
+        return jours
 
-    def jours_tmp(_horodatage: str) -> tuple[int, str]:
-        return (retention_audio_jours,
-                f"enregistrement temporaire de plus de {retention_audio_jours} j")
+    jours_archive = jours_audio("audio sans job")
+    jours_tmp = jours_audio("enregistrement temporaire")
 
     def jours_transcript(_horodatage: str) -> tuple[int, str]:
         return (retention_transcript_jours,

@@ -21,6 +21,16 @@ from collections.abc import Callable, Iterable
 import retention
 
 MOTIF_HORS_DOSSIERS = "chemin hors des dossiers de MeetNote"
+TAILLE_INCONNUE = "taille inconnue"
+_OCTETS_PAR_KO = 1024
+_OCTETS_PAR_MO = 1024 * 1024
+
+
+def taille_lisible(octets: int) -> str:
+    """Taille en Ko ou en Mo, pour repérer un fichier trop gros pour la Corbeille."""
+    if octets >= _OCTETS_PAR_MO:
+        return f"{octets / _OCTETS_PAR_MO:.1f} Mo"
+    return f"{max(1, round(octets / _OCTETS_PAR_KO))} Ko" if octets else "0 Ko"
 
 
 @dataclasses.dataclass
@@ -48,8 +58,9 @@ class _Passe:
     def __init__(self, dossiers: tuple[str, str, str],
                  supprimer: Callable[[str], str | None],
                  mettre_a_jour: Callable[[object], None], journal, existe,
-                 jour: str):
+                 jour: str, taille: Callable[[str], int] = os.path.getsize):
         self.dossiers = dossiers
+        self.taille = taille
         self.supprimer = supprimer
         self.mettre_a_jour = mettre_a_jour
         self.journal = journal
@@ -62,14 +73,23 @@ class _Passe:
         nom = os.path.basename(chemin)
         if not any(retention.est_sous_dossier(chemin, d) for d in self.dossiers):
             return self._echec(nom, MOTIF_HORS_DOSSIERS)
+        taille = self._taille_avant_suppression(chemin)
         try:
             motif = self.supprimer(chemin)
         except Exception as exc:  # noqa: BLE001 - un échec ne doit pas stopper la passe
             motif = f"{type(exc).__name__}: {exc}"
         if motif:
             return self._echec(nom, motif)
-        self.journal.info("Corbeille : %s (%s)", nom, regle)
+        self.journal.info("Corbeille : %s (%s, %s)", nom, regle, taille)
         return True
+
+    def _taille_avant_suppression(self, chemin: str) -> str:
+        """Taille lue juste avant l'envoi : Windows supprime pour de bon un fichier
+        trop gros pour la Corbeille, la ligne de journal doit le rendre repérable."""
+        try:
+            return taille_lisible(self.taille(chemin))
+        except OSError:
+            return TAILLE_INCONNUE
 
     def _echec(self, nom: str, motif: str) -> bool:
         self.bilan.echecs += 1
@@ -113,6 +133,12 @@ class _Passe:
             self.bilan.transcriptions += 1
             self.enregistrer(purge.job)
 
+    def transcriptions_differees(self, jobs: list) -> None:
+        """Journalise les purges différées : identifiant seul, jamais de contenu."""
+        for job in jobs:
+            self.journal.info("purge différée : transcription non transmise (%s)",
+                              getattr(job, "id", "?"))
+
     def orphelins(self, orphelins: list[retention.Orphelin]) -> None:
         for orphelin in orphelins:
             if self.envoyer(orphelin.chemin, orphelin.regle):
@@ -127,7 +153,8 @@ def executer_passe(jobs: Iterable, maintenant: datetime.datetime,
                    mettre_a_jour: Callable[[object], None], journal,
                    ids_occupes: Iterable[str] = (),
                    enregistrement_en_cours: bool = False,
-                   existe: Callable[[str], bool] = os.path.exists) -> BilanPasse:
+                   existe: Callable[[str], bool] = os.path.exists,
+                   taille: Callable[[str], int] = os.path.getsize) -> BilanPasse:
     """Exécute une passe de conservation et rend son bilan.
 
     `jobs` sont modifiés en place (`audio_supprime_le`, `transcript_purge_le`, champs
@@ -135,6 +162,7 @@ def executer_passe(jobs: Iterable, maintenant: datetime.datetime,
     est parti à la Corbeille, sinon le motif de l'échec. `lister(dossier)` rend les
     noms de fichiers du dossier ; `journal` est un `logging.Logger`. Pendant un
     enregistrement, aucun audio n'est supprimé (règle de `retention.py`).
+    `taille(chemin)` rend la taille en octets, journalisée à chaque envoi.
     """
     liste_jobs = list(jobs)
     occupes = list(ids_occupes)
@@ -149,6 +177,8 @@ def executer_passe(jobs: Iterable, maintenant: datetime.datetime,
     purges = retention.transcriptions_a_purger(
         liste_jobs, maintenant, retention_transcript_jours, dossier_transcripts,
         occupes)
+    differees = retention.transcriptions_differees(
+        liste_jobs, maintenant, retention_transcript_jours, occupes)
     orphelins = retention.orphelins(
         liste_jobs, maintenant, retention_audio_jours, retention_transcript_jours,
         dossier_archives, noms_archives, dossier_transcripts, noms_transcripts,
@@ -158,9 +188,11 @@ def executer_passe(jobs: Iterable, maintenant: datetime.datetime,
         orphelins = []
 
     passe = _Passe((dossier_archives, dossier_transcripts, dossier_tmp), supprimer,
-                   mettre_a_jour, journal, existe, maintenant.date().isoformat())
+                   mettre_a_jour, journal, existe, maintenant.date().isoformat(),
+                   taille)
     passe.audios(audios)
     passe.transcriptions(purges)
+    passe.transcriptions_differees(differees)
     passe.orphelins(orphelins)
     journal.info(passe.bilan.resume())
     return passe.bilan

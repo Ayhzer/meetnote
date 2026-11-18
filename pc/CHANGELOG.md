@@ -1,5 +1,19 @@
 # MeetNote PC — Changelog
 
+## [3.6.2] — 2026-11-18
+
+### Correctifs — suppression automatique
+- **Une transcription qui n'est pas encore arrivée dans Notion n'est plus jamais supprimée.**
+  Si l'envoi a échoué ou attend encore, la suppression est reportée ; elle aura lieu une fois
+  l'envoi réussi. En sortie « fichier », rien ne change.
+- **Un enregistrement jamais transcrit est gardé 6 mois** au lieu de 30 jours : c'est la seule
+  copie d'un enregistrement interrompu. Il reste supprimé au bout de 30 jours si sa
+  transcription existe.
+- **Les entrées anciennes de l'historique ne disparaissent plus** à cause de la suppression
+  automatique : une entrée déjà retirée n'y est plus réinsérée.
+- Le journal indique désormais **la taille de chaque fichier envoyé à la Corbeille**, pour
+  repérer ceux que Windows supprime définitivement.
+
 ## [3.6.1] — 2026-11-17
 
 ### Correctif

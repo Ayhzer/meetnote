@@ -202,6 +202,40 @@ class TranscriptionTest(unittest.TestCase):
         self.assertFalse(env.passe([job]).a_change)
 
 
+class PurgeDiffereeTest(unittest.TestCase):
+    def test_envoi_notion_en_echec_ni_purge_ni_corbeille_et_journal(self):
+        job = _job("a", VIEUX, status_notion="error")
+        env = _env_pour(job)
+        bilan = env.passe([job])
+        self.assertNotIn(job.transcript_path, env.supprimes)
+        self.assertEqual(job.transcript, "texte confidentiel")
+        self.assertEqual(job.transcript_purge_le, "")
+        self.assertEqual(bilan.transcriptions, 0)
+        messages = env.messages()
+        self.assertIn("purge différée : transcription non transmise", messages)
+        self.assertIn("'a'", messages)
+        self.assertNotIn("texte confidentiel", messages)
+
+    def test_purge_a_la_passe_suivante_une_fois_l_envoi_reussi(self):
+        job = _job("a", VIEUX, status_notion="pending")
+        env = _env_pour(job)
+        env.passe([job])
+        self.assertEqual(job.transcript_purge_le, "")
+        job.status_notion = "done"
+        env.passe([job])
+        self.assertIn(job.transcript_path, env.supprimes)
+        self.assertEqual(job.transcript_purge_le, AUJOURDHUI)
+        self.assertEqual(job.transcript, "")
+
+    def test_mode_fichier_reste_purge(self):
+        job = _job("a", VIEUX, status_notion="skipped")
+        env = _env_pour(job)
+        env.passe([job])
+        self.assertIn(job.transcript_path, env.supprimes)
+        self.assertEqual(job.transcript_purge_le, AUJOURDHUI)
+        self.assertNotIn("purge différée", env.messages())
+
+
 class OrphelinsEtJournalTest(unittest.TestCase):
     def test_orphelins_des_trois_dossiers_sont_supprimes(self):
         h = _horodatage(VIEUX)
@@ -229,6 +263,38 @@ class OrphelinsEtJournalTest(unittest.TestCase):
         self.assertIn(os.path.basename(job.wav_path), messages)
         self.assertIn("de plus de 30 j", messages)
         self.assertNotIn("texte confidentiel", messages)
+
+    def test_ligne_corbeille_porte_la_taille_du_fichier(self):
+        job = _job("a", ANCIEN)
+        env = _env_pour(job)
+        env.passe([job], taille=lambda _chemin: 3 * 1024 * 1024 + 200 * 1024)
+        self.assertIn("3.2 Mo", env.messages())
+
+    def test_taille_inconnue_si_le_fichier_est_illisible(self):
+        job = _job("a", ANCIEN)
+        env = _env_pour(job)
+
+        def illisible(_chemin):
+            raise OSError("verrouillé")
+
+        bilan = env.passe([job], taille=illisible)
+        self.assertIn(pc.TAILLE_INCONNUE, env.messages())
+        self.assertEqual(env.supprimes, [job.wav_path])  # la suppression a bien lieu
+        self.assertEqual(bilan.echecs, 0)
+
+    def test_taille_lisible(self):
+        self.assertEqual(pc.taille_lisible(0), "0 Ko")
+        self.assertEqual(pc.taille_lisible(10), "1 Ko")
+        self.assertEqual(pc.taille_lisible(512 * 1024), "512 Ko")
+        self.assertEqual(pc.taille_lisible(5 * 1024 * 1024), "5.0 Mo")
+
+    def test_tmp_jamais_transcrit_survit_a_47_jours_et_part_apres_180(self):
+        recent = f"rec_{_horodatage(ANCIEN)}.wav"
+        vieux = f"rec_{_horodatage(VIEUX)}.wav"
+        env = _Env({TMP: [recent, vieux]})
+        env.passe([])
+        self.assertEqual(env.supprimes, [os.path.join(TMP, vieux)])
+        self.assertIn("sans transcription", env.messages())
 
     def test_un_resume_par_passe(self):
         env = _Env()

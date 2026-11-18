@@ -5777,7 +5777,8 @@ def _executer_passe_conservation():
             user_config.jours_de_conservation("retention_audio_jours"),
             user_config.jours_de_conservation("retention_transcript_jours"),
             config.AUDIO_ARCHIVE_DIR, config.TRANSCRIPT_DIR, config.TEMP_DIR,
-            _lister_ou_vide, corbeille.envoyer_a_la_corbeille, hist_mod.update, _logger,
+            _lister_ou_vide, corbeille.envoyer_a_la_corbeille,
+            hist_mod.mettre_a_jour_si_present, _logger,
             ids_occupes=_ids_jobs_occupes(), enregistrement_en_cours=_recording)
         if bilan.a_change and _root:
             _root.after(0, _refresh_history_panel)
