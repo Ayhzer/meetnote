@@ -94,7 +94,7 @@ Créer la database **Transcripts** avec ces propriétés :
 | Titre | title | — |
 | Date | date | — |
 | Participants | select | noms des participants |
-| Source | select | PC / Mobile |
+| Source | select | PC / Agenda |
 | Statut | select | À traiter / Traité |
 | Type | select | Gouvernance / Technique / Projet / RH / Fournisseur / Autre / A classifier |
 | Durée (min) | number | — |
@@ -104,7 +104,11 @@ Créer une intégration sur [notion.so/my-integrations](https://www.notion.so/my
 
 ### 3. Agent Claude (traitement automatique)
 
-Claude Desktop + MCP Notion → coller le contenu de `shared/prompt_agent_claude.md`
+Claude Desktop + connecteur Notion → coller le contenu de [`shared/prompt_agent_claude.md`](shared/prompt_agent_claude.md)
+après y avoir remplacé les noms de bases par les tiens. Le prompt traite les transcripts dont
+`Statut` vaut « À traiter » (3 au plus par exécution), rédige pour chacun un compte rendu
+(résumé, décisions, plan d'actions avec responsable et échéance) puis passe `Statut` à « Traité ».
+Il ne recopie jamais de donnée de santé ni RH hors d'une base dédiée.
 
 ## Utilisation PC
 

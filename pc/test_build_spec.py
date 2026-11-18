@@ -587,6 +587,18 @@ class ScriptsDeBuildSansModeleTest(unittest.TestCase):
         appel_slim = self._source("build_spec_slim.py").split("produire_installeur(")[1]
         self.assertIn("slim=True", appel_slim)
 
+    def test_guide_pdf_produit_apres_l_installeur_avant_le_bilan(self):
+        source = self._source("build_spec.py")
+        self.assertIn("produire_guide_pdf(VERSION", source)
+        self.assertLess(source.index("produire_installeur("),
+                        source.index("produire_guide_pdf(VERSION"))
+        self.assertLess(source.index("produire_guide_pdf(VERSION"),
+                        source.index("composer_bilan(ALERTES)"))
+        # Alerte au bilan, jamais un échec du build.
+        appel = source.split("produire_guide_pdf(VERSION")[1].split("composer_bilan")[0]
+        self.assertIn("alertes=ALERTES", appel)
+        self.assertNotIn("sys.exit", appel)
+
     def test_aucune_copie_de_modele(self):
         for nom in self.SCRIPTS:
             source = self._source(nom)

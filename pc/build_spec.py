@@ -24,6 +24,7 @@ from build_paths import (
     signer_fichier,
 )
 from build_version import build_version_resource
+from guide_pdf import produire_guide_pdf
 from version import VERSION
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
@@ -319,6 +320,10 @@ if result.returncode == 0:
     produire_installeur(sortie_fraiche, VERSION, os.path.join(SCRIPT_DIR, "dist"),
                         journal=lambda m: print(f"[build_spec] {m}"),
                         alertes=ALERTES)
+    # ── Guide d'installation en PDF, à côté de l'installeur : sans Edge, une alerte. ──
+    produire_guide_pdf(VERSION, os.path.join(SCRIPT_DIR, "dist"),
+                       journal=lambda m: print(f"[build_spec] {m}"),
+                       alertes=ALERTES)
     for ligne in composer_bilan(ALERTES):
         print(f"[build_spec] {ligne}")
 else:
